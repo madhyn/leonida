@@ -291,12 +291,13 @@ The last line also gets `--wave64-emulate` and the fallback flags of the build, 
   `0x80004001`) after 28 creations.
 
 **Run time.** `ShaderLibrary::load(dir)` (`runtime/src/shader_library.h`) reads `<dir>/index.json`, then
-`<dir>/fspx/index.json` and `<dir>/bvh/index.json` when they are there. The builder's entries are named
-`bvh/<name>`, the path of their module below `<dir>`, and go into the table of the game's shaders, so
-`create_compute` finds them through the lookup it already had (`compute_program()` gives an `FSSM` program, looked up
-by `(cs, fssm_sha256)`). A missing or unreadable `bvh/index.json` leaves the other indexes loaded, and the main
-index is still required. `bvh_size()` counts the entries, which `shader_library_corpus_test` leaves out of the
-entries a carved container must reach, like the FSPX ones.
+`<dir>/fspx/index.json`, `<dir>/bvh/index.json`, and `<dir>/exe/index.json` when they are there. The builder's
+entries are named `bvh/<name>` and the executable's `exe/<name>`, the path of their module below `<dir>`, and both
+go into the table of the game's shaders, so graphics and compute pipeline creation find them through the lookup they
+already had (`fssm_program()` / `compute_program()` gives an `FSSM` program, looked up by `(stage, fssm_sha256)`). A
+missing or unreadable subfolder `index.json` leaves the other indexes loaded, and the main index is still required.
+`bvh_size()` and `exe_size()` count those entries, which `shader_library_corpus_test` leaves out of the entries a
+carved container must reach, like the FSPX ones.
 
 **Measured: `LEONIDA_BVH_DEVICE=vulkan bvh_builder_test`** (package 1.0.2.1, `LEONIDA_BVH_RECORD62=1`,
 `LEONIDA_SHADERS` on a folder holding this step's output and an empty main index, since only this step was run).
@@ -390,6 +391,17 @@ constructor's pipelines are created, not that a build produces the right tree (s
 `tests/test_bvh_shaders_stage.py` runs the step on a synthetic DLL (hand-built containers around a made-up `FSSM`
 blob, no game data): the key the extracted layout gives the translator, the tools and arguments, reuse and each
 reason to run again, a second run that leaves no duplicate containers, the report of an untranslated program on
-every run and the failure when nothing translates. `shader_library_test` covers the `bvh/` index (found by the
-container's program hash, counted apart, a broken or missing index beside the others) and `d3d12_compute_test`
+every run and the failure when nothing translates. `shader_library_test` covers the `bvh/` and `exe/` indexes (found
+by the container's program hash, counted apart, a broken or missing index beside the others) and `d3d12_compute_test`
 creates a pipeline through slot 62 whose only translation is in `<shaders>/bvh/index.json`.
+
+**Retail executable (`exe_shaders()`).** After `bvh_shaders()`, `make_game.py`'s `shaders` stage runs
+`exe_shaders()` on `<game>/game_scarlett_master.exe` when present (skipping cleanly and dropping any stale
+`<work>/shaders/spirv/exe/index.json` and `exe_build.json` when the package has no executable). It runs the same
+four tools into `<work>/shaders/exe` and `<work>/shaders/spirv/exe` (without `--max-shared-memory`, since the
+executable's containers are 1 VS + 9 PS graphics shaders), tracking inputs in `exe_build.json` and logging
+translated/missing counts on every run. Measured on 1.0.2.1: 10 of 10 programs translate and pass `spirv-val`
+natively and with `--wave64-emulate`, `ShaderLibrary::load` finds all 10 (`1 VS + 9 PS`) by `(stage, fssm_sha256)`,
+and `vk_pipeline_check` passes 10/10 modules and 10/10 pipelines (0 failed, 0 skipped) on an AMD Radeon RX 9070 XT
+(RADV GFX1201, Mesa 26.2.6) and an AMD Ryzen 7 9800X3D integrated GPU (RADV RAPHAEL_MENDOCINO, Mesa 26.2.6).
+`tests/test_exe_shaders_stage.py` covers the step on synthetic VS/PS `PSV0` containers without game data.
