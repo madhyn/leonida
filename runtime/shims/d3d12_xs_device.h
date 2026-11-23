@@ -6,6 +6,8 @@
 //             the device in RCX and the buffer in RDX. The thunk takes the console form when RDX holds a device
 //             proxy, and forwards the PC form otherwise. Slots 25 and 43 return structs too; no call of them by
 //             the executable has been seen yet, so they are forwarded in the PC form.
+//   slot 41   CreateCommandSignature at its PC position; a console argument of type 105 (a 12-byte dispatch, read
+//             from the retail title's call sites) is created as D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH.
 //   slot 62   CreateComputePipelineState(desc, w2, w3, iid, out): two words (0 from XboxBvhBuilder, meaning unknown)
 //             before the IID. The PC slot 62 is CreateStateObject.
 //   slot 67   CreateComputePipelineState from native code (desc, iid, out): converts the Xbox native-code desc
