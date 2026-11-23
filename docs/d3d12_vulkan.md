@@ -2263,6 +2263,13 @@ The trace will enumerate them.
   The descriptions the title passes to slot 25 carry console values (layout word `0x101`/`0x1`, flag bits above the PC
   ones). The proxy gives the PC device a copy with the PC flags only and ROW_MAJOR (buffer) or UNKNOWN (texture); the
   title's array is never written (`d3d12_xs_desc_clean.h`, the same cleaning as slot 76; #6982 section 3.7).
+  A committed resource made through slots 76 and 127 also allocates that size through the title's
+  `__XMemAllocationHooks__`, as the console runtime's `XMemAlloc` for the resource does, and frees it when the
+  resource is destroyed (a lease kept with `SetPrivateDataInterface`; the bytes are not used). The retail title
+  budgets its first full-screen render targets with such a hook: it bump-allocates the allocations whose XALLOC
+  page-size field is 2 out of a range it reserved and asserts that less than 2 MiB is left (RT-5 stop 17). The
+  lease's attribute word (allocator ID 0x80, page-size field 2, object type 0) is an **assumption**; the measured
+  hook reads only the page-size field.
 - `GetAdapterLuid` (implemented): `VkPhysicalDeviceIDProperties::deviceLUID`, which on Windows is the DXGI
   adapter's LUID; `d3d12_fence_timing_test` finds it with `IDXGIFactory4::EnumAdapterByLuid` (RTX 4090, driver
   621.14). A driver that reports `deviceLUIDValid = VK_FALSE` gets a zero LUID, logged.

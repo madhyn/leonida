@@ -2013,6 +2013,97 @@ HRESULT proxy_create_compute_pipeline_from_native_code(DeviceProxy* self, const 
     return hr;
 }
 
+// ---- Committed resources take their memory through the title's XMem hooks (RT-5 stop 17) ----
+// On the console the D3D runtime allocates a committed resource's memory with XMemAlloc, so the allocation goes
+// through the title's __XMemAllocationHooks__. Around its first full-screen render targets (slot 127) the retail title
+// registers a per-thread matcher that bump-allocates out of a range it reserved, taking any allocation whose XALLOC
+// page-size field (bits 14..15) is 2, and afterwards asserts that less than 2 MiB of the range is left. Resources
+// created on the PC never allocated through the hooks, so the whole range was left and the assert fired. Each committed
+// resource made by slots 76 and 127 therefore allocates its size through the hooks as a lease: the resource holds it
+// (SetPrivateDataInterface) and the hooks' free runs when the resource is destroyed. The bytes are not used for the
+// resource; the PC device owns its memory. The size is the one slot 25 answers for the same description
+// (lease_size), the figure the title budgets with.
+// HYPOTHESIS: the attribute word, allocator ID 0x80 (eXALLOCAllocatorId_D3D) with page-size field 2 and object type 0.
+// Of it the measured matcher reads only the page-size field; a title hook that matches on other fields may not take
+// these leases for the console's allocations.
+inline constexpr std::uint64_t kXmemCommittedResourceAttributes = (0x80ULL << 16) | (2ULL << 14);
+
+// {6c1f3a52-8d47-4e0b-9b1e-2f7a5c3d9e61}: the private-data entry a committed resource keeps its lease under.
+constexpr GUID kTitleMemoryLeaseGuid{0x6c1f3a52, 0x8d47, 0x4e0b, {0x9b, 0x1e, 0x2f, 0x7a, 0x5c, 0x3d, 0x9e, 0x61}};
+
+// The console allocation for one clean description: a listed render-target shape's whole tiles, else the PC size.
+UINT64 lease_size(ID3D12Device* real, const D3D12_RESOURCE_DESC& clean_desc) {
+    if (const UINT64 tiles = console_render_target_size(clean_desc)) return tiles;
+    return real->GetResourceAllocationInfo(0, 1, &clean_desc).SizeInBytes;
+}
+
+// One reference is held by the resource; the last Release gives the memory back through the hooks' free.
+class TitleMemoryLease final : public IUnknown {
+public:
+    TitleMemoryLease(void* memory, DescriptorHeapBackingFree free_fn) : memory_(memory), free_(free_fn) {}
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** out) override {
+        if (!out) return E_POINTER;
+        if (!IsEqualIID(riid, __uuidof(IUnknown))) {
+            *out = nullptr;
+            return E_NOINTERFACE;
+        }
+        AddRef();
+        *out = this;
+        return S_OK;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return refs_.fetch_add(1, std::memory_order_relaxed) + 1; }
+    ULONG STDMETHODCALLTYPE Release() override {
+        const ULONG left = refs_.fetch_sub(1, std::memory_order_acq_rel) - 1;
+        if (left == 0) {
+            if (free_) free_(memory_, kXmemCommittedResourceAttributes);
+            delete this;
+        }
+        return left;
+    }
+
+private:
+    std::atomic<ULONG> refs_{1};
+    void* memory_;
+    DescriptorHeapBackingFree free_;
+};
+
+// `created` is the object a slot 76/127 creation returned (any interface of the resource). Nothing happens without
+// installed hooks, for a size the PC device refuses, or when the hooks return null; creation never fails here.
+void lease_title_resource_memory(DeviceProxy* self, void* created, const D3D12_RESOURCE_DESC& clean_desc) {
+    if (!created) return;
+    DescriptorHeapBackingAlloc alloc_fn = nullptr;
+    DescriptorHeapBackingFree free_fn = nullptr;
+    {
+        std::lock_guard lock(heap_alloc_mutex());
+        alloc_fn = g_heap_alloc;
+        free_fn = g_heap_free;
+    }
+    if (!alloc_fn) return;
+    const UINT64 size = lease_size(self->real, clean_desc);
+    if (size == 0 || size == UINT64_MAX || size > (std::numeric_limits<std::size_t>::max)()) return;
+    void* const memory = alloc_fn(static_cast<std::size_t>(size), kXmemCommittedResourceAttributes);
+    if (!memory) return;
+    ID3D12Object* object = nullptr;
+    auto* const lease = new (std::nothrow) TitleMemoryLease(memory, free_fn);
+    if (!lease || FAILED(static_cast<IUnknown*>(created)->QueryInterface(__uuidof(ID3D12Object),
+                                                                         reinterpret_cast<void**>(&object)))) {
+        if (lease)
+            lease->Release();  // frees the memory
+        else if (free_fn)
+            free_fn(memory, kXmemCommittedResourceAttributes);
+        return;
+    }
+    object->SetPrivateDataInterface(kTitleMemoryLeaseGuid, lease);  // the resource's reference
+    object->Release();
+    lease->Release();  // ours; from here the resource's reference is the only one
+    static std::atomic<bool> logged{false};
+    if (!logged.exchange(true, std::memory_order_relaxed))
+        std::fprintf(stderr,
+                     "[rt] d3d12_xs: committed resources lease their size through the title's XMem hooks (first: "
+                     "%llu B)\n",
+                     static_cast<unsigned long long>(size));
+}
+
 HRESULT proxy_create_resource(DeviceProxy* self, const D3D12_HEAP_PROPERTIES* heap_properties,
                               D3D12_HEAP_FLAGS heap_flags, const D3D12_RESOURCE_DESC* xbox_desc,
                               D3D12_RESOURCE_STATES initial_state, const D3D12_CLEAR_VALUE* clear_value,
@@ -2037,8 +2128,10 @@ HRESULT proxy_create_resource(DeviceProxy* self, const D3D12_HEAP_PROPERTIES* he
                      "[rt] d3d12_xs: slot 76 resource: dimension=%d xbox layout=0x%x -> PC layout=0x%x\n",
                      static_cast<int>(pc_desc.Dimension), xbox_layout, static_cast<unsigned>(pc_desc.Layout));
     }
-    return self->real->CreateCommittedResource(heap_properties, heap_flags, &pc_desc, initial_state, clear_value,
-                                               *riid, out);
+    const HRESULT hr = self->real->CreateCommittedResource(heap_properties, heap_flags, &pc_desc, initial_state,
+                                                           clear_value, *riid, out);
+    if (SUCCEEDED(hr)) lease_title_resource_memory(self, *out, pc_desc);
+    return hr;
 }
 
 // Device slot 133 is the console's CreatePlacedResourceX: (va, desc, state, clear, riid, out), measured on the retail
@@ -2164,13 +2257,37 @@ HRESULT proxy_create_committed_resource3_x(DeviceProxy* self, std::uint64_t heap
                                 const D3D12_RESOURCE_DESC1*, std::uint32_t, const D3D12_CLEAR_VALUE*,
                                 ID3D12ProtectedResourceSession*, std::uint32_t, const DXGI_FORMAT*, const IID*,
                                 void**);
-    const auto create = reinterpret_cast<Fn>(self->real_vtable[kPcCreateCommittedResource3]);
-    return create(self->real, reinterpret_cast<const D3D12_HEAP_PROPERTIES*>(heap_word),
-                  static_cast<D3D12_HEAP_FLAGS>(static_cast<std::uint32_t>(heap_flags)), &pc_desc,
-                  static_cast<std::uint32_t>(layout_word), reinterpret_cast<const D3D12_CLEAR_VALUE*>(clear_word),
-                  reinterpret_cast<ID3D12ProtectedResourceSession*>(session_word),
-                  static_cast<std::uint32_t>(castable_count), reinterpret_cast<const DXGI_FORMAT*>(castable_formats),
-                  riid, out);
+    // The ID3D12Device10 interface pointer, not the base device's: COM only promises that QueryInterface on the
+    // original pointer yields that interface, and a different pointer has its own vtable. Released after the call.
+    void* device10 = nullptr;
+#ifdef __ID3D12Device10_INTERFACE_DEFINED__
+    if (FAILED(self->real->QueryInterface(__uuidof(ID3D12Device10), &device10))) device10 = nullptr;
+#endif
+    if (!device10) return E_NOTIMPL;
+    const auto create = reinterpret_cast<Fn>((*reinterpret_cast<void***>(device10))[kPcCreateCommittedResource3]);
+    const HRESULT hr =
+        create(static_cast<ID3D12Device*>(device10), reinterpret_cast<const D3D12_HEAP_PROPERTIES*>(heap_word),
+               static_cast<D3D12_HEAP_FLAGS>(static_cast<std::uint32_t>(heap_flags)), &pc_desc,
+               static_cast<std::uint32_t>(layout_word), reinterpret_cast<const D3D12_CLEAR_VALUE*>(clear_word),
+               reinterpret_cast<ID3D12ProtectedResourceSession*>(session_word),
+               static_cast<std::uint32_t>(castable_count), reinterpret_cast<const DXGI_FORMAT*>(castable_formats), riid,
+               out);
+    static_cast<IUnknown*>(device10)->Release();
+    if (SUCCEEDED(hr)) {
+        D3D12_RESOURCE_DESC plain{};  // D3D12_RESOURCE_DESC1 without SamplerFeedbackMipRegion
+        plain.Dimension = pc_desc.Dimension;
+        plain.Alignment = pc_desc.Alignment;
+        plain.Width = pc_desc.Width;
+        plain.Height = pc_desc.Height;
+        plain.DepthOrArraySize = pc_desc.DepthOrArraySize;
+        plain.MipLevels = pc_desc.MipLevels;
+        plain.Format = pc_desc.Format;
+        plain.SampleDesc = pc_desc.SampleDesc;
+        plain.Layout = pc_desc.Layout;
+        plain.Flags = pc_desc.Flags;
+        lease_title_resource_memory(self, *out, plain);
+    }
+    return hr;
 }
 
 template <unsigned Slot>
