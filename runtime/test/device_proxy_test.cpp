@@ -247,6 +247,44 @@ int main(int argc, char** argv) {
         const D3D12_RESOURCE_ALLOCATION_INFO pc_info = device->GetResourceAllocationInfo(0, 1, &desc);
         check(pc_info.SizeInBytes == want.SizeInBytes && pc_info.Alignment == want.Alignment,
               "slot 25 still answers the PC (C++) form");
+
+        // A console depth-stencil texture that allows unordered access too, as a title sizes one: a 2D
+        // R32G8X24_TYPELESS texture with ALLOW_DEPTH_STENCIL | ALLOW_UNORDERED_ACCESS and the console layout word. The
+        // PC device refuses the flag pair (negative control); slot 25 sizes it as the depth-stencil texture alone.
+        D3D12_RESOURCE_DESC ds_uav{};
+        ds_uav.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        ds_uav.Width = 2560;
+        ds_uav.Height = 1440;
+        ds_uav.DepthOrArraySize = 1;
+        ds_uav.MipLevels = 1;
+        ds_uav.Format = DXGI_FORMAT_R32G8X24_TYPELESS;
+        ds_uav.SampleDesc.Count = 1;
+        ds_uav.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x101);
+        ds_uav.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        D3D12_RESOURCE_DESC pc_pair = ds_uav;
+        pc_pair.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+        check(real->GetResourceAllocationInfo(0, 1, &pc_pair).SizeInBytes == UINT64_MAX,
+              "the PC device refuses a depth-stencil texture with unordered access (negative control)");
+        D3D12_RESOURCE_DESC ds_only = pc_pair;
+        ds_only.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+        const D3D12_RESOURCE_ALLOCATION_INFO ds_want = real->GetResourceAllocationInfo(0, 1, &ds_only);
+        check(ds_want.SizeInBytes != UINT64_MAX, "WARP sizes the depth-stencil texture without unordered access");
+        const D3D12_RESOURCE_DESC ds_clean = rt::d3d12_xs::pc_resource_desc(ds_uav);
+        check(ds_clean.Flags == D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
+              "pc_resource_desc drops unordered access from a depth-stencil texture");
+        D3D12_RESOURCE_DESC uav_buffer = buffer_desc();
+        uav_buffer.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        D3D12_RESOURCE_DESC rt_uav = ds_only;
+        rt_uav.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        rt_uav.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        check(rt::d3d12_xs::pc_resource_desc(uav_buffer).Flags == D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS &&
+                  rt::d3d12_xs::pc_resource_desc(rt_uav).Flags == rt_uav.Flags,
+              "pc_resource_desc keeps unordered access on buffers and color textures");
+        D3D12_RESOURCE_ALLOCATION_INFO ds_got{~0ull, ~0ull};
+        get_alloc_info(&ds_got, device.Get(), 0, 1, &ds_uav);
+        check(ds_got.SizeInBytes != UINT64_MAX && ds_got.SizeInBytes >= ds_want.SizeInBytes &&
+                  (ds_got.SizeInBytes >> 32) == 0,
+              "slot 25 (C ABI) sizes a console depth-stencil texture with unordered access");
     }
 
     D3D12_RESOURCE_DESC reserved_desc = buffer_desc();

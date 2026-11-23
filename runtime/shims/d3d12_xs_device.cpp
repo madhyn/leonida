@@ -2455,6 +2455,10 @@ HRESULT proxy_create_resource(DeviceProxy* self, const D3D12_HEAP_PROPERTIES* he
     const auto xbox_layout = static_cast<std::uint32_t>(pc_desc.Layout);
     pc_desc.Layout = pc_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? D3D12_TEXTURE_LAYOUT_ROW_MAJOR
                                                                          : D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    // A console depth-stencil texture may allow unordered access; the PC one may not (without_depth_stencil_uav, the
+    // slot 25 stand-in). Only that bit is dropped here: the other flag bits go on as they came.
+    pc_desc.Flags = static_cast<D3D12_RESOURCE_FLAGS>(
+        without_depth_stencil_uav(pc_desc.Dimension, static_cast<std::uint32_t>(pc_desc.Flags)));
 
     static std::atomic<bool> logged{false};
     if (!logged.exchange(true, std::memory_order_relaxed)) {
@@ -3022,6 +3026,14 @@ void* WINAPI proxy_get_resource_allocation_info(std::uint64_t a0, std::uint64_t 
         for (UINT i = 0; i < desc_count; ++i) {
             const auto& desc = descs[i];
             clean[i] = call.console_abi || desc.Layout == kXboxTiledResourceLayout ? pc_resource_desc(desc) : desc;
+            static std::atomic<bool> uav_dropped{false};
+            if (((static_cast<std::uint32_t>(desc.Flags) & ~static_cast<std::uint32_t>(clean[i].Flags)) &
+                 D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) &&
+                first_call(uav_dropped))
+                std::fprintf(stderr,
+                             "[rt] d3d12_xs: slot 25: depth-stencil texture (format %d) sized without unordered "
+                             "access, which the PC refuses with it (stand-in)\n",
+                             static_cast<int>(desc.Format));
         }
         descs = clean.get();
     }
