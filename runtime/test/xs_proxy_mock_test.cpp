@@ -1137,8 +1137,8 @@ int check_xbox_slots() {
 
 // ---- 8. Environment overrides for the Xbox device slots (one process each, read once) ----
 
-int run_env_slots(bool valid) {
-    const char* frame_interval = valid ? "96" : "2";
+int run_env_slots(bool valid, bool on_slot74 = false) {
+    const char* frame_interval = on_slot74 ? "74" : valid ? "96" : "2";
     const char* schedule_event = valid ? "97" : "2";
     const char* wait_event = valid ? "98" : "2";
     const char* queue_x = valid ? "99" : "2";
@@ -1154,7 +1154,12 @@ int run_env_slots(bool valid) {
     EXPECT(device);
     xs::reset_device_proxy_stats();
     std::uint64_t token = 0;
-    if (valid) {
+    if (on_slot74) {
+        // SetFrameIntervalX moved onto 74, which also has a built-in handler: the override wins, so (output, interval,
+        // latency, flags) is a frame-interval call that reaches no PC slot, not the stand-in that ignores its words.
+        EXPECT(hr_of(raw(device, 74, 0, 16667, 1, 0)) == S_OK && mock->calls[74] == 0);
+        EXPECT(hr_of(raw(device, 78, 0, 16667, 1, 0)) == S_OK && mock->calls[78] == 1);  // the old default is a PC slot now
+    } else if (valid) {
         // Every route moved: the new slot is handled, the default slot is forwarded to the mock.
         EXPECT(hr_of(raw(device, 96, 0, 16667, 1, 0)) == S_OK && mock->calls[96] == 0);
         EXPECT(hr_of(raw(device, 97, 0, 0, 0, 0)) == S_OK && mock->calls[97] == 0);
@@ -1301,6 +1306,27 @@ int check_slot70() {
         // No destination, no write.
         raw(device, 70, word(words), word(view), 0);
         EXPECT(mock->calls[70] == 0 && mock->calls[18] == 1);
+        EXPECT(release(device) == 0 && mock->refs == 0);
+    }
+    return 0;
+}
+
+// ---- 8b. Device slot 74: (pointer, u32, pointer) succeeds and touches nothing, never the PC ShaderCacheControl ----
+
+int check_slot74() {
+    // Level 9 has the PC slot 74 (ShaderCacheControl); level 0 does not (44 PC slots). Neither may reach it.
+    for (const int level : {9, 0}) {
+        Mock* mock = nullptr;
+        void* device = make_device(mock, level, true);
+        EXPECT(device && xs::device_slot_overridden(74));
+        xs::reset_device_proxy_stats();
+        std::uint32_t first[4] = {0x11111111, 0x22222222, 0x33333333, 0x44444444};
+        std::uint32_t second[4] = {0x55555555, 0x66666666, 0x77777777, 0x88888888};
+        const std::uint32_t first_before[4] = {first[0], first[1], first[2], first[3]};
+        const std::uint32_t second_before[4] = {second[0], second[1], second[2], second[3]};
+        EXPECT(hr_of(raw(device, 74, word(first), 7, word(second))) == S_OK);
+        EXPECT(mock->calls[74] == 0 && xs::device_slot_hits(74) == 1);
+        EXPECT(std::memcmp(first, first_before, sizeof(first)) == 0 && std::memcmp(second, second_before, sizeof(second)) == 0);
         EXPECT(release(device) == 0 && mock->refs == 0);
     }
     return 0;
@@ -2157,6 +2183,7 @@ int main(int argc, char** argv) {
     if (argc == 2) {
         if (std::strcmp(argv[1], "--env-slots") == 0) return run_env_slots(true);
         if (std::strcmp(argv[1], "--env-slots-invalid") == 0) return run_env_slots(false);
+        if (std::strcmp(argv[1], "--env-slots-74") == 0) return run_env_slots(true, true);
         return run_fault_mode(argv[1]);
     }
     if (argc != 1) return 2;
@@ -2168,7 +2195,8 @@ int main(int argc, char** argv) {
         check_render_target_sizes() ||
         check_allocation_descriptions_cleaned() ||
         check_render_target_layout() ||
-        check_committed_resource_leases())
+        check_committed_resource_leases() ||
+        check_slot74())
         return 1;
     std::printf("xs_proxy_mock_test: PASS (%d allocations refused on purpose)\n", g_failed_news);
     return 0;
