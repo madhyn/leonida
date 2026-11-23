@@ -2247,6 +2247,14 @@ The trace will enumerate them.
   Intel Raptor Lake-S (101.7092) and RTX 5060 Laptop (621.24) hosts wrap, two 2^63 buffers to 0, and WARP on that
   PC still saturates. A wrapped total could make a caller allocate less than one of its resources, so the layer
   keeps saturating, and the test accepts a host that wraps.
+  Behind the Xbox-ABI proxy (device slot 25) a 2D render target of a listed colour format with one sample is padded to
+  whole console tiles: the size is the sum over its mips, each mip rounded up to the RDNA2 SW_64KB_D tile shape
+  (`runtime/src/gfx10_tiling.h`: 128 x 128 pixels for 4-byte elements, 128 x 64 for 8-byte ones), with the mips that
+  fit in one tile sharing one tail tile, times the array size. A 1920 x 1080 RGBA8 target is 135 tiles, 8,847,360 bytes,
+  where the PC answer is 8,323,072. The proxy adds the difference per description to the PC total when the console
+  size is larger and never lowers a size (`d3d12_xs_alloc_size.h`; `xs_proxy_mock_test`). **Assumption**: the
+  retail title's own sizes are not measured (#6982, stop 17), so that its allocation is these shapes and no DCC or
+  CMask memory is open until they are.
 - `GetAdapterLuid` (implemented): `VkPhysicalDeviceIDProperties::deviceLUID`, which on Windows is the DXGI
   adapter's LUID; `d3d12_fence_timing_test` finds it with `IDXGIFactory4::EnumAdapterByLuid` (RTX 4090, driver
   621.14). A driver that reports `deviceLUIDValid = VK_FALSE` gets a zero LUID, logged.

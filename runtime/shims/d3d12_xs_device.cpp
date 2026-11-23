@@ -25,6 +25,7 @@
 // behind the device before a presenter exists, so WaitFrameEventX returns at once with a fresh non-zero token.
 #include "d3d12_xs_device.h"
 #include "d3d12_trace.h"
+#include "d3d12_xs_alloc_size.h"
 #include "../src/shader_library.h"  // leonida::fspx_payload_from_parts for slot 67
 
 #include <windows.h>
@@ -2371,12 +2372,34 @@ StructReturnCall struct_return_call(std::uint64_t a0, std::uint64_t a1) {
     return {reinterpret_cast<DeviceProxy*>(a1), reinterpret_cast<void*>(a0)};  // C form: return buffer, this
 }
 
+// The size the PC device saturates a total at (docs/d3d12_vulkan.md, GetResourceAllocationInfo).
+constexpr UINT64 kSizeSaturated = 0xFFFFFFFFFFFF0000ull;
+
 void* WINAPI proxy_get_resource_allocation_info(std::uint64_t a0, std::uint64_t a1, std::uint64_t visible_mask,
                                                 std::uint64_t count, const D3D12_RESOURCE_DESC* descs) {
     note_slot(25);
     const StructReturnCall call = struct_return_call(a0, a1);
-    *static_cast<D3D12_RESOURCE_ALLOCATION_INFO*>(call.ret) = call.self->real->GetResourceAllocationInfo(
-        static_cast<UINT>(visible_mask), static_cast<UINT>(count), descs);
+    ID3D12Device* const real = call.self->real;
+    D3D12_RESOURCE_ALLOCATION_INFO info =
+        real->GetResourceAllocationInfo(static_cast<UINT>(visible_mask), static_cast<UINT>(count), descs);
+    // A render target takes whole console tiles, which the PC device's size does not (d3d12_xs_alloc_size.h). The
+    // total grows by what each render target lacks on its own, so the placement of the others stays as the PC lays it.
+    if (info.SizeInBytes != UINT64_MAX) {
+        const UINT64 extra = console_render_target_extra(descs, static_cast<UINT>(count), [&](UINT i) {
+            return real->GetResourceAllocationInfo(static_cast<UINT>(visible_mask), 1, &descs[i]).SizeInBytes;
+        });
+        if (extra) {
+            static std::atomic<bool> logged{false};
+            if (!logged.exchange(true, std::memory_order_relaxed))
+                std::fprintf(stderr,
+                             "[rt] d3d12_xs: slot 25: render target sizes padded to console tiles, +%llu B on "
+                             "%llu B for %u description(s)\n",
+                             static_cast<unsigned long long>(extra),
+                             static_cast<unsigned long long>(info.SizeInBytes), static_cast<unsigned>(count));
+            info.SizeInBytes = extra > kSizeSaturated - info.SizeInBytes ? kSizeSaturated : info.SizeInBytes + extra;
+        }
+    }
+    *static_cast<D3D12_RESOURCE_ALLOCATION_INFO*>(call.ret) = info;
     return call.ret;
 }
 
