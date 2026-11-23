@@ -819,6 +819,9 @@ struct ChildProxy {
     void** real_vtable;
     unsigned slot_count;    // public slots the real object implements; the rest of the table is refused
     std::atomic<unsigned long> refs;
+    // Allocators only: callback and context recorded by console slot 9 (SetAllocatorCallbackX).
+    std::atomic<std::uintptr_t> allocator_callback{0};
+    std::atomic<std::uintptr_t> allocator_callback_context{0};
 };
 
 template <ChildKind K>
@@ -856,6 +859,7 @@ const char* child_public_name(unsigned slot) {
         if (slot < kFence1PublicSlots) return fence[slot - 8];
     } else {
         if (slot == 8) return "Reset";
+        if (slot == 9) return "SetAllocatorCallbackX";
     }
     return nullptr;
 }
@@ -1364,6 +1368,24 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
         if constexpr (K == ChildKind::queue && Slot == kQueueExecuteCommandListsX) {
             d3d12_trace::record(child_trace_name<K>(Slot));
             return queue_execute_command_lists(self, a1, a2);
+        }
+        if constexpr (K == ChildKind::allocator && Slot == 9) {
+            // Console-only ID3D12CommandAllocator::SetAllocatorCallbackX(callback, context, ...), observed past the
+            // 9-slot PC chain on the retail executable (call shape: function pointer, context, plus trailing words).
+            // The PC/Vulkan layer manages command-buffer backing directly without invoking a title allocator callback,
+            // so record the callback and context on the proxy and return S_OK while leaving slots 10+ refused.
+            self->allocator_callback.store(static_cast<std::uintptr_t>(a1), std::memory_order_relaxed);
+            self->allocator_callback_context.store(static_cast<std::uintptr_t>(a2), std::memory_order_relaxed);
+            static std::atomic<bool> logged{false};
+            if (!logged.exchange(true, std::memory_order_relaxed)) {
+                std::fprintf(stderr,
+                             "[rt] d3d12_xs: allocator slot 9 (SetAllocatorCallbackX) recorded "
+                             "(callback=0x%llx context=0x%llx a3=0x%llx a4=0x%llx)\n",
+                             static_cast<unsigned long long>(a1), static_cast<unsigned long long>(a2),
+                             static_cast<unsigned long long>(a3), static_cast<unsigned long long>(a4));
+            }
+            d3d12_trace::record(child_trace_name<K>(Slot));
+            return hr_to_u64(S_OK);
         }
         if (Slot >= self->slot_count) {
             bool expected = false;
@@ -3064,6 +3086,18 @@ bool queue_slot_overridden(unsigned slot) {
 unsigned allocator_proxy_table_size() { return kAllocatorSlots; }
 unsigned allocator_proxy_slot_count(const void* allocator) {
     return is_allocator_proxy(allocator) ? static_cast<const ChildProxy*>(allocator)->slot_count : 0;
+}
+
+std::uintptr_t allocator_proxy_callback(const void* allocator) {
+    return is_allocator_proxy(allocator)
+               ? static_cast<const ChildProxy*>(allocator)->allocator_callback.load(std::memory_order_relaxed)
+               : 0;
+}
+
+std::uintptr_t allocator_proxy_callback_context(const void* allocator) {
+    return is_allocator_proxy(allocator)
+               ? static_cast<const ChildProxy*>(allocator)->allocator_callback_context.load(std::memory_order_relaxed)
+               : 0;
 }
 
 unsigned long command_object_proxy_ref_count(const void* object) {

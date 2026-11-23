@@ -985,9 +985,21 @@ int check_allocators() {
         EXPECT(xs::is_allocator_proxy(allocator) && word(xs::allocator_proxy_real_allocator(allocator)) == word(real));
         EXPECT(mock->args[9][0] == D3D12_COMMAND_LIST_TYPE_DIRECT && real->refs == 1);
         EXPECT(xs::allocator_proxy_slot_count(allocator) == 9 && xs::device_proxy_ref_count(device) == device_refs + 1);
-        // Reset (slot 8) reaches the real allocator; every slot past it up to the table end is refused.
+        // Reset (slot 8) reaches the real allocator; slot 9 (SetAllocatorCallbackX) records callback/context and
+        // succeeds without touching the real vtable; every slot past 9 up to the table end is refused.
         EXPECT(hr_of(raw(allocator, 8)) == S_OK && real->calls[8] == 1);
-        for (unsigned slot = 9; slot < xs::allocator_proxy_table_size(); ++slot)
+        EXPECT(xs::allocator_proxy_callback(allocator) == 0 && xs::allocator_proxy_callback_context(allocator) == 0);
+        EXPECT(xs::allocator_proxy_callback(nullptr) == 0 && xs::allocator_proxy_callback_context(device) == 0);
+        constexpr std::uintptr_t fake_cb = 0x12345678u;
+        constexpr std::uintptr_t fake_ctx = 0x9abcdef0u;
+        const std::uint64_t slot9_hits_before = xs::allocator_slot_hits(9);
+        EXPECT(hr_of(raw(allocator, 9, fake_cb, fake_ctx, 0, 0xfeedfaceu)) == S_OK && real->calls[9] == 0);
+        EXPECT(xs::allocator_slot_hits(9) == slot9_hits_before + 1 && xs::allocator_slot_first_call_seen(9));
+        EXPECT(xs::allocator_proxy_callback(allocator) == fake_cb &&
+               xs::allocator_proxy_callback_context(allocator) == fake_ctx);
+        EXPECT(hr_of(raw(allocator, 9, 0, 0)) == S_OK && real->calls[9] == 0);
+        EXPECT(xs::allocator_proxy_callback(allocator) == 0 && xs::allocator_proxy_callback_context(allocator) == 0);
+        for (unsigned slot = 10; slot < xs::allocator_proxy_table_size(); ++slot)
             EXPECT(hr_of(raw(allocator, slot)) == E_NOTIMPL && real->calls[slot] == 0);
         // The tag and the real object stay hidden: QueryInterface answers only the modelled interfaces.
         void* found = reinterpret_cast<void*>(1);

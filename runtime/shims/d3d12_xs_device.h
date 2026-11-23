@@ -203,10 +203,11 @@ std::uint64_t fence_table_overruns();
 // or the fault logger failed).
 bool command_object_tables_guarded();
 
-// Command allocator proxies (device slot 9): the public chain (9 slots: the base chain and Reset) is forwarded, a
-// slot past it up to the end of the table (64 slots) is logged and refused with E_NOTIMPL, and a read past the
-// table faults in a guard region, as for queues and fences. The console allocator's extra methods are not
-// measured and not guessed. Slot 9 wraps only an allocator that answers kLeonidaCommandAllocatorTag, Leonida's
+// Command allocator proxies (device slot 9): the public chain (9 slots: the base chain and Reset) is forwarded,
+// slot 9 (console SetAllocatorCallbackX(callback, context, ...)) records the callback and context on the proxy and
+// returns S_OK without invoking the callback on the PC/Vulkan path, slots 10..63 are logged and refused with
+// E_NOTIMPL, and a read past the table faults in a guard region, as for queues and fences. Slot 9 wraps only an
+// allocator that answers kLeonidaCommandAllocatorTag, Leonida's
 // own Vulkan-layer allocator: its command lists resolve the proxy (CreateCommandList, Reset). A PC runtime
 // allocator goes back unchanged, because the PC runtime's lists would take a proxy for their own allocator; a
 // command-list proxy that unwraps at Reset is what lets the host backend wrap allocators too.
@@ -218,6 +219,9 @@ bool is_allocator_proxy(const void* allocator);
 ID3D12CommandAllocator* allocator_proxy_real_allocator(const void* allocator);
 unsigned allocator_proxy_slot_count(const void* allocator);
 unsigned allocator_proxy_table_size();
+// Callback and context recorded by console allocator slot 9 (SetAllocatorCallbackX), or 0 if unset / not a proxy.
+std::uintptr_t allocator_proxy_callback(const void* allocator);
+std::uintptr_t allocator_proxy_callback_context(const void* allocator);
 std::uint64_t allocator_slot_hits(unsigned slot);
 bool allocator_slot_first_call_seen(unsigned slot);
 std::uint64_t allocator_table_overruns();
