@@ -806,7 +806,11 @@ static_assert(kQueueSlots * sizeof(void*) <= 4096 && kFenceSlots * sizeof(void*)
                   kAllocatorSlots * sizeof(void*) <= 4096,
               "a table must fit in the first page of its reservation");
 
+constexpr unsigned kQueueExecuteCommandLists = 10;   // (UINT, ID3D12CommandList* const*)
 constexpr unsigned kQueueSignal = 14, kQueueWait = 15;  // (ID3D12Fence*, UINT64)
+constexpr unsigned kQueueExecuteCommandListsX = 35;  // console ExecuteCommandLists(count, lists) variant
+static_assert(kQueueExecuteCommandLists < kQueuePublicSlots && kQueueExecuteCommandListsX < kQueueSlots,
+              "queue execution slots must stay within their respective tables");
 
 struct ChildProxy {
     void** vtable;          // offset 0: the caller's ID3D12CommandQueue* / ID3D12Fence* points here
@@ -847,6 +851,7 @@ const char* child_public_name(unsigned slot) {
     if (slot < 8) return object[slot];
     if constexpr (K == ChildKind::queue) {
         if (slot < kQueuePublicSlots) return queue[slot - 8];
+        if (slot == kQueueExecuteCommandListsX) return "ExecuteCommandListsX";
     } else if constexpr (K == ChildKind::fence) {
         if (slot < kFence1PublicSlots) return fence[slot - 8];
     } else {
@@ -1323,6 +1328,20 @@ LONG CALLBACK table_overrun_handler(EXCEPTION_POINTERS* info) {
     return EXCEPTION_CONTINUE_SEARCH;  // diagnostics only: the fault goes on to the title's handlers or the crash
 }
 
+std::uint64_t queue_execute_command_lists(ChildProxy* self, std::uint64_t count_word, std::uint64_t lists_word) {
+    // The array holds what the title got from the proxy: list proxies are replaced by the real lists in a copy, as
+    // for every other array of objects the real device or queue reads.
+    UnwrappedArray unwrapped_lists;
+    if (!unwrapped_lists.fill(lists_word, static_cast<UINT>(count_word))) return hr_to_u64(E_OUTOFMEMORY);
+    if (unwrapped_lists.data()) lists_word = unwrapped_lists.data();
+    // Pass zero-extended UINT in 64-bit RDX so both 32-bit PC implementations and 64-bit mock thunks see clean count.
+    using ExecuteFn = void(WINAPI*)(void*, std::uint64_t, ID3D12CommandList* const*);
+    reinterpret_cast<ExecuteFn>(self->real_vtable[kQueueExecuteCommandLists])(
+        self->real, static_cast<std::uint64_t>(static_cast<UINT>(count_word)),
+        reinterpret_cast<ID3D12CommandList* const*>(lists_word));
+    return 0;
+}
+
 template <ChildKind K, unsigned Slot>
 std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_t a2, std::uint64_t a3,
                                 std::uint64_t a4, std::uint64_t a5, std::uint64_t a6, std::uint64_t a7,
@@ -1342,6 +1361,10 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
                                              reinterpret_cast<void**>(a2)));
     } else {
         note_child_slot<K>(Slot);
+        if constexpr (K == ChildKind::queue && Slot == kQueueExecuteCommandListsX) {
+            d3d12_trace::record(child_trace_name<K>(Slot));
+            return queue_execute_command_lists(self, a1, a2);
+        }
         if (Slot >= self->slot_count) {
             bool expected = false;
             if (ChildStats<K>::beyond_warned[Slot].compare_exchange_strong(expected, true,
@@ -1357,6 +1380,9 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
             return hr_to_u64(E_NOTIMPL);
         }
         d3d12_trace::record(child_trace_name<K>(Slot));  // "called": the real object's result is not inspected
+        if constexpr (K == ChildKind::queue && Slot == kQueueExecuteCommandLists) {
+            return queue_execute_command_lists(self, a1, a2);
+        }
         if constexpr (K == ChildKind::queue && (Slot == kQueueSignal || Slot == kQueueWait)) a1 = unwrap_object(a1);
         UnwrappedArray unwrapped_lists;
         if constexpr (K == ChildKind::queue && Slot == 10) {
@@ -3030,6 +3056,11 @@ unsigned fence_proxy_slot_count(const void* fence) {
 
 unsigned queue_proxy_table_size() { return kQueueSlots; }
 unsigned fence_proxy_table_size() { return kFenceSlots; }
+
+bool queue_slot_overridden(unsigned slot) {
+    return slot <= 2 || slot == 7 || slot == kQueueSignal || slot == kQueueWait ||
+           slot == kQueueExecuteCommandListsX;
+}
 unsigned allocator_proxy_table_size() { return kAllocatorSlots; }
 unsigned allocator_proxy_slot_count(const void* allocator) {
     return is_allocator_proxy(allocator) ? static_cast<const ChildProxy*>(allocator)->slot_count : 0;

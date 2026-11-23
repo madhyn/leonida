@@ -1284,6 +1284,42 @@ int check_xbox_slots() {
 #endif
 }
 
+// ---- 7b. Xbox queue ExecuteCommandLists variant (queue slot 35 -> PC slot 10) ----
+
+int check_xbox_queue_slots() {
+    Mock* mock = nullptr;
+    void* device = make_device(mock, 9, true);
+    EXPECT(device);
+    void* queue = make_queue(device);
+    EXPECT(queue);
+    Mock* const queue_mock = reinterpret_cast<Mock*>(xs::queue_proxy_real_queue(queue));
+    xs::reset_device_proxy_stats();
+
+    EXPECT(xs::queue_slot_overridden(35) && xs::queue_slot_overridden(14) && xs::queue_slot_overridden(15));
+    EXPECT(!xs::queue_slot_overridden(10) && !xs::queue_slot_overridden(34) && !xs::queue_slot_overridden(36));
+
+    // Real objects, not numbers: the array is read to replace list proxies by their real lists, as slot 10's is.
+    Mock* const list_a = new_mock(Kind::command_list);
+    Mock* const list_b = new_mock(Kind::command_list);
+    void* lists[2] = {list_a, list_b};
+    EXPECT(raw(queue, 35, (0xdeadbeefull << 32) | 2ull, word(lists)) == 0);
+    EXPECT(xs::queue_slot_hits(35) == 1 && xs::queue_slot_first_call_seen(35));
+    EXPECT(xs::queue_slot_hits(10) == 0);
+    EXPECT(queue_mock->calls[35] == 0 && queue_mock->calls[10] == 1);
+    EXPECT(queue_mock->args[10][0] == 2);
+    EXPECT(queue_mock->array[10][0] == word(list_a) && queue_mock->array[10][1] == word(list_b));
+    EXPECT(lists[0] == list_a && lists[1] == list_b);  // the caller's array is not written
+
+    EXPECT(raw(queue, 35, 0, 0) == 0);
+    EXPECT(xs::queue_slot_hits(35) == 2 && queue_mock->calls[35] == 0 && queue_mock->calls[10] == 2);
+    EXPECT(queue_mock->args[10][0] == 0 && queue_mock->args[10][1] == 0);
+
+    EXPECT(release(queue) == 0 && release(device) == 0 && mock->refs == 0);
+    std::printf("%s: queue slot 35 routes ExecuteCommandLists(count, lists) to PC slot 10 with UINT count masking\n",
+                g_label);
+    return 0;
+}
+
 // ---- 8. Environment overrides for the Xbox device slots (one process each, read once) ----
 
 int run_env_slots(bool valid, bool on_slot74 = false) {
@@ -1777,8 +1813,10 @@ int check_tail(bool want_guarded) {
     // Signal (14) still reaches the real queue, with the real fence.
     EXPECT(hr_of(raw(queue, 14, word(fence), 5)) == S_OK && queue_mock->calls[14] == 1 &&
            queue_mock->args[14][0] == word(xs::fence_proxy_real_fence(fence)) && queue_mock->args[14][1] == 5);
-    for (unsigned slot = 19; slot < xs::queue_proxy_table_size(); ++slot)
+    for (unsigned slot = 19; slot < xs::queue_proxy_table_size(); ++slot) {
+        if (xs::queue_slot_overridden(slot)) continue;
         EXPECT(hr_of(raw(queue, slot)) == E_NOTIMPL && queue_mock->calls[slot] == 0);
+    }
     for (unsigned slot = 12; slot < xs::fence_proxy_table_size(); ++slot) EXPECT(hr_of(raw(fence, slot)) == E_NOTIMPL);
     EXPECT(xs::queue_table_overruns() == 0 && xs::fence_table_overruns() == 0);
     EXPECT(release(queue) == 0 && release(fence) == 0 && release(device) == 0 && mock->refs == 0);
@@ -2365,7 +2403,8 @@ int main(int argc, char** argv) {
         check_allocation_descriptions_cleaned() ||
         check_render_target_layout() ||
         check_committed_resource_leases() ||
-        check_slot74())
+        check_slot74() ||
+        check_xbox_queue_slots())
         return 1;
     std::printf("xs_proxy_mock_test: PASS (%d allocations refused on purpose)\n", g_failed_news);
     return 0;

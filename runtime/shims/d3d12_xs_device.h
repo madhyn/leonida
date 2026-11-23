@@ -64,11 +64,12 @@
 //
 // Command queues and fences (device slots 8, 75, 36, and 32 for a shared fence) come back wrapped in queue and fence
 // proxies of the same kind: the public chain (19 queue slots, 11 or 12 fence slots in SDK 10.0.26100) is forwarded
-// in PC order, and a slot past it, up to the end of the proxy's table (128 queue, 64 fence slots), is logged with its
-// first four argument words and refused with E_NOTIMPL. A slot past the table faults on the vtable read inside a
-// reserved, never-committed region, and the fault is logged with the slot. That is where the console's queue methods
-// (PresentX, SuspendX, ResumeX) will show up; their slots are not known and are not guessed, and that the console
-// keeps the public slots is an assumption (docs/d3d12_command_objects.md §5.2). Heap, queue and fence proxies are
+// in PC order. Queue slot 35 is the console ExecuteCommandLists(count, lists) variant and forwards to PC slot 10;
+// every other slot past the public chain, up to the end of the proxy's table (128 queue, 64 fence slots), is logged
+// with its first four argument words and refused with E_NOTIMPL. A slot past the table faults on the vtable read inside a
+// reserved, never-committed region, and the fault is logged with the slot. PresentX, SuspendX and ResumeX slots past
+// the public chain remain refused until measured and implemented, and that the console keeps the public slots is an
+// assumption (docs/d3d12_command_objects.md §5.2). Heap, queue and fence proxies are
 // unwrapped wherever a device or queue method hands them to the real runtime: queue Signal/Wait (14/15), device
 // CreateSharedHandle (31), MakeResident/Evict (34/35), SetEventOnMultipleFenceCompletion (45), SetResidencyPriority
 // (46) and EnqueueMakeResident (50). Command lists are not wrapped, so ExecuteCommandLists passes them through and a
@@ -185,6 +186,9 @@ unsigned queue_proxy_slot_count(const void* queue);
 unsigned fence_proxy_slot_count(const void* fence);
 unsigned queue_proxy_table_size();
 unsigned fence_proxy_table_size();
+// True for queue slots handled by the proxy instead of forwarded verbatim past IUnknown: 0-2 (IUnknown),
+// 7 (GetDevice), 14/15 (Signal/Wait unwrap fences), and 35 (Xbox ExecuteCommandLists variant -> PC slot 10).
+bool queue_slot_overridden(unsigned slot);
 // Live references on a queue, fence or allocator proxy (0 for anything else). Test helper.
 unsigned long command_object_proxy_ref_count(const void* object);
 // Per-slot call counters and first-call flags, shared by all queue proxies and all fence proxies.
