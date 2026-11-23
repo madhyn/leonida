@@ -10,7 +10,8 @@
 //     checks the viewport flip (D3D clip space is y-up) and the front-face winding;
 //   - full-screen blends that read destination alpha into B8G8R8X8 and B8G8R8A8 targets cleared with alpha 0.25:
 //     B8G8R8X8 has no alpha, so destination alpha reads 1 there, as on WARP and AMD's D3D12 driver;
-//   - an A8_UNORM render target where the device has VK_FORMAT_A8_UNORM_KHR: a draw and two alpha blends;
+//   - an A8_UNORM render target where the device has VK_FORMAT_A8_UNORM_KHR: a draw and two alpha blends, also on
+//     one created with A8_UNORM as its castable list (an R8_UNORM list is refused);
 //   - draws through RTVs in a format the texture's castable list names, in the other channel order (RGBA8 and BGRA8)
 //     or across B8G8R8X8 and B8G8R8A8: the bytes land in the view's order and encoding.
 // The shaders are GLSL written to the translator's contract (test/glsl/vs_draw.vert, ps_draw.frag). No game data.
@@ -891,12 +892,35 @@ int main() {
                 EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &a8_desc,
                                                                  D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr,
                                                                  IID_PPV_ARGS(&a8_target.p))));
-                device->CreateRenderTargetView(a8_target.p, nullptr, a8_rtv);
+                // The same target through CreateCommittedResource3 with its own format as the castable list. An R8_UNORM
+                // list is refused: no other format can be a view format of a VK_FORMAT_A8_UNORM_KHR image.
+                Ref<ID3D12Device10> a8_inner10;
+                EXPECT(SUCCEEDED(inner->QueryInterface(IID_PPV_ARGS(&a8_inner10.p))));
+                D3D12_RESOURCE_DESC1 a8_desc1{};
+                a8_desc1.Dimension = a8_desc.Dimension;
+                a8_desc1.Width = a8_desc.Width;
+                a8_desc1.Height = a8_desc.Height;
+                a8_desc1.DepthOrArraySize = a8_desc.DepthOrArraySize;
+                a8_desc1.MipLevels = a8_desc.MipLevels;
+                a8_desc1.Format = a8_desc.Format;
+                a8_desc1.SampleDesc = a8_desc.SampleDesc;
+                a8_desc1.Layout = a8_desc.Layout;
+                a8_desc1.Flags = a8_desc.Flags;
+                const DXGI_FORMAT a8_own = DXGI_FORMAT_A8_UNORM, a8_r8 = DXGI_FORMAT_R8_UNORM;
+                Ref<ID3D12Resource> a8_cast_target, a8_r8_target;
+                EXPECT(SUCCEEDED(a8_inner10->CreateCommittedResource3(&default_heap, D3D12_HEAP_FLAG_NONE, &a8_desc1,
+                    D3D12_BARRIER_LAYOUT_RENDER_TARGET, nullptr, nullptr, 1, &a8_own, IID_PPV_ARGS(&a8_cast_target.p))));
+                EXPECT(a8_inner10->CreateCommittedResource3(&default_heap, D3D12_HEAP_FLAG_NONE, &a8_desc1,
+                    D3D12_BARRIER_LAYOUT_RENDER_TARGET, nullptr, nullptr, 1, &a8_r8, IID_PPV_ARGS(&a8_r8_target.p)) ==
+                       E_INVALIDARG);
+                EXPECT(!a8_r8_target.p);
                 const FLOAT a8_clear[4] = {0.9f, 0.8f, 0.7f, 0.25f};  // only alpha lands
                 const D3D12_VIEWPORT a8_viewport{0, 0, 4, 4, 0, 1};
                 const D3D12_RECT a8_scissor{0, 0, 4, 4};
-                UINT64 a8_fence = 50;  // after the B8G8R8X8 block's 41..50, before the step-rate block's 61
+                UINT64 a8_fence = 50;  // after the B8G8R8X8 block's 41..50; 51..56, before the step-rate block's 61
+                for (ID3D12Resource* const a8_resource : {a8_target.p, a8_cast_target.p})
                 for (const A8Case& c : a8_cases) {
+                    device->CreateRenderTargetView(a8_resource, nullptr, a8_rtv);
                     D3D12_GRAPHICS_PIPELINE_STATE_DESC a8_pso_desc = fullscreen_desc;
                     a8_pso_desc.RTVFormats[0] = DXGI_FORMAT_A8_UNORM;
                     a8_pso_desc.BlendState.RenderTarget[0] = {
@@ -913,14 +937,14 @@ int main() {
                     list->OMSetRenderTargets(1, &a8_rtv, FALSE, nullptr);
                     list->SetGraphicsRootConstantBufferView(1, upload_va + 2048);
                     list->DrawInstanced(3, 1, 0, 0);
-                    const auto a8_to_copy = transition(a8_target.p, D3D12_RESOURCE_STATE_RENDER_TARGET,
+                    const auto a8_to_copy = transition(a8_resource, D3D12_RESOURCE_STATE_RENDER_TARGET,
                                                        D3D12_RESOURCE_STATE_COPY_SOURCE);
                     list->ResourceBarrier(1, &a8_to_copy);
                     D3D12_TEXTURE_COPY_LOCATION a8_dst{readback.p, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, {}};
                     a8_dst.PlacedFootprint = {0, {DXGI_FORMAT_A8_UNORM, 4, 4, 1, 256}};
-                    D3D12_TEXTURE_COPY_LOCATION a8_src{a8_target.p, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}};
+                    D3D12_TEXTURE_COPY_LOCATION a8_src{a8_resource, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}};
                     list->CopyTextureRegion(&a8_dst, 0, 0, 0, &a8_src, nullptr);
-                    const auto a8_to_target = transition(a8_target.p, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    const auto a8_to_target = transition(a8_resource, D3D12_RESOURCE_STATE_COPY_SOURCE,
                                                          D3D12_RESOURCE_STATE_RENDER_TARGET);
                     list->ResourceBarrier(1, &a8_to_target);
                     EXPECT(list->Close() == S_OK);
@@ -934,13 +958,14 @@ int main() {
                         for (UINT x = 0; x < 4; ++x) {
                             const int byte = got[y * 256 + x];
                             if (std::abs(byte - c.want) <= 1) continue;
-                            std::fprintf(stderr, "A8 target, %s: texel (%u,%u) got %d, want %d\n", c.name, x, y,
+                            std::fprintf(stderr, "A8 target%s, %s: texel (%u,%u) got %d, want %d\n",
+                                         a8_resource == a8_cast_target.p ? " (castable list)" : "", c.name, x, y,
                                          byte, c.want);
                             return 1;
                         }
                 }
-                std::printf("A8_UNORM render target: clear, draw and %u alpha blends matched\n",
-                            unsigned(std::size(a8_cases)));
+                std::printf("A8_UNORM render target: clear, draw and %u alpha blends matched, also with an A8_UNORM "
+                            "castable list (R8_UNORM refused)\n", unsigned(std::size(a8_cases)));
             }
         }
 

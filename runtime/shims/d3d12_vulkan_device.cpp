@@ -1428,12 +1428,20 @@ Format texture_format(const DeviceState& device, const D3D12_RESOURCE_DESC& desc
 // path, D3D-90's placed one). Each format must map and be the same texel size as the resource's: the host PC
 // runtime refuses other sizes, and a size-mismatched VkImageFormatListCreateInfo is a Vulkan validation error
 // (VUID-VkImageCreateInfo-pNext-06722). A nonzero count with a null list is no list. E_INVALIDARG on a bad format.
-HRESULT castable_view_formats(const Format& format, UINT32 count, const DXGI_FORMAT* castable,
-                              std::vector<VkFormat>& out) {
+// An A8_UNORM texture's own format is always viewable (create_texture adds the image's format), so naming it is a
+// no-op. An A8 render target's VK_FORMAT_A8_UNORM_KHR image (Format::a8_as_alpha) is in a class of its own: no
+// other format can be a view format of it, so any other castable format is refused here, before Vulkan.
+HRESULT castable_view_formats(const Format& format, DXGI_FORMAT resource_format, UINT32 count,
+                              const DXGI_FORMAT* castable, std::vector<VkFormat>& out) {
     if (!count || !castable) return S_OK;
     const bool depth = (format.aspects & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) != 0;
     const leonida::BlockFormat own = leonida::block_format(format.format, format.aspects);
     for (UINT32 i = 0; i < count; ++i) {
+        if (resource_format == DXGI_FORMAT_A8_UNORM && castable[i] == DXGI_FORMAT_A8_UNORM) continue;
+        if (format.a8_as_alpha) {
+            log_once("castable format of an A8_UNORM render target not supported (only A8_UNORM is):", castable[i]);
+            return E_INVALIDARG;
+        }
         const Format cast = vulkan_format(castable[i], depth);
         if (cast.format == VK_FORMAT_UNDEFINED) {
             log_once("castable format not supported yet:", castable[i]);
@@ -7424,7 +7432,7 @@ public:
                 hr = E_INVALIDARG;
             } else {
                 std::vector<VkFormat> cast_formats;
-                hr = castable_view_formats(format, castable_count, castable, cast_formats);
+                hr = castable_view_formats(format, desc->Format, castable_count, castable, cast_formats);
                 if (SUCCEEDED(hr)) hr = resource->create_texture(format, cast_formats);
                 if (SUCCEEDED(hr)) resource->keep_castable_formats(castable_count, castable);
             }
@@ -8589,7 +8597,7 @@ private:
                 hr = E_INVALIDARG;
             } else {
                 std::vector<VkFormat> cast_formats;
-                hr = castable_view_formats(format, castable_count, castable, cast_formats);
+                hr = castable_view_formats(format, desc->Format, castable_count, castable, cast_formats);
                 if (SUCCEEDED(hr)) hr = resource->create_texture(format, cast_formats);
                 if (SUCCEEDED(hr)) resource->keep_castable_formats(castable_count, castable);
             }
@@ -9798,7 +9806,8 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
 
 #ifdef VK_KHR_MAINTENANCE_5_EXTENSION_NAME
     // VK_KHR_maintenance5 brings VK_FORMAT_A8_UNORM_KHR (VulkanDeviceInfo::a8_render_target). It is enabled only where
-    // that format can be sampled and is a colour attachment the GPU can blend; nothing else here relies on it.
+    // that format can be sampled, copied (every texture is a transfer source and destination) and is a colour
+    // attachment the GPU can blend; nothing else here relies on it.
     VkPhysicalDeviceMaintenance5FeaturesKHR maintenance5{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES_KHR};
     if (has_device_extension(VK_KHR_MAINTENANCE_5_EXTENSION_NAME) && vkGetPhysicalDeviceFormatProperties) {
         VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &maintenance5};
@@ -9806,7 +9815,8 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
         VkFormatProperties a8{};
         vkGetPhysicalDeviceFormatProperties(info.physical, VK_FORMAT_A8_UNORM_KHR, &a8);
         const VkFormatFeatureFlags needed = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT |
-                                            VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT;
+                                            VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT |
+                                            VK_FORMAT_FEATURE_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
         info.a8_render_target = maintenance5.maintenance5 == VK_TRUE && (a8.optimalTilingFeatures & needed) == needed;
         if (info.a8_render_target) {
             maintenance5.pNext = *v13.next();

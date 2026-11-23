@@ -460,11 +460,13 @@ What is implemented (all of it testable without the game):
   - Single-sampled `A8_UNORM` 2D textures use one byte per texel in `VK_FORMAT_R8_UNORM`. Their SRVs expose
     (0, 0, 0, A) before applying the caller's component mapping. Format support includes `MIP` when the Vulkan
     image supports multiple levels. Where the GPU has `VK_FORMAT_A8_UNORM_KHR` (`VK_KHR_maintenance5`) and can
-    sample it and blend it as a colour attachment, a texture created with `ALLOW_RENDER_TARGET` is stored in that
+    sample, copy and blend it as a colour attachment, a texture created with `ALLOW_RENDER_TARGET` is stored in that
     format instead: its RTVs, PSO `RTVFormats` and clears use the alpha channel, its SRVs view it in the same format
     (the T# names its one channel X, gfx10's `channels_a`), and format support adds `RENDER_TARGET` and
     `BLENDABLE`. Vulkan puts A8 in a compatibility class of its own, so the two kinds of A8 texture cannot share
-    an image. Without that format, render targets are refused as before; depth-stencil and UAV creation are
+    an image. A castable-format list naming `A8_UNORM` itself is a no-op; any other format in it is refused with
+    `E_INVALIDARG` for such a render target, since no other format can view its image. Without that format,
+    render targets are refused as before; depth-stencil and UAV creation are
     unsupported for this format.
   - reserved resources and `GetResourceTiling` (section 4.2);
   - query heaps for occlusion, timestamps and pipeline statistics, and `GetTimestampFrequency` on the queue

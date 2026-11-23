@@ -515,7 +515,8 @@ public:
                 physical, VK_FORMAT_A8_UNORM_KHR, &a8);
             const VkFormatFeatureFlags needed = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
                                                 VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT |
-                                                VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT;
+                                                VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT |
+                                                VK_FORMAT_FEATURE_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
             a8_render_target =
                 maintenance5.maintenance5 == VK_TRUE && (a8.optimalTilingFeatures & needed) == needed;
         }
