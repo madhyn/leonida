@@ -997,6 +997,8 @@ int check_allocators() {
     return 0;
 }
 
+
+
 // ---- 7. Xbox device slots from the public HLE (48, 73, 78, 79, 80) and the retail title (41) ----
 //
 // A device that answers ID3D12Device11 (80 PC slots) is the Vulkan layer's shape: slots 78/79 are inside its table
@@ -1093,14 +1095,29 @@ int check_xbox_slots() {
     EXPECT(mock->calls[41] == 2 && mock->args[41][0] == word(&pc_sig));
     EXPECT(mock->array[41][1] == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH);
 
-    EXPECT(xs::device_slot_overridden(41) && xs::device_slot_overridden(48) && xs::device_slot_overridden(73) &&
+    // 61 CreateSamplerX(desc, dest): the PC CreateSampler (slot 22) gets the same two words, not the PC slot 61
+    // (CreateMetaCommand). A null description is skipped without reaching the device.
+    D3D12_SAMPLER_DESC sampler{};
+    sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+    sampler.AddressU = sampler.AddressV = sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+    sampler.MaxLOD = D3D12_FLOAT32_MAX;
+    const std::uint64_t sampler_handle = 0x7ff012340040ull;
+    raw(device, 61, word(&sampler), sampler_handle);
+    EXPECT(mock->calls[61] == 0 && mock->calls[22] == 1 && xs::device_slot_hits(61) == 1);
+    EXPECT(mock->args[22][0] == word(&sampler) && mock->args[22][1] == sampler_handle);
+    raw(device, 61, 0, sampler_handle);
+    EXPECT(mock->calls[61] == 0 && mock->calls[22] == 1 && xs::device_slot_hits(61) == 2);
+
+    EXPECT(xs::device_slot_overridden(41) && xs::device_slot_overridden(48) && xs::device_slot_overridden(61) &&
+           xs::device_slot_overridden(73) &&
            xs::device_slot_overridden(78) && xs::device_slot_overridden(79) && xs::device_slot_overridden(80));
 
     EXPECT(release(allocator) == 0 && real_allocator->refs == 0);
     EXPECT(release(queue) == 0);
     EXPECT(release(device) == 0 && mock->refs == 0);
-    std::printf("%s: device slots 48/73/78/79/80 route to a queue, a list and frame-event tokens without reaching "
-                "the mock's own PC slots; slot 41 creates argument type 105 as DISPATCH\n", g_label);
+    std::printf("%s: device slots 48/73/78/79/80 route to a queue, a list and frame-event tokens, and slot 61 to "
+                "CreateSampler, without reaching the mock's own PC slots; slot 41 creates argument type 105 as DISPATCH\n",
+                g_label);
     return 0;
 #else
     std::printf("%s: ID3D12Device11 is not in this SDK; Xbox slot 80's beyond-table case is not built\n", g_label);
