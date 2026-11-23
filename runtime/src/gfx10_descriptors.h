@@ -218,6 +218,7 @@ struct FormatRow {
 };
 
 inline constexpr Swizzle channels_r{select_x, select_zero, select_zero, select_one};
+inline constexpr Swizzle channels_a{select_zero, select_zero, select_zero, select_x};
 inline constexpr Swizzle channels_rg{select_x, select_y, select_zero, select_one};
 inline constexpr Swizzle channels_rgb{select_x, select_y, select_z, select_one};
 inline constexpr Swizzle channels_rgba = identity_swizzle;
@@ -227,6 +228,9 @@ inline constexpr Swizzle channels_abgr{select_w, select_z, select_y, select_x};
 
 inline constexpr FormatRow format_table[] = {
     {1, VK_FORMAT_R8_UNORM, channels_r},                          // GFX10_FORMAT_8_UNORM
+#ifdef VK_KHR_MAINTENANCE_5_EXTENSION_NAME
+    {1, VK_FORMAT_A8_UNORM_KHR, channels_a},                      // GFX10_FORMAT_8_UNORM (an A8 render target)
+#endif
     {2, VK_FORMAT_R8_SNORM, channels_r},                          // GFX10_FORMAT_8_SNORM
     {3, VK_FORMAT_R8_USCALED, channels_r},                        // GFX10_FORMAT_8_USCALED
     {4, VK_FORMAT_R8_SSCALED, channels_r},                        // GFX10_FORMAT_8_SSCALED

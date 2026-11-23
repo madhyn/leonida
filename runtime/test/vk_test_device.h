@@ -106,6 +106,9 @@ public:
     bool storage_buffer_8bit = false; // storageBuffer8BitAccess enabled
     bool conditional_rendering = false;  // VK_EXT_conditional_rendering enabled, where available
     bool host_image_copy = false;  // VK_EXT_host_image_copy and hostImageCopy enabled
+    // VK_KHR_maintenance5 enabled, where VK_FORMAT_A8_UNORM_KHR can be sampled and blended as a colour attachment, as
+    // gta6rt enables it (VulkanDeviceInfo::a8_render_target).
+    bool a8_render_target = false;
     // create(true) only: VK_KHR (else EXT) swapchain_maintenance1 and its feature enabled, with the surface half on the
     // instance, so a vsync swapchain can switch to IMMEDIATE or FIFO_RELAXED per present.
     bool swapchain_maintenance1 = false;
@@ -499,6 +502,28 @@ public:
             host_copy.pNext = *v13_.next();  // after the conditional rendering features, if any
             *v13_.next() = &host_copy;
         }
+#ifdef VK_KHR_MAINTENANCE_5_EXTENSION_NAME
+        VkPhysicalDeviceMaintenance5FeaturesKHR maintenance5{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES_KHR};
+        if (std::any_of(extensions.begin(), extensions.end(), [](const auto& e) {
+                return std::strcmp(e.extensionName, VK_KHR_MAINTENANCE_5_EXTENSION_NAME) == 0;
+            })) {
+            VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &maintenance5};
+            instance_fn<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(physical, &query);
+            VkFormatProperties a8{};
+            instance_fn<PFN_vkGetPhysicalDeviceFormatProperties>("vkGetPhysicalDeviceFormatProperties")(
+                physical, VK_FORMAT_A8_UNORM_KHR, &a8);
+            const VkFormatFeatureFlags needed = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
+                                                VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT |
+                                                VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT;
+            a8_render_target =
+                maintenance5.maintenance5 == VK_TRUE && (a8.optimalTilingFeatures & needed) == needed;
+        }
+        if (a8_render_target) {
+            maintenance5.pNext = *v13_.next();
+            *v13_.next() = &maintenance5;
+        }
+#endif
 
 #ifdef VK_KHR_SHADER_FMA_EXTENSION_NAME
         // VK_KHR_shader_fma where the device has it: translated shaders built with --fma khr use OpFmaKHR.
@@ -575,6 +600,9 @@ public:
         if (vertex_attribute_divisor) device_extensions.push_back(divisor_extension);
         if (conditional_rendering) device_extensions.push_back(conditional_extension);
         if (host_image_copy) device_extensions.push_back(host_image_copy_name);
+#ifdef VK_KHR_MAINTENANCE_5_EXTENSION_NAME
+        if (a8_render_target) device_extensions.push_back(VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
+#endif
         if (host_pointer_alignment) device_extensions.push_back(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
         const char* swapchain = "VK_KHR_swapchain";
         if (presentation) device_extensions.push_back(swapchain);

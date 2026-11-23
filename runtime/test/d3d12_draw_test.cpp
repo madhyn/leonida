@@ -10,6 +10,7 @@
 //     checks the viewport flip (D3D clip space is y-up) and the front-face winding;
 //   - full-screen blends that read destination alpha into B8G8R8X8 and B8G8R8A8 targets cleared with alpha 0.25:
 //     B8G8R8X8 has no alpha, so destination alpha reads 1 there, as on WARP and AMD's D3D12 driver;
+//   - an A8_UNORM render target where the device has VK_FORMAT_A8_UNORM_KHR: a draw and two alpha blends;
 //   - draws through RTVs in a format the texture's castable list names, in the other channel order (RGBA8 and BGRA8)
 //     or across B8G8R8X8 and B8G8R8A8: the bytes land in the view's order and encoding.
 // The shaders are GLSL written to the translator's contract (test/glsl/vs_draw.vert, ps_draw.frag). No game data.
@@ -119,6 +120,7 @@ int main() {
         info.device = d.device;
         info.queue = d.queue;
         info.queue_family = d.family;
+        info.a8_render_target = d.a8_render_target;
         info.buffer_device_address = true;
         info.subgroup = d.subgroup;
         info.shader_dir = library.string();
@@ -854,6 +856,92 @@ int main() {
             }
             std::printf("B8G8R8X8: %u blends that read destination alpha read 1, B8G8R8A8 its stored alpha\n",
                         unsigned(std::size(x8_cases)));
+        }
+
+        // An A8_UNORM render target (VK_FORMAT_A8_UNORM_KHR, VulkanDeviceInfo::a8_render_target): the full-screen draw
+        // writes alpha 1, and the alpha blend reads the cleared alpha 0.25 (byte 64) as the destination.
+        {
+            D3D12_FEATURE_DATA_FORMAT_SUPPORT a8_support{DXGI_FORMAT_A8_UNORM};
+            EXPECT(SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &a8_support,
+                                                         sizeof(a8_support))));
+            if (!(a8_support.Support1 & D3D12_FORMAT_SUPPORT1_RENDER_TARGET)) {
+                std::printf("A8_UNORM render target: not supported on this device (no VK_FORMAT_A8_UNORM_KHR)\n");
+            } else {
+                struct A8Case {
+                    const char* name;
+                    BOOL blend;
+                    D3D12_BLEND src_alpha, dst_alpha;
+                    int want;
+                };
+                constexpr A8Case a8_cases[] = {
+                    {"no blend", FALSE, D3D12_BLEND_ONE, D3D12_BLEND_ZERO, 255},
+                    {"alpha ZERO, ONE", TRUE, D3D12_BLEND_ZERO, D3D12_BLEND_ONE, 64},
+                    {"alpha INV_DEST_ALPHA, ZERO", TRUE, D3D12_BLEND_INV_DEST_ALPHA, D3D12_BLEND_ZERO, 191},
+                };
+                const D3D12_DESCRIPTOR_HEAP_DESC a8_heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1,
+                                                              D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+                Ref<ID3D12DescriptorHeap> a8_heap;
+                EXPECT(SUCCEEDED(device->CreateDescriptorHeap(&a8_heap_desc, IID_PPV_ARGS(&a8_heap.p))));
+                const D3D12_CPU_DESCRIPTOR_HANDLE a8_rtv{
+                    SIZE_T(reinterpret_cast<XboxHeapHandleFn>(slot(a8_heap.p, 9))(a8_heap.p))};
+                D3D12_RESOURCE_DESC a8_desc = rt_desc;
+                a8_desc.Width = a8_desc.Height = 4;
+                a8_desc.Format = DXGI_FORMAT_A8_UNORM;
+                Ref<ID3D12Resource> a8_target;
+                EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &a8_desc,
+                                                                 D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr,
+                                                                 IID_PPV_ARGS(&a8_target.p))));
+                device->CreateRenderTargetView(a8_target.p, nullptr, a8_rtv);
+                const FLOAT a8_clear[4] = {0.9f, 0.8f, 0.7f, 0.25f};  // only alpha lands
+                const D3D12_VIEWPORT a8_viewport{0, 0, 4, 4, 0, 1};
+                const D3D12_RECT a8_scissor{0, 0, 4, 4};
+                UINT64 a8_fence = 50;  // after the B8G8R8X8 block's 41..50, before the step-rate block's 61
+                for (const A8Case& c : a8_cases) {
+                    D3D12_GRAPHICS_PIPELINE_STATE_DESC a8_pso_desc = fullscreen_desc;
+                    a8_pso_desc.RTVFormats[0] = DXGI_FORMAT_A8_UNORM;
+                    a8_pso_desc.BlendState.RenderTarget[0] = {
+                        c.blend, FALSE, D3D12_BLEND_ONE, D3D12_BLEND_ZERO, D3D12_BLEND_OP_ADD, c.src_alpha,
+                        c.dst_alpha, D3D12_BLEND_OP_ADD, D3D12_LOGIC_OP_NOOP, D3D12_COLOR_WRITE_ENABLE_ALL};
+                    Ref<ID3D12PipelineState> a8_pso;
+                    EXPECT(SUCCEEDED(device->CreateGraphicsPipelineState(&a8_pso_desc, IID_PPV_ARGS(&a8_pso.p))));
+                    EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, a8_pso.p)));
+                    list->ClearRenderTargetView(a8_rtv, a8_clear, 0, nullptr);
+                    list->SetGraphicsRootSignature(root.p);
+                    list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                    list->RSSetViewports(1, &a8_viewport);
+                    list->RSSetScissorRects(1, &a8_scissor);
+                    list->OMSetRenderTargets(1, &a8_rtv, FALSE, nullptr);
+                    list->SetGraphicsRootConstantBufferView(1, upload_va + 2048);
+                    list->DrawInstanced(3, 1, 0, 0);
+                    const auto a8_to_copy = transition(a8_target.p, D3D12_RESOURCE_STATE_RENDER_TARGET,
+                                                       D3D12_RESOURCE_STATE_COPY_SOURCE);
+                    list->ResourceBarrier(1, &a8_to_copy);
+                    D3D12_TEXTURE_COPY_LOCATION a8_dst{readback.p, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, {}};
+                    a8_dst.PlacedFootprint = {0, {DXGI_FORMAT_A8_UNORM, 4, 4, 1, 256}};
+                    D3D12_TEXTURE_COPY_LOCATION a8_src{a8_target.p, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}};
+                    list->CopyTextureRegion(&a8_dst, 0, 0, 0, &a8_src, nullptr);
+                    const auto a8_to_target = transition(a8_target.p, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                                                         D3D12_RESOURCE_STATE_RENDER_TARGET);
+                    list->ResourceBarrier(1, &a8_to_target);
+                    EXPECT(list->Close() == S_OK);
+                    queue->ExecuteCommandLists(1, lists);
+                    EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
+                    ++a8_fence;
+                    EXPECT(SUCCEEDED(queue->Signal(fence.p, a8_fence)) &&
+                           SUCCEEDED(fence->SetEventOnCompletion(a8_fence, nullptr)));
+                    const auto* got = static_cast<const std::uint8_t*>(mapped);
+                    for (UINT y = 0; y < 4; ++y)
+                        for (UINT x = 0; x < 4; ++x) {
+                            const int byte = got[y * 256 + x];
+                            if (std::abs(byte - c.want) <= 1) continue;
+                            std::fprintf(stderr, "A8 target, %s: texel (%u,%u) got %d, want %d\n", c.name, x, y,
+                                         byte, c.want);
+                            return 1;
+                        }
+                }
+                std::printf("A8_UNORM render target: clear, draw and %u alpha blends matched\n",
+                            unsigned(std::size(a8_cases)));
+            }
         }
 
         // Instance step rate > 1 (VK_KHR/EXT_vertex_attribute_divisor): two per-instance colours in slot 1:

@@ -156,6 +156,9 @@ struct VulkanDeviceInfo {
     bool fragment_shader_barycentric = false;
     bool fragment_shader_interlock = false;
     bool maintenance8 = false;
+    // VK_KHR_maintenance5, enabled where its VK_FORMAT_A8_UNORM_KHR can be sampled and is a colour attachment the GPU
+    // can blend: A8_UNORM render targets are then stored in that format (other A8_UNORM textures stay R8_UNORM).
+    bool a8_render_target = false;
     // The instance enabled VK_EXT_debug_utils: SetMarker/BeginEvent/EndEvent become debug labels. Otherwise they
     // do nothing.
     bool debug_utils = false;
