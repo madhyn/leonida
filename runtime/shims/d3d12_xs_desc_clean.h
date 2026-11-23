@@ -21,7 +21,8 @@ constexpr std::uint32_t kPcResourceFlagsMask =
     D3D12_RESOURCE_FLAG_VIDEO_DECODE_REFERENCE_ONLY | D3D12_RESOURCE_FLAG_VIDEO_ENCODE_REFERENCE_ONLY |
     D3D12_RESOURCE_FLAG_RAYTRACING_ACCELERATION_STRUCTURE;
 
-constexpr auto kXboxTiledResourceLayout = static_cast<D3D12_TEXTURE_LAYOUT>(0x101);
+// Not constexpr: 0x101 is outside the unfixed enum's value range, which clang-cl rejects in a constant expression.
+inline const auto kXboxTiledResourceLayout = static_cast<D3D12_TEXTURE_LAYOUT>(0x101);
 
 // Strip Xbox-only flags and translate the Xbox tiled layout. Preserve all other layouts so the host can validate them.
 inline D3D12_RESOURCE_DESC pc_resource_desc(const D3D12_RESOURCE_DESC& xbox) {
