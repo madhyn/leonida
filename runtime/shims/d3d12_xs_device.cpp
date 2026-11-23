@@ -2483,13 +2483,14 @@ void** get_vtable();
 struct StructReturnCall {
     DeviceProxy* self;
     void* ret;
+    bool console_abi;
 };
 
 StructReturnCall struct_return_call(std::uint64_t a0, std::uint64_t a1) {
     void** const vtable = get_vtable();
     if (a0 && *reinterpret_cast<void***>(a0) == vtable)  // PC form: this, return buffer
-        return {reinterpret_cast<DeviceProxy*>(a0), reinterpret_cast<void*>(a1)};
-    return {reinterpret_cast<DeviceProxy*>(a1), reinterpret_cast<void*>(a0)};  // C form: return buffer, this
+        return {reinterpret_cast<DeviceProxy*>(a0), reinterpret_cast<void*>(a1), false};
+    return {reinterpret_cast<DeviceProxy*>(a1), reinterpret_cast<void*>(a0), true};  // C form: return buffer, this
 }
 
 // The console size of a list of descriptions (d3d12_xs_alloc_size.h): the PC device's answer with every console render
@@ -2516,8 +2517,8 @@ void* WINAPI proxy_get_resource_allocation_info(std::uint64_t a0, std::uint64_t 
     note_slot(25);
     const StructReturnCall call = struct_return_call(a0, a1);
     ID3D12Device* const real = call.self->real;
-    // The descriptions are the console's. The PC device gets a copy with PC flags and layout; the title's array is
-    // read only. A copy that cannot be made answers as an invalid description.
+    // Normalize console descriptors in a copy. PC calls can also pass the Xbox tiled layout explicitly. Otherwise
+    // their flags and layout reach the host unchanged so the host can validate them.
     const UINT desc_count = static_cast<UINT>(count);
     std::unique_ptr<D3D12_RESOURCE_DESC[]> clean;
     if (descs && desc_count) {
@@ -2526,7 +2527,10 @@ void* WINAPI proxy_get_resource_allocation_info(std::uint64_t a0, std::uint64_t 
             *static_cast<D3D12_RESOURCE_ALLOCATION_INFO*>(call.ret) = {UINT64_MAX, D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT};
             return call.ret;
         }
-        for (UINT i = 0; i < desc_count; ++i) clean[i] = pc_resource_desc(descs[i]);
+        for (UINT i = 0; i < desc_count; ++i) {
+            const auto& desc = descs[i];
+            clean[i] = call.console_abi || desc.Layout == kXboxTiledResourceLayout ? pc_resource_desc(desc) : desc;
+        }
         descs = clean.get();
     }
     const UINT mask = static_cast<UINT>(visible_mask);

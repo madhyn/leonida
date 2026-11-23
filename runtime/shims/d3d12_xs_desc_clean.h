@@ -21,12 +21,15 @@ constexpr std::uint32_t kPcResourceFlagsMask =
     D3D12_RESOURCE_FLAG_VIDEO_DECODE_REFERENCE_ONLY | D3D12_RESOURCE_FLAG_VIDEO_ENCODE_REFERENCE_ONLY |
     D3D12_RESOURCE_FLAG_RAYTRACING_ACCELERATION_STRUCTURE;
 
-// A copy of the title's description with the PC flags only and a PC layout: ROW_MAJOR for a buffer, UNKNOWN for a
-// texture (the layout the PC device picks itself).
+constexpr auto kXboxTiledResourceLayout = static_cast<D3D12_TEXTURE_LAYOUT>(0x101);
+
+// Strip Xbox-only flags and translate the Xbox tiled layout. Preserve all other layouts so the host can validate them.
 inline D3D12_RESOURCE_DESC pc_resource_desc(const D3D12_RESOURCE_DESC& xbox) {
     D3D12_RESOURCE_DESC pc = xbox;
-    pc.Layout = xbox.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? D3D12_TEXTURE_LAYOUT_ROW_MAJOR
-                                                                 : D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    if (pc.Layout == kXboxTiledResourceLayout) {
+        pc.Layout = pc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? D3D12_TEXTURE_LAYOUT_ROW_MAJOR
+                                                                   : D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    }
     pc.Flags = static_cast<D3D12_RESOURCE_FLAGS>(static_cast<std::uint32_t>(xbox.Flags) & kPcResourceFlagsMask);
     return pc;
 }

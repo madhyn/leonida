@@ -2261,8 +2261,9 @@ The trace will enumerate them.
   retail title's own sizes are not measured (#6982, stop 17), so that its allocation is these shapes and no DCC or
   CMask memory is open until they are.
   The descriptions the title passes to slot 25 carry console values (layout word `0x101`/`0x1`, flag bits above the PC
-  ones). The proxy gives the PC device a copy with the PC flags only and ROW_MAJOR (buffer) or UNKNOWN (texture); the
-  title's array is never written (`d3d12_xs_desc_clean.h`, the same cleaning as slot 76; #6982 section 3.7).
+  ones). For console-form calls or descriptors explicitly using layout `0x101`, the proxy strips Xbox-only flags and
+  translates layout `0x101` to ROW_MAJOR for buffers or UNKNOWN for textures. Other PC-form descriptors reach the host
+  unchanged for validation (`d3d12_xs_desc_clean.h`; #6982 section 3.7).
   A committed resource made through slots 76 and 127 also allocates that size through the title's
   `__XMemAllocationHooks__`, as the console runtime's `XMemAlloc` for the resource does, and frees it when the
   resource is destroyed (a lease kept with `SetPrivateDataInterface`; the bytes are not used). The retail title
