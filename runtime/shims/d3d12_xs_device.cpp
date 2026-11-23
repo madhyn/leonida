@@ -1943,7 +1943,15 @@ HRESULT proxy_create_compute_pipeline_state(DeviceProxy* self, const D3D12_COMPU
 // does; they record on a second command list of the title's context. So type 105 is taken as a dispatch whose
 // arguments are a D3D12_DISPATCH_ARGUMENTS. HYPOTHESIS: what the console does differently for it (which command
 // stream it feeds) is not known; the PC layer has one compute path. Other descriptions are forwarded unchanged.
-constexpr D3D12_INDIRECT_ARGUMENT_TYPE kXboxIndirectArgumentDispatch105 = static_cast<D3D12_INDIRECT_ARGUMENT_TYPE>(105);
+// 105 is outside D3D12_INDIRECT_ARGUMENT_TYPE's range, so the field is read as its 32 bits (a constant expression that
+// casts 105 to the enum does not compile with clang-cl).
+constexpr std::uint32_t kXboxIndirectArgumentDispatch105 = 105;
+
+std::uint32_t argument_type(const D3D12_INDIRECT_ARGUMENT_DESC& arg) {
+    std::uint32_t type = 0;
+    std::memcpy(&type, &arg.Type, sizeof(type));
+    return type;
+}
 
 HRESULT proxy_create_command_signature(DeviceProxy* self, const D3D12_COMMAND_SIGNATURE_DESC* desc,
                                        std::uint64_t root_signature, const IID* riid, void** out) {
@@ -1954,7 +1962,7 @@ HRESULT proxy_create_command_signature(DeviceProxy* self, const D3D12_COMMAND_SI
     bool console = false;
     if (desc && desc->pArgumentDescs)
         for (UINT i = 0; i < desc->NumArgumentDescs && !console; ++i)
-            console = desc->pArgumentDescs[i].Type == kXboxIndirectArgumentDispatch105;
+            console = argument_type(desc->pArgumentDescs[i]) == kXboxIndirectArgumentDispatch105;
     if (!console) return forward(self->real, desc, root_signature, riid, out);
 
     std::unique_ptr<D3D12_INDIRECT_ARGUMENT_DESC[]> args(new (std::nothrow)
@@ -1965,7 +1973,8 @@ HRESULT proxy_create_command_signature(DeviceProxy* self, const D3D12_COMMAND_SI
     }
     for (UINT i = 0; i < desc->NumArgumentDescs; ++i) {
         args[i] = desc->pArgumentDescs[i];
-        if (args[i].Type == kXboxIndirectArgumentDispatch105) args[i].Type = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH;
+        if (argument_type(args[i]) == kXboxIndirectArgumentDispatch105)
+            args[i].Type = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH;
     }
     static std::atomic<bool> logged{false};
     if (!logged.exchange(true, std::memory_order_relaxed))

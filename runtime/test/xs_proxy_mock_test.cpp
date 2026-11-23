@@ -293,8 +293,11 @@ std::uint64_t mock_call(Mock* m, unsigned slot, const std::uint64_t* words) {
             case 41:                                                        // CreateCommandSignature(desc, ...)
                 if (const auto* desc = reinterpret_cast<const D3D12_COMMAND_SIGNATURE_DESC*>(a1)) {
                     m->array[41][0] = desc->ByteStride | std::uint64_t{desc->NumArgumentDescs} << 32;
-                    for (UINT i = 0; desc->pArgumentDescs && i < desc->NumArgumentDescs && i < 3; ++i)
-                        m->array[41][i + 1] = static_cast<std::uint32_t>(desc->pArgumentDescs[i].Type);
+                    for (UINT i = 0; desc->pArgumentDescs && i < desc->NumArgumentDescs && i < 3; ++i) {
+                        std::uint32_t type = 0;  // read as its 32 bits: a console type is outside the enum's range
+                        std::memcpy(&type, &desc->pArgumentDescs[i].Type, sizeof(type));
+                        m->array[41][i + 1] = type;
+                    }
                 }
                 break;
             case 50: copy_array(m, slot, a3, a2); break;                    // (flags, count, objects, fence, value)
@@ -1068,7 +1071,8 @@ int check_xbox_slots() {
     D3D12_INDIRECT_ARGUMENT_DESC console_args[2]{};
     console_args[0].Type = D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT;
     console_args[0].Constant.Num32BitValuesToSet = 1;
-    console_args[1].Type = static_cast<D3D12_INDIRECT_ARGUMENT_TYPE>(105);
+    constexpr std::uint32_t kType105 = 105;  // outside the enum's range: written and read as its 32 bits
+    std::memcpy(&console_args[1].Type, &kType105, sizeof(kType105));
     const D3D12_COMMAND_SIGNATURE_DESC console_sig{16, 2, console_args, 0};
     const IID sig_iid = __uuidof(ID3D12CommandSignature);
     void* sig = nullptr;
@@ -1079,7 +1083,9 @@ int check_xbox_slots() {
     EXPECT(mock->array[41][0] == (16 | std::uint64_t{2} << 32));
     EXPECT(mock->array[41][1] == D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT &&
            mock->array[41][2] == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH);
-    EXPECT(console_args[1].Type == static_cast<D3D12_INDIRECT_ARGUMENT_TYPE>(105));  // the caller's copy is untouched
+    std::uint32_t caller_type = 0;
+    std::memcpy(&caller_type, &console_args[1].Type, sizeof(caller_type));
+    EXPECT(caller_type == kType105);  // the caller's description is untouched
     D3D12_INDIRECT_ARGUMENT_DESC pc_arg{};
     pc_arg.Type = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH;
     const D3D12_COMMAND_SIGNATURE_DESC pc_sig{12, 1, &pc_arg, 0};
