@@ -166,6 +166,12 @@ HRESULT WINAPI D3D12XboxCreateDevice(IUnknown* adapter, const void* params, cons
         std::fprintf(stderr,
                      "[rt] d3d12_xs: D3D12XboxCreateDevice: wrapping the PC ID3D12Device in the Xbox-ABI proxy "
                      "(slot 62 -> CreateComputePipelineState, slot 76 -> CreateCommittedResource).\n");
+        // A console method whose slot is another PC method (61) is served only to the title: a caller in an image
+        // this loader mapped.
+        rt::d3d12_xs::set_console_caller([](std::uint64_t address) {
+            std::uint64_t base = 0;
+            return rt::shims::mapped_image_base(address, base);
+        });
     }
 
 #ifdef LEONIDA_VULKAN_DEVICE

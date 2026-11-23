@@ -1095,18 +1095,28 @@ int check_xbox_slots() {
     EXPECT(mock->calls[41] == 2 && mock->args[41][0] == word(&pc_sig));
     EXPECT(mock->array[41][1] == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH);
 
-    // 61 CreateSamplerX(desc, dest): the PC CreateSampler (slot 22) gets the same two words, not the PC slot 61
-    // (CreateMetaCommand). A null description is skipped without reaching the device.
+    // 61 is CreateSamplerX(desc, dest) for the title and the PC CreateMetaCommand for a host caller. With no
+    // console-caller check installed (a host program like this one), the call is the PC slot 61.
     D3D12_SAMPLER_DESC sampler{};
     sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
     sampler.AddressU = sampler.AddressV = sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
     sampler.MaxLOD = D3D12_FLOAT32_MAX;
     const std::uint64_t sampler_handle = 0x7ff012340040ull;
     raw(device, 61, word(&sampler), sampler_handle);
-    EXPECT(mock->calls[61] == 0 && mock->calls[22] == 1 && xs::device_slot_hits(61) == 1);
+    EXPECT(mock->calls[61] == 1 && mock->calls[22] == 0 && xs::device_slot_hits(61) == 1);
+    // A caller the check calls the title's (here every one): the PC CreateSampler (slot 22) gets the same two words,
+    // not the PC slot 61. A null description is skipped without reaching the device.
+    xs::set_console_caller([](std::uint64_t) { return true; });
+    raw(device, 61, word(&sampler), sampler_handle);
+    EXPECT(mock->calls[61] == 1 && mock->calls[22] == 1 && xs::device_slot_hits(61) == 2);
     EXPECT(mock->args[22][0] == word(&sampler) && mock->args[22][1] == sampler_handle);
     raw(device, 61, 0, sampler_handle);
-    EXPECT(mock->calls[61] == 0 && mock->calls[22] == 1 && xs::device_slot_hits(61) == 2);
+    EXPECT(mock->calls[61] == 1 && mock->calls[22] == 1 && xs::device_slot_hits(61) == 3);
+    // A caller outside the title's images is a host one again.
+    xs::set_console_caller([](std::uint64_t) { return false; });
+    raw(device, 61, word(&sampler), sampler_handle);
+    EXPECT(mock->calls[61] == 2 && mock->calls[22] == 1);
+    xs::set_console_caller(nullptr);
 
     EXPECT(xs::device_slot_overridden(41) && xs::device_slot_overridden(48) && xs::device_slot_overridden(61) &&
            xs::device_slot_overridden(73) &&

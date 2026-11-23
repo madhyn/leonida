@@ -159,6 +159,12 @@ void set_console_descriptor_heap_handler(ConsoleDescriptorHeapHandler handler);
 // handles for the allocator proxy.
 bool device_slot_overridden(unsigned slot);
 
+// Whether a return address is in an image the guest loader mapped, i.e. the call comes from the title. Device slot 61
+// is CreateSamplerX for such a caller and the PC ID3D12Device5::CreateMetaCommand for any other; with no check
+// installed every caller is a host one. D3D12XboxCreateDevice installs rt::shims::mapped_image_base.
+using ConsoleCaller = bool (*)(std::uint64_t address);
+void set_console_caller(ConsoleCaller classify);
+
 // Queue and fence proxies created by device slots 8/75 and 36. The real_* accessors return the wrapped object
 // (no reference added), or null when the pointer is not such a proxy.
 bool is_queue_proxy(const void* queue);
