@@ -2,6 +2,8 @@
 //   - devices that stop at ID3D12Device, Device1, Device3 and Device9: the slots of a missing interface (45/46,
 //     50, 75) are refused without reaching the device, the others get the real objects behind the proxies;
 //   - fences with and without ID3D12Fence1: 11 or 12 public slots, QueryInterface and slot 11 to match;
+//   - fence slot 12: the address of a completed value that follows the real fence, from a CPU Signal through the
+//     proxy and from a signal the proxy never sees, up to device removal, with the descriptor's code pointer unused;
 //   - creation that fails, that returns S_OK with no object, a null IID or output, and an interface the real object
 //     has but the proxy does not model;
 //   - OpenSharedHandle of a fence (as ID3D12Fence, IUnknown, Fence1), of a non-fence object, of an invalid handle,
@@ -96,6 +98,10 @@ struct Mock {
     bool create_null;        // device: creation returns create_result with no object
     HRESULT create_result;   // device: what creation returns (S_OK makes the object)
     Mock* last_child;        // device: the object its last creation or open made
+    SRWLOCK lock;            // fence: guards completed, armed_value and armed_event (zeroed = SRWLOCK_INIT)
+    std::uint64_t completed; // fence: what GetCompletedValue (slot 8) returns
+    std::uint64_t armed_value;  // fence: the value SetEventOnCompletion (slot 9) waits for
+    HANDLE armed_event;      // fence: the event it sets then, or null
     unsigned calls[kMockSlots];
     std::uint64_t args[kMockSlots][5];
     std::uint64_t array[kMockSlots][4];  // device: the first entries of the array argument, as received
@@ -117,7 +123,40 @@ Mock* new_mock(Kind kind) {
     std::memset(m, 0, sizeof(*m));
     m->vtable = mock_vtable();
     m->kind = kind;
+    if (kind == Kind::fence) m->completed = kCompletedValue;
     return m;
+}
+
+// A mock fence's completed value, read and written under its lock: the proxy's wait thread calls slots 8 and 9 while
+// the test signals. Signal sets the one armed event once the value reaches it, as the PC fence does.
+std::uint64_t fence_completed(Mock* m) {
+    AcquireSRWLockExclusive(&m->lock);
+    const std::uint64_t value = m->completed;
+    ReleaseSRWLockExclusive(&m->lock);
+    return value;
+}
+
+void fence_signal(Mock* m, std::uint64_t value) {
+    AcquireSRWLockExclusive(&m->lock);
+    m->completed = value;
+    if (m->armed_event && value >= m->armed_value) {
+        SetEvent(m->armed_event);
+        m->armed_event = nullptr;
+    }
+    ReleaseSRWLockExclusive(&m->lock);
+}
+
+HRESULT fence_set_event(Mock* m, std::uint64_t value, HANDLE event) {
+    if (!event) return S_OK;  // the PC fence would block until `value`; no caller here does that
+    AcquireSRWLockExclusive(&m->lock);
+    if (m->completed >= value) {
+        SetEvent(event);
+    } else {
+        m->armed_value = value;
+        m->armed_event = event;
+    }
+    ReleaseSRWLockExclusive(&m->lock);
+    return S_OK;
 }
 
 bool mock_has(const Mock* m, REFIID iid) {
@@ -326,7 +365,14 @@ std::uint64_t mock_call(Mock* m, unsigned slot, const std::uint64_t* words) {
         }
         return S_OK;
     }
-    if (m->kind == Kind::fence && slot == 8) return kCompletedValue;  // GetCompletedValue
+    if (m->kind == Kind::fence) {
+        switch (slot) {
+            case 8: return fence_completed(m);  // GetCompletedValue
+            case 9: return static_cast<std::uint32_t>(fence_set_event(m, a1, reinterpret_cast<HANDLE>(a2)));
+            case 10: fence_signal(m, a1); return S_OK;  // Signal
+            default: break;
+        }
+    }
     if (m->kind == Kind::queue && slot == 10) copy_array(m, slot, a2, a1);  // ExecuteCommandLists(count, lists)
     if (m->kind == Kind::command_list && slot == 28) copy_array(m, slot, a2, a1);  // SetDescriptorHeaps(count, heaps)
     if (m->kind == Kind::command_list && slot == 46) copy_array(m, slot, a2, a1);  // OMSetRenderTargets(count, handles)
@@ -794,6 +840,88 @@ int check_fence1() {
     }
     std::printf("%s: fences without and with ID3D12Fence1: 11/12 slots, QueryInterface, slot 11 and creation as "
                 "Fence1 refused or forwarded to match\n", g_label);
+    return 0;
+}
+
+// ---- Fence slot 12: the completed value at an address ----
+
+std::atomic<int> g_descriptor_calls{0};
+void WINAPI descriptor_callback() { g_descriptor_calls.fetch_add(1); }
+
+// True once *completed reads `value`, within five seconds (the proxy's wait thread writes it).
+bool reads_within(const volatile std::uint64_t* completed, std::uint64_t value) {
+    for (int i = 0; i < 5000; ++i) {
+        if (*completed == value) return true;
+        Sleep(1);
+    }
+    return *completed == value;
+}
+
+int check_fence_completed_value() {
+    for (const bool fence1 : {false, true}) {  // past ID3D12Fence1 either way
+        Mock* mock = nullptr;
+        void* device = make_device(mock, 9, fence1);
+        EXPECT(device);
+        void* fence = make_fence(device);
+        Mock* const fence_mock = mock->last_child;
+        void* other = make_fence(device);
+        Mock* const other_mock = mock->last_child;
+        EXPECT(fence && other && fence_mock != other_mock);
+
+        // The title's shape: (value, descriptor with a code pointer in its second word, flags).
+        const std::uint64_t descriptor[4] = {0, reinterpret_cast<std::uint64_t>(&descriptor_callback), 0, 0};
+        const auto* completed =
+            reinterpret_cast<const volatile std::uint64_t*>(raw(fence, 12, 9, word(descriptor), 1));
+        EXPECT(completed && *completed == kCompletedValue);
+        EXPECT(xs::fence_slot_first_call_seen(12));
+        EXPECT(raw(fence, 12, 9, word(descriptor), 1) == word(completed));  // one address per fence
+        const auto* other_completed = reinterpret_cast<const volatile std::uint64_t*>(raw(other, 12, 0, 0, 0));
+        EXPECT(other_completed && other_completed != completed);
+
+        // A CPU Signal through the proxy shows at once.
+        EXPECT(hr_of(raw(fence, 10, 9)) == S_OK && fence_mock->completed == 9);
+        EXPECT(*completed == 9 && *other_completed == kCompletedValue);
+        // A signal the proxy never sees (a queue's, on the GPU) shows without another call, and again after it.
+        fence_signal(fence_mock, 12);
+        EXPECT(reads_within(completed, 12));
+        fence_signal(fence_mock, 40);
+        EXPECT(reads_within(completed, 40));
+        fence_signal(other_mock, 8);
+        EXPECT(reads_within(other_completed, 8) && *completed == 40);
+        // Device removal: the real fence reports ~0, which the title tests for, and nothing is armed after it.
+        fence_signal(fence_mock, ~std::uint64_t{0});
+        EXPECT(reads_within(completed, ~std::uint64_t{0}));
+        Sleep(50);
+        AcquireSRWLockExclusive(&fence_mock->lock);
+        const bool rearmed = fence_mock->armed_event != nullptr;
+        ReleaseSRWLockExclusive(&fence_mock->lock);
+        EXPECT(!rearmed);
+        EXPECT(g_descriptor_calls.load() == 0);  // the descriptor's code pointer is not called
+
+        // Release waits out the wait thread; both fences and the device go back to zero references.
+        EXPECT(release(fence) == 0 && fence_mock->refs == 0);
+        EXPECT(release(other) == 0 && other_mock->refs == 0);
+
+        // A fence whose slot 12 is never called arms nothing on the real fence.
+        void* quiet = make_fence(device);
+        Mock* const quiet_mock = mock->last_child;
+        EXPECT(quiet && hr_of(raw(quiet, 10, 3)) == S_OK && raw(quiet, 8) == 3 && quiet_mock->calls[9] == 0);
+        EXPECT(release(quiet) == 0 && quiet_mock->refs == 0);
+
+        // Out of memory for the mirror: slot 12 returns null, and the next call works.
+        void* starved = make_fence(device);
+        EXPECT(starved);
+        g_fail_news = 1;
+        const std::uint64_t none = raw(starved, 12, 0, 0, 0);
+        g_fail_news = 0;
+        EXPECT(none == 0);
+        const auto* later = reinterpret_cast<const volatile std::uint64_t*>(raw(starved, 12, 0, 0, 0));
+        EXPECT(later && *later == kCompletedValue);
+        EXPECT(release(starved) == 0);
+        EXPECT(release(device) == 0 && mock->refs == 0);
+    }
+    std::printf("%s: fence slot 12 returns one address per fence whose completed value follows CPU and unseen "
+                "signals up to device removal; the descriptor is not called\n", g_label);
     return 0;
 }
 
@@ -1871,7 +1999,8 @@ int check_tail(bool want_guarded) {
         if (xs::queue_slot_overridden(slot)) continue;
         EXPECT(hr_of(raw(queue, slot)) == E_NOTIMPL && queue_mock->calls[slot] == 0);
     }
-    for (unsigned slot = 12; slot < xs::fence_proxy_table_size(); ++slot) EXPECT(hr_of(raw(fence, slot)) == E_NOTIMPL);
+    EXPECT(raw(fence, 12) != 0);  // the completed value's address (check_fence_completed_value)
+    for (unsigned slot = 13; slot < xs::fence_proxy_table_size(); ++slot) EXPECT(hr_of(raw(fence, slot)) == E_NOTIMPL);
     EXPECT(xs::queue_table_overruns() == 0 && xs::fence_table_overruns() == 0);
     EXPECT(release(queue) == 0 && release(fence) == 0 && release(device) == 0 && mock->refs == 0);
     return 0;
@@ -2506,7 +2635,7 @@ int main(int argc, char** argv) {
         return run_fault_mode(argv[1]);
     }
     if (argc != 1) return 2;
-    if (check_tail(true) || check_levels() || check_slot48() || check_fence1() || check_create_failures() || check_open_shared() ||
+    if (check_tail(true) || check_levels() || check_slot48() || check_fence1() || check_fence_completed_value() || check_create_failures() || check_open_shared() ||
         check_alloc_failures() || check_allocators() || check_xbox_slots() || check_console_command_list() ||
         check_custom_heap_properties() ||
         check_resource_allocation_info() || check_slot70() || check_committed_resource3_x() ||

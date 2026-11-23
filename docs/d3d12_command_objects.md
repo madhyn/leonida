@@ -764,6 +764,12 @@ Queues and fences are wrapped the same way.
   object implements but the proxy does not model is logged once and refused.
 - **The refused tail.** A slot past the public chain, up to the end of the proxy's own table (128 queue and
   64 fence slots, every one a thunk), logs its first four argument words once and returns `E_NOTIMPL`.
+- **Fence slot 12.** The one served slot past the chain. The retail executable calls it as
+  `(value, descriptor, flags)` and reads the return as a pointer to the fence's 64-bit completed value: it
+  compares that value with `~0` (device removed) and subtracts the value it waits for. The proxy returns a
+  per-fence mirror. A wait on the real fence (`SetEventOnCompletion(completed + 1)`, re-armed after each
+  completion) keeps it current without another call, and slot 12 and the CPU `Signal` (10) refresh it at
+  once. The descriptor's second word is a code pointer, which is not called.
 - **The guard region.** Each table sits at the end of the first page of a 64 KiB reservation, and the rest
   of that reservation is never committed. A slot past the table therefore faults on the vtable read itself,
   inside the reservation, and a vectored handler logs the slot before the fault goes on. A vtable read that

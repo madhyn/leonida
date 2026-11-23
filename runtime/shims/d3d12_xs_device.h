@@ -66,7 +66,9 @@
 // proxies of the same kind: the public chain (19 queue slots, 11 or 12 fence slots in SDK 10.0.26100) is forwarded
 // in PC order. Queue slot 35 is the console ExecuteCommandLists(count, lists) variant and forwards to PC slot 10;
 // every other slot past the public chain, up to the end of the proxy's table (128 queue, 64 fence slots), is logged
-// with its first four argument words and refused with E_NOTIMPL. A slot past the table faults on the vtable read inside a
+// with its first four argument words and refused with E_NOTIMPL. Fence slot 12 is served instead: the retail executable
+// reads its return as the address of the fence's 64-bit completed value, so it returns a per-fence mirror that a wait on
+// the real fence keeps current (d3d12_xs_device.cpp, "Fence slot 12"). A slot past the table faults on the vtable read inside a
 // reserved, never-committed region, and the fault is logged with the slot. PresentX, SuspendX and ResumeX slots past
 // the public chain remain refused until measured and implemented, and that the console keeps the public slots is an
 // assumption (docs/d3d12_command_objects.md §5.2). Heap, queue and fence proxies are
