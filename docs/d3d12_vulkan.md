@@ -2247,12 +2247,17 @@ The trace will enumerate them.
   Intel Raptor Lake-S (101.7092) and RTX 5060 Laptop (621.24) hosts wrap, two 2^63 buffers to 0, and WARP on that
   PC still saturates. A wrapped total could make a caller allocate less than one of its resources, so the layer
   keeps saturating, and the test accepts a host that wraps.
-  Behind the Xbox-ABI proxy (device slot 25) a 2D render target of a listed colour format with one sample is padded to
-  whole console tiles: the size is the sum over its mips, each mip rounded up to the RDNA2 SW_64KB_D tile shape
-  (`runtime/src/gfx10_tiling.h`: 128 x 128 pixels for 4-byte elements, 128 x 64 for 8-byte ones), with the mips that
-  fit in one tile sharing one tail tile, times the array size. A 1920 x 1080 RGBA8 target is 135 tiles, 8,847,360 bytes,
-  where the PC answer is 8,323,072. The proxy adds the difference per description to the PC total when the console
-  size is larger and never lowers a size (`d3d12_xs_alloc_size.h`; `xs_proxy_mock_test`). **Assumption**: the
+  Behind the Xbox-ABI proxy (device slots 25 and 56) a 2D render target of a listed colour format with one sample is
+  padded to whole console tiles: the size is the sum over its mips (MipLevels 0 is the full chain, an odd extent
+  rounds up), each mip rounded up to the RDNA2 SW_64KB_D tile shape (`runtime/src/gfx10_tiling.h`: 256 x 128 pixels
+  for 2-byte elements, 128 x 128 for 4-byte, 128 x 64 for 8-byte, 64 x 64 for 16-byte), with the first mip that fits
+  in half a tile's width and a whole tile's height, and the mips after it, sharing one tail tile, times the array
+  size. A 1920 x 1080 RGBA8 target is 135 tiles, 8,847,360 bytes, where the PC answer is 8,323,072. The proxy lays
+  the descriptions out as the PC device does (each at its own alignment, the total rounded up to the largest
+  alignment, sums saturating) with each render target at the larger of its console size and its PC size; a 4 MiB
+  aligned multisampled neighbour therefore keeps its place (a 1 x 1 four-sample target and a 1080p target need 16 MiB,
+  not 12.5). Slot 56 reports the same offsets. The PC layout stands when no description grows
+  (`d3d12_xs_alloc_size.h`; `xs_proxy_mock_test`). **Assumption**: the
   retail title's own sizes are not measured (#6982, stop 17), so that its allocation is these shapes and no DCC or
   CMask memory is open until they are.
   The descriptions the title passes to slot 25 carry console values (layout word `0x101`/`0x1`, flag bits above the PC
@@ -2274,8 +2279,9 @@ The trace will enumerate them.
   RDX, node mask in R8 and heap type in R9: three calls right after device creation, node mask 1 and types 1, 2
   and 3 (measured under `gta6rt --run` with a register probe in the slot's thunk). A PC C++ method has the device
   in RCX and the buffer in RDX, so the Xbox-ABI proxy takes the console form when RDX holds the proxy
-  (`d3d12_xs_device.cpp`; `xs_proxy_mock_test`, `device_proxy_test`). Slots 25 and 43 return structs too; the
-  executable has not been seen calling them yet, so the proxy still forwards them in the PC form.
+  (`d3d12_xs_device.cpp`; `xs_proxy_mock_test`, `device_proxy_test`). Slot 43 returns a struct too and the
+  proxy still forwards it in the PC form: no call of slot 43 has been seen. Slots 25 and 56 take the same form by the
+  same rule (reported later in the boot, #6982; not measured), as #6973 first did for slot 25.
 - Residency and power (D3D-33) are no-ops that still check their arguments (`d3d12_vulkan_device.cpp`, tested in
   `d3d12_vulkan_device_test`). Vulkan has no residency API: memory from `vkAllocateMemory` stays usable until
   `vkFreeMemory`, and paging under pressure is the kernel driver's job, so every pageable object is always resident.

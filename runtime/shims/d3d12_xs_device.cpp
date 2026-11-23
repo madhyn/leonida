@@ -33,6 +33,7 @@
 #include <dxgi1_4.h>
 
 #include <atomic>
+#include <functional>
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
@@ -237,6 +238,7 @@ const char* slot_name(unsigned slot) {
         case 46: return "SetResidencyPriority (proxies unwrapped)";
         case 48: return "Xbox CreateCommandQueueX -> queue proxy";
         case 50: return "EnqueueMakeResident (proxies unwrapped)";
+        case 56: return "GetResourceAllocationInfo1 (C or PC form)";
         case 62: return "Xbox CreateComputePipelineState";
         case 67: return "Xbox DeserializeComputePipelineStateX";
         case 70: return "Xbox shader-resource view from raw words";
@@ -2373,8 +2375,24 @@ StructReturnCall struct_return_call(std::uint64_t a0, std::uint64_t a1) {
     return {reinterpret_cast<DeviceProxy*>(a1), reinterpret_cast<void*>(a0)};  // C form: return buffer, this
 }
 
-// The size the PC device saturates a total at (docs/d3d12_vulkan.md, GetResourceAllocationInfo).
-constexpr UINT64 kSizeSaturated = 0xFFFFFFFFFFFF0000ull;
+// The console size of a list of descriptions (d3d12_xs_alloc_size.h): the PC device's answer with every console render
+// target laid out at its console size, each at its own alignment. `info` is the PC answer and is replaced only when
+// the console layout is larger. `each` is the per-description array of slot 56, or null.
+void apply_console_placement(const D3D12_RESOURCE_DESC* descs, UINT count, D3D12_RESOURCE_ALLOCATION_INFO& info,
+                             D3D12_RESOURCE_ALLOCATION_INFO1* each,
+                             const std::function<D3D12_RESOURCE_ALLOCATION_INFO(UINT)>& pc_one, unsigned slot) {
+    if (info.SizeInBytes == UINT64_MAX) return;
+    D3D12_RESOURCE_ALLOCATION_INFO console{};
+    if (!console_placement(descs, count, pc_one, console, each)) return;
+    static std::atomic<bool> logged{false};
+    if (!logged.exchange(true, std::memory_order_relaxed))
+        std::fprintf(stderr,
+                     "[rt] d3d12_xs: slot %u: render targets sized as console tiles, %llu B for %llu B on %u "
+                     "description(s)\n",
+                     slot, static_cast<unsigned long long>(console.SizeInBytes),
+                     static_cast<unsigned long long>(info.SizeInBytes), static_cast<unsigned>(count));
+    if (console.SizeInBytes >= info.SizeInBytes) info = console;
+}
 
 void* WINAPI proxy_get_resource_allocation_info(std::uint64_t a0, std::uint64_t a1, std::uint64_t visible_mask,
                                                 std::uint64_t count, const D3D12_RESOURCE_DESC* descs) {
@@ -2394,27 +2412,37 @@ void* WINAPI proxy_get_resource_allocation_info(std::uint64_t a0, std::uint64_t 
         for (UINT i = 0; i < desc_count; ++i) clean[i] = pc_resource_desc(descs[i]);
         descs = clean.get();
     }
-    D3D12_RESOURCE_ALLOCATION_INFO info =
-        real->GetResourceAllocationInfo(static_cast<UINT>(visible_mask), desc_count, descs);
-    // A render target takes whole console tiles, which the PC device's size does not (d3d12_xs_alloc_size.h). The
-    // total grows by what each render target lacks on its own, so the placement of the others stays as the PC lays it.
-    if (info.SizeInBytes != UINT64_MAX) {
-        const UINT64 extra = console_render_target_extra(descs, static_cast<UINT>(count), [&](UINT i) {
-            return real->GetResourceAllocationInfo(static_cast<UINT>(visible_mask), 1, &descs[i]).SizeInBytes;
-        });
-        if (extra) {
-            static std::atomic<bool> logged{false};
-            if (!logged.exchange(true, std::memory_order_relaxed))
-                std::fprintf(stderr,
-                             "[rt] d3d12_xs: slot 25: render target sizes padded to console tiles, +%llu B on "
-                             "%llu B for %u description(s)\n",
-                             static_cast<unsigned long long>(extra),
-                             static_cast<unsigned long long>(info.SizeInBytes), static_cast<unsigned>(count));
-            info.SizeInBytes = extra > kSizeSaturated - info.SizeInBytes ? kSizeSaturated : info.SizeInBytes + extra;
-        }
-    }
+    const UINT mask = static_cast<UINT>(visible_mask);
+    D3D12_RESOURCE_ALLOCATION_INFO info = real->GetResourceAllocationInfo(mask, desc_count, descs);
+    apply_console_placement(descs, desc_count, info, nullptr,
+                            [&](UINT i) { return real->GetResourceAllocationInfo(mask, 1, &descs[i]); }, 25);
     *static_cast<D3D12_RESOURCE_ALLOCATION_INFO*>(call.ret) = info;
     return call.ret;
+}
+
+// Slot 56, ID3D12Device4::GetResourceAllocationInfo1: the same answer, and the per-description offsets follow the
+// padded sizes, so a title that places its resources at those offsets does not overlap them. The call is forwarded
+// as it came; the console layout then replaces the total and the offsets.
+void* WINAPI proxy_get_resource_allocation_info1(std::uint64_t a0, std::uint64_t a1, std::uint64_t visible_mask,
+                                                 std::uint64_t count, const D3D12_RESOURCE_DESC* descs,
+                                                 D3D12_RESOURCE_ALLOCATION_INFO1* each) {
+    const StructReturnCall call = struct_return_call(a0, a1);
+    DeviceProxy* const self = call.self;
+    note_slot(56);
+    if (56 >= self->slot_count) {
+        return reinterpret_cast<void*>(hr_to_u64(refuse_beyond_device(56, self->slot_count)));
+    }
+    using Fn = void*(WINAPI*)(void*, void*, UINT, UINT, const D3D12_RESOURCE_DESC*, D3D12_RESOURCE_ALLOCATION_INFO1*);
+    const UINT n = static_cast<UINT>(count);
+    void* const returned = reinterpret_cast<Fn>(self->real_vtable[56])(
+        self->real, call.ret, static_cast<UINT>(visible_mask), n, descs, each);
+    if (each) {
+        auto& info = *static_cast<D3D12_RESOURCE_ALLOCATION_INFO*>(call.ret);
+        apply_console_placement(descs, n, info, each, [&](UINT i) {
+            return D3D12_RESOURCE_ALLOCATION_INFO{each[i].SizeInBytes, each[i].Alignment};
+        }, 56);
+    }
+    return returned;
 }
 
 void** get_vtable() {
@@ -2422,6 +2450,7 @@ void** get_vtable() {
         static void* storage[kMaxSlots];
         fill_vtable(storage, std::make_index_sequence<kMaxSlots>{});
         storage[25] = reinterpret_cast<void*>(&proxy_get_resource_allocation_info);
+        storage[56] = reinterpret_cast<void*>(&proxy_get_resource_allocation_info1);
         return storage;
     }();
     return vtable;
@@ -2578,7 +2607,7 @@ ID3D12Device* device_proxy_real_device(const void* device) {
 
 bool device_slot_overridden(unsigned slot) {
     if (slot <= 2 || slot == 8 || slot == 9 || slot == 14 || (slot >= 17 && slot <= 24) || slot == 25 || slot == 26 || slot == 31 || slot == 32 || slot == 34 || slot == 35 ||
-        slot == 36 || slot == 45 || slot == 46 || slot == 50 || slot == 62 || slot == 67 ||
+        slot == 36 || slot == 45 || slot == 46 || slot == 50 || slot == 56 || slot == 62 || slot == 67 ||
         slot == 70 || slot == 75 || slot == 76 || slot == 133 || slot == kCreateCommittedResource3X)
         return true;
     const XboxDeviceSlotRoutes& routes = xbox_device_slot_routes();
