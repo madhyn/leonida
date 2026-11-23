@@ -37,7 +37,9 @@
 #include <deque>
 #include <functional>
 #include <limits>
+#include <memory>
 #include <mutex>
+#include <utility>
 
 namespace leonida {
 
@@ -143,9 +145,19 @@ struct FrameStatistic {
     float percent_scanned = 0.0f;    // display entries: where the scan was when the frame came up (0 at a vblank)
 };
 
+class FrameTokenSource {
+public:
+    std::uint64_t issue() { return last_.fetch_add(1, std::memory_order_acq_rel) + 1; }
+    std::uint64_t issued() const { return last_.load(std::memory_order_acquire); }
+
+private:
+    std::atomic<std::uint64_t> last_{0};
+};
+
 class FramePacer {
 public:
-    explicit FramePacer(FrameClock& clock) : clock_(clock) {
+    explicit FramePacer(FrameClock& clock, std::shared_ptr<FrameTokenSource> tokens = nullptr)
+        : clock_(clock), tokens_(tokens ? std::move(tokens) : std::make_shared<FrameTokenSource>()) {
         clock_.set_wake([this] {
             { std::lock_guard guard(mutex_); }
             cv_.notify_all();
@@ -263,7 +275,7 @@ public:
         std::lock_guard guard(mutex_);
         if (issue) *issue = TokenIssue::none;
         if (suspended_) return pacer_hr::invalid_state;
-        if (token > issued_) return pacer_hr::invalid_arg;
+        if (token > tokens_->issued()) return pacer_hr::invalid_arg;
         if (issue) {
             if (token == 0) *issue = TokenIssue::null_token;
             else if (token == last_presented_) *issue = TokenIssue::repeated;
@@ -357,7 +369,8 @@ public:
     }
 
     bool suspended() const { std::lock_guard guard(mutex_); return suspended_; }
-    std::uint64_t tokens_issued() const { std::lock_guard guard(mutex_); return issued_; }
+    std::uint64_t tokens_issued() const { return tokens_->issued(); }
+    const std::shared_ptr<FrameTokenSource>& token_source() const { return tokens_; }
     std::uint32_t frames_in_flight() {
         std::lock_guard guard(mutex_);
         retire_locked(clock_.now_us());
@@ -408,7 +421,7 @@ private:
             const std::uint64_t now = clock_.now_us();
             retire_locked(now);
             if (uncapped_) {  // no vblank grid and no latency throttle: a token at once, due now
-                *token = ++issued_;
+                *token = tokens_->issue();
                 Record record;
                 record.token = *token;
                 record.origin_us = now;
@@ -426,7 +439,7 @@ private:
                     const std::int64_t newest = std::int64_t((now - first) / period_us_);
                     const std::int64_t origin = std::max(next, newest);
                     last_origin_ = origin;
-                    *token = ++issued_;
+                    *token = tokens_->issue();
                     Record record;
                     record.token = *token;
                     record.origin_us = first + std::uint64_t(origin) * period_us_;
@@ -457,7 +470,7 @@ private:
     std::uint32_t offset_us_ = 0;
     std::uint64_t epoch_us_ = 0;
     std::int64_t last_origin_ = 0;  // origin 0 is the epoch itself, which has passed
-    std::uint64_t issued_ = 0;
+    std::shared_ptr<FrameTokenSource> tokens_;
     std::uint64_t last_presented_ = 0;
     std::uint64_t immediate_presents_ = 0;
     std::deque<Pending> pending_;
