@@ -17158,6 +17158,41 @@ def restore_mix_inline_literal(ins, raw, literal):
     ins["enc"] = raw.hex()
 
 
+def restore_vcc_tuples(insns, blob, code_start, code_end):
+    """Put back the scalar-memory, image and buffer instructions whose register tuple runs into vcc.
+
+    llvm-mc rejects a tuple that reaches SGPRs 106 and 107 (s_load_dwordx8 into s[100:107], an image resource in
+    s[100:107], a buffer resource in s[104:107]): it skips the first word as invalid and then prints the second word
+    as an instruction of its own, one that is junk or does not match the blob (docs/shader_library.md section 5).
+    The pure-Python decoder reads such a word as a VCCTuple list, [s100,...,s105,vcc_lo,vcc_hi], the form the
+    translator takes for these instructions. Every blob dword in the code range that no matched instruction covers
+    is offered to it; the instruction is used only if its operands hold such a list, so no other undecodable word
+    changes. Instructions printed inside the words of a restored one are dropped. The instructions already carry
+    their blob offsets in "pc"; returns the list sorted by it."""
+    import rdna2_decode
+    covered = set()
+    for ins in insns:
+        if not ins.get("normalized"):
+            covered.update(range(ins["pc"], ins["pc"] + len(ins["enc"]) // 2, 4))
+    stop = min(len(blob), code_end if code_end is not None else len(blob))
+    restored, at = [], code_start
+    while at + 8 <= stop:
+        found = None if at in covered else rdna2_decode.decode_bytes(blob[at:at + 20])["insns"][:1]
+        if found and found[0]["pc"] == 0 and any(
+                a["k"] == "slist" and ("vcc_lo" in a["r"] or "vcc_hi" in a["r"]) for a in found[0]["args"]):
+            ins = found[0]
+            ins["pc"] = at
+            restored.append(ins)
+            at += len(ins["enc"]) // 2
+        else:
+            at += 4
+    if not restored:
+        return insns
+    spans = [(r["pc"], r["pc"] + len(r["enc"]) // 2) for r in restored]
+    kept = [i for i in insns if not any(i["pc"] < hi and i["pc"] + len(i["enc"]) // 2 > lo for lo, hi in spans)]
+    return sorted(kept + restored, key=lambda i: i["pc"])
+
+
 def output_signature(path, name):
     """OSG1 elements as (register, system value), one per register (first element wins)."""
     d = shader_container(path, name)
@@ -17432,6 +17467,7 @@ def translate(path):
                 ins["normalized"] = True
             ins["pc"] = at
             pos = at + len(enc)
+        insns = restore_vcc_tuples(insns, blob, info["code_start"], info.get("code_end"))
         insns = fold_far_branches(insns)
         insns = reachable_code(insns, info.get("code_end"))
         if any(i.get("normalized") for i in insns):

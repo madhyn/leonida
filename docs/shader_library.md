@@ -165,9 +165,11 @@ What stops the rest, by the translator's message:
   run into `vcc` (SGPRs 106 and 107): `s_load_dwordx8`/`x4`/`x16` writing `s[100:107]`, `s[104:107]` or
   `s[92:107]`, and image instructions whose resource is `s[100:107]`. In the compute programs alone that is 37,952
   SMEM, 22,248 MIMG and 2,298 MUBUF words. The same words with the register field one tuple lower decode; with
-  `gfx1030` they don't either. The FSSM shaders don't use these tuples; the pipeline builds use them often. A decoder
-  fallback for these encodings would cover most of the remaining programs. The translator already reads
-  `[s100,...,vcc_lo,vcc_hi]` lists (design.md *Scalar/buffer memory*).
+  `gfx1030` they don't either. The FSSM shaders don't use these tuples; the pipeline builds use them often. The translator
+  now decodes these words from the blob with `rdna2_decode` (`restore_vcc_tuples`) and reads them as the
+  `[s100,...,vcc_lo,vcc_hi]` lists it already takes (design.md *Scalar/buffer memory*); synthetic cases are in
+  `tests/semantic/test_vcc_tuple_fallback.py`. The count above was measured before this change; it has not been
+  re-run on the real library.
 * **443: an instruction llvm-mc prints with another encoding than the blob's** (`v_fma_mix*`, `v_interp_p2_f16`):
   the existing `check_printed_encodings` refusal.
 * **90 CS: "CS thread-group-size SGPR"**: RSRC2 `TG_SIZE_EN`, which no FSSM compute shader sets.
