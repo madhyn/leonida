@@ -1006,6 +1006,13 @@ if(BUILD_TESTING)
     add_test(NAME startup_trace COMMAND startup_trace_test)
   endif()
 
+  if(WIN32)
+    add_executable(present_window_test test/present_window_test.cpp)
+    target_link_libraries(present_window_test PRIVATE user32)
+    add_test(NAME present_window COMMAND present_window_test)
+    set_tests_properties(present_window PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 15)
+  endif()
+
   if(TARGET device_proxy_test)
     add_test(NAME device_proxy COMMAND device_proxy_test)
     set_tests_properties(device_proxy PROPERTIES SKIP_RETURN_CODE 77)  # no WARP adapter (Wine)

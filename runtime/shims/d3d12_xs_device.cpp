@@ -24,6 +24,9 @@
 // for a trace that disagrees. The frame-event calls answer from a per-device token counter: there is no vblank source
 // behind the device before a presenter exists, so WaitFrameEventX returns at once with a fresh non-zero token.
 #include "d3d12_xs_device.h"
+#ifdef LEONIDA_VULKAN_DEVICE
+#include "present_window.h"
+#endif
 #include "d3d12_trace.h"
 #include "d3d12_xs_alloc_size.h"
 #include "d3d12_xs_desc_clean.h"
@@ -1538,19 +1541,11 @@ constexpr unsigned kQueuePresentX = 32;
 #ifdef LEONIDA_VULKAN_DEVICE
 
 struct PresentState {
-    ~PresentState() {
-        xbox.reset();
-        if (window) DestroyWindow(window);
-    }
-    HWND window = nullptr;
+    PresentWindow window;  // The presenter is destroyed before its surface window.
     std::unique_ptr<rt::d3d12::XboxPresentation> xbox;
 };
 
 void destroy_present_state(void* present_state) { delete static_cast<PresentState*>(present_state); }
-
-LRESULT CALLBACK present_window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
-    return DefWindowProcW(window, message, wparam, lparam);
-}
 
 // Builds the window, presenter and XboxPresentation once per device. Returns the state even when `xbox` stays null:
 // the failure is logged once and not retried.
@@ -1561,30 +1556,20 @@ PresentState* present_state_for(DeviceProxy* device) {
     auto* state = new (std::nothrow) PresentState;
     if (!state) return nullptr;
     device->present_state = state;
-    WNDCLASSW window_class{};
-    window_class.lpfnWndProc = present_window_proc;
-    window_class.hInstance = GetModuleHandleW(nullptr);
-    window_class.lpszClassName = L"LeonidaPresentX";
-    if (!RegisterClassW(&window_class) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
-        std::fprintf(stderr, "[rt] d3d12_xs: PresentX window class failed (error %lu)\n", GetLastError());
-        return state;
-    }
-    state->window = CreateWindowExW(0, window_class.lpszClassName, L"Leonida", WS_OVERLAPPEDWINDOW, CW_USEDEFAULT,
-                                    CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, nullptr, nullptr,
-                                    window_class.hInstance, nullptr);
-    if (!state->window) {
+    HWND window = state->window.create();
+    if (!window) {
         std::fprintf(stderr, "[rt] d3d12_xs: PresentX window failed (error %lu)\n", GetLastError());
         return state;
     }
-    ShowWindow(state->window, SW_SHOWNOACTIVATE);
-    auto presenter = rt::d3d12::create_window_presenter(device->real, state->window);
+    ShowWindowAsync(window, SW_SHOWNOACTIVATE);
+    auto presenter = rt::d3d12::create_window_presenter(device->real, window);
     if (!presenter) {
         std::fprintf(stderr, "[rt] d3d12_xs: no window presenter on this device; PresentX shows nothing\n");
         return state;
     }
     state->xbox = std::make_unique<rt::d3d12::XboxPresentation>(std::move(presenter), nullptr, device->frame_tokens);
     // The device's token source: the title takes its frame tokens from device slot 80 and presents them here.
-    std::fprintf(stderr, "[rt] d3d12_xs: PresentX ready (window %p)\n", static_cast<void*>(state->window));
+    std::fprintf(stderr, "[rt] d3d12_xs: PresentX ready (window %p)\n", static_cast<void*>(window));
     return state;
 }
 
