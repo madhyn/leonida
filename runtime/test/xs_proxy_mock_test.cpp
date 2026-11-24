@@ -959,6 +959,18 @@ int check_xbox_slots() {
     // output on failure, so an invalid call would clear this pointer.
     EXPECT(release(list) == 0);
 
+    // The Xbox ID3D12GraphicsCommandListX IID maps to PC ID3D12GraphicsCommandList on creation and QueryInterface.
+    const IID xbox_list_iid = {0xc3827890, 0x4024, 0x474c, {0x98, 0xcf, 0x64, 0x5b, 0x51, 0xdc, 0x48, 0x74}};
+    void* xbox_list = nullptr;
+    EXPECT(hr_of(raw(device, 73, word(&desc), word(allocator), 0, word(&xbox_list_iid), word(&xbox_list))) == S_OK);
+    EXPECT(xs::is_command_list_proxy(xbox_list));
+    EXPECT(mock->calls[12] == 2 &&
+           IsEqualIID(*reinterpret_cast<const IID*>(mock->args[12][4]), __uuidof(ID3D12GraphicsCommandList)));
+    void* qi_xbox_list = nullptr;
+    EXPECT(hr_of(raw(xbox_list, 0, word(&xbox_list_iid), word(&qi_xbox_list))) == S_OK && qi_xbox_list == xbox_list);
+    EXPECT(release(qi_xbox_list) == 1);
+    EXPECT(release(xbox_list) == 0);
+
     // Missing description, allocator or output: E_INVALIDARG/E_POINTER before the real device is called.
     EXPECT(hr_of(raw(device, 73, 0, word(allocator), 0, word(&list_iid), word(&list))) == E_INVALIDARG);
     EXPECT(hr_of(raw(device, 73, word(&desc), 0, 0, word(&list_iid), word(&list))) == E_INVALIDARG);
