@@ -165,10 +165,11 @@ private:
     struct Functions {
 #define LEONIDA_SCRATCH_FUNCTIONS(X)                                                                           \
     X(vkCreateBuffer) X(vkDestroyBuffer) X(vkGetBufferMemoryRequirements) X(vkBindBufferMemory) X(vkFreeMemory) \
-    X(vkMapMemory) X(vkGetSemaphoreCounterValue) X(vkDeviceWaitIdle)
+    X(vkGetSemaphoreCounterValue) X(vkDeviceWaitIdle)
 #define LEONIDA_SCRATCH_MEMBER(name) PFN_##name name = nullptr;
         LEONIDA_SCRATCH_FUNCTIONS(LEONIDA_SCRATCH_MEMBER)
 #undef LEONIDA_SCRATCH_MEMBER
+        PFN_vkMapMemory vkMapMemory = nullptr;
 
         bool load(PFN_vkGetDeviceProcAddr get, VkDevice device) {
             bool all = true;
@@ -178,6 +179,7 @@ private:
             LEONIDA_SCRATCH_FUNCTIONS(LEONIDA_SCRATCH_LOAD)
 #undef LEONIDA_SCRATCH_LOAD
 #undef LEONIDA_SCRATCH_FUNCTIONS
+            vkMapMemory = reinterpret_cast<PFN_vkMapMemory>(get(device, "vkMapMemory"));
             return all;
         }
     };
@@ -199,7 +201,8 @@ private:
     }
     bool map_chunk(Chunk& chunk) {
         if (chunk.mapped) return true;
-        return vk_.vkMapMemory(device_, chunk.memory, 0, chunk.size, 0, &chunk.mapped) == VK_SUCCESS && chunk.mapped;
+        return vk_.vkMapMemory && vk_.vkMapMemory(device_, chunk.memory, 0, chunk.size, 0, &chunk.mapped) == VK_SUCCESS &&
+               chunk.mapped;
     }
     void destroy(Chunk& chunk) {
         if (chunk.buffer) vk_.vkDestroyBuffer(device_, chunk.buffer, nullptr);
