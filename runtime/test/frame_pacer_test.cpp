@@ -816,10 +816,9 @@ int main() {
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
         const int reads_before_late = clock.now_calls.load();
         std::future<Result> late = wait_async(*raw, infinite_timeout_ms);
-        EXPECT(late.wait_for(std::chrono::seconds(2)) == std::future_status::ready);
-        const Result late_r = late.get();
-        EXPECT(late_r.hr == pacer_hr::invalid_state && late_r.token == 0);
-        EXPECT(clock.now_calls.load() == reads_before_late);
+        const bool late_ready = late.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
+        const Result late_r = late_ready ? late.get() : Result{};
+        const int reads_after_late = clock.now_calls.load();
         {
             std::lock_guard g(clock.gate_mutex);
             clock.release = true;
@@ -828,6 +827,9 @@ int main() {
         EXPECT(dtor.wait_for(std::chrono::seconds(2)) == std::future_status::ready);
         dtor.get();
         EXPECT(first.get().hr == pacer_hr::invalid_state);
+        EXPECT(late_ready);
+        EXPECT(late_r.hr == pacer_hr::invalid_state && late_r.token == 0);
+        EXPECT(reads_after_late == reads_before_late);
     }
 
     std::printf("frame_pacer_test: all cases pass\n");
