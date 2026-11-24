@@ -297,6 +297,7 @@ class Gen:
         self.uses_store_views = set()  # image_store dims used (index into STORE_DIMS)
         self.uses_int_sampler = False    # 2D typed sampled-image types for sampling and gathering
         self.uses_int_fetch = set()    # typed image_load dims (index into STORE_DIMS): uint/sint sampled aliases
+        self.uses_ms_views = set()     # image_msaa_load arrayed flags (0 = 2D_MSAA, 1 = 2D_MSAA_ARRAY)
         self.uses_d16_image = False    # a d16 image result is narrowed: needs the normalized / 32-bit-float tables
         self.uses_fmt_size = False    # %fmt_size_tab: byte size of each 7-bit buffer FORMAT code (0 = not in FORMATS)
         self.reads_store_views = False  # a coherent image_load reads a storage view (StorageImageReadWithoutFormat)
@@ -5775,8 +5776,8 @@ class Gen:
             return
         if op.startswith("ds_"):
             kind = "lds"
-        elif op.startswith(("buffer_", "tbuffer_", "global_", "flat_", "image_load", "image_store", "image_atomic",
-                            "s_load_", "s_buffer_load_")):
+        elif op.startswith(("buffer_", "tbuffer_", "global_", "flat_", "image_load", "image_msaa_load",
+                            "image_store", "image_atomic", "s_load_", "s_buffer_load_")):
             kind = "mem"
         else:
             return
@@ -7725,7 +7726,8 @@ class Gen:
                     "image_sample_c_cl_o", "image_sample_c_b_cl_o") or                 op in ("image_sample", "image_sample_lz", "image_sample_l", "image_sample_b", "image_sample_c_lz",
                     "image_sample_c_l", "image_sample_c", "image_sample_c_b", "image_sample_cl", "image_sample_b_cl", "image_sample_c_cl",
                     "image_sample_c_b_cl",
-                    "image_sample_d", "image_sample_d_cl", "image_load", "image_gather4_lz", "image_gather4_l",
+                    "image_sample_d", "image_sample_d_cl", "image_load", "image_msaa_load",
+                    "image_gather4_lz", "image_gather4_l",
                     "image_gather4_lz_o", "image_gather4_l_o") or op in self.GATHER4_LOD_OPS:
             self.image_op(op, a, mods)
         elif op in ("v_sin_f16", "v_cos_f16"):
@@ -13265,6 +13267,32 @@ class Gen:
         a16 = "a16" in mods
         d16 = "d16" in mods
         dim = next((m for m in mods if m.startswith("dim:")), "dim:SQ_RSRC_IMG_2D")
+        if op == "image_msaa_load":
+            ms_dims = {"dim:SQ_RSRC_IMG_2D_MSAA": (0, 3), "dim:SQ_RSRC_IMG_2D_MSAA_ARRAY": (1, 4)}
+            if dim not in ms_dims:
+                raise Unsupported(op + " " + dim.split("SQ_RSRC_IMG_")[-1])
+            if any(m in mods for m in ("glc", "tfe", "lwe")):
+                raise Unsupported(op + " modifiers")
+            ms_arr, n_ms = ms_dims[dim]
+            self.uses_ms_views.add(ms_arr)
+            dm = next((m for m in mods if m.startswith("dmask:")), "dmask:0x1")
+            dmask = int(dm.split(":")[1], 0)
+            vdata = a[0]
+            if vdata["k"] != "vgpr":
+                raise Unsupported(op + " destination")
+            addr = self.addr_regs(a[1])
+            img_idx = self.desc_lookup_sgpr(a[2], 8)
+            coords = (self.unpack_image_a16_uints([self.load_reg("vgpr", r) for r in addr]) if a16
+                      else [self.load_reg("vgpr", r) for r in addr])
+            if len(coords) < n_ms:
+                raise Unsupported("image_msaa_load coords")
+            ncoord = 2 + ms_arr
+            ints = [self.as_int(c) for c in coords[:ncoord]]
+            iv = self.tmp()
+            self.emit(f"{iv} = OpCompositeConstruct {'%v2int' if ncoord == 2 else '%v3int'} {' '.join(ints)}")
+            sample = self.as_int(coords[ncoord])
+            self.image_msaa_load_typed(ms_arr, self.sgpr_word(a[2], 1), iv, sample, img_idx, dmask, vdata, d16)
+            return
         kinds = {"dim:SQ_RSRC_IMG_2D": ("img2d", "%images", "simg2d", 2, "_ptr_UC_img"),
                  "dim:SQ_RSRC_IMG_2D_ARRAY": ("img2da", "%images_arr", "simg2da", 3, "_ptr_UC_imga"),
                  # Cube: the shader already did face selection (v_cube*), and cube_coords maps (s, t, face) onto a
@@ -13817,6 +13845,19 @@ class Gen:
             return res
         self.image_read_typed(dim, t1, img, idx, dmask, vdata, d16, fetch)
 
+    def image_msaa_load_typed(self, ms_arr, t1, iv, sample, idx, dmask, vdata, d16=False):
+        def view(cls):
+            ip, im = self.tmp(), self.tmp()
+            self.dynamic_sampled_access(ip, f"%_ptr_UC_itx_ms{cls}_{ms_arr}", f"%itx_ms{cls}_{ms_arr}", idx)
+            self.emit(f"{im} = OpLoad %itximg_ms{cls}_{ms_arr} {ip}")
+            return im
+
+        def fetch(image, _cls, ty):
+            res = self.tmp()
+            self.emit(f"{res} = OpImageFetch {ty} {image} {iv} Sample {sample}")
+            return res
+        self.image_read_typed(None, t1, None, idx, dmask, vdata, d16, fetch, view=view)
+
     def image_load_coherent(self, dim, t1, iv, idx, dmask, vdata, d16):
         """image_load with glc: a coherent read. On GFX10 a device-scope load is glc + dlc and a device-scope store
         glc (Mesa ac_get_hw_cache_flags maps ACCESS_COHERENT to exactly these bits); the POPS pixel shaders read and
@@ -13849,8 +13890,8 @@ class Gen:
         (0 float, 1 uint, 2 sint); by default the sampled image img for float and, for UINT and SINT, typed aliases
         of the dimension's sampled binding (SHADER-151), so no storage image feature is needed.
         dmask selects the output components; d16 packs two per VGPR."""
-        di = self.STORE_DIMS[dim][0]
         if view is None:
+            di = self.STORE_DIMS[dim][0]
             self.uses_int_fetch.add(di)
 
             def view(cls):
@@ -15408,12 +15449,14 @@ def assemble(gen):
          [f"%ms_out_f16h{n}_{h}" for n in ms_halves for h in (0, 1)])) if ms else []) + (
         ["%x_buf"] if gen.emulate or gen.bar_rounds and not gen.bar_counts_in_lds() else []) + (
         ([("%gs_in_pos" if sv == 1 else f"%gs_in{r}") for r, sv in gen.gs["in"]] +
-         [("%gs_out_pos" if sv == 1 else f"%gs_out{r}") for r, sv in gen.gs["out"]]) if gsx else []) +         (["%fmt_uint_mask", "%fmt_sint_mask"] if gen.uses_store_views or gen.uses_int_fetch else []) + \
+         [("%gs_out_pos" if sv == 1 else f"%gs_out{r}") for r, sv in gen.gs["out"]]) if gsx else []) + \
+        (["%fmt_uint_mask", "%fmt_sint_mask"] if gen.uses_store_views or gen.uses_int_fetch or gen.uses_ms_views else []) + \
          (["%fmt_norm_mask", "%fmt_f32_mask"] if gen.uses_d16_image else []) + \
         (["%fmt_size_tab"] if gen.uses_fmt_size else []) + \
         (["%fmt_desc_tab", "%fmt_norm_rep_tab"] if gen.uses_fmt_tables else []) + \
         [f"%stv{c}_{d}" for d in sorted(gen.uses_store_views) for c in range(3)] + \
-        [f"%itx{c}_{d}" for d in sorted(gen.uses_int_fetch) for c in (1, 2)]
+        [f"%itx{c}_{d}" for d in sorted(gen.uses_int_fetch) for c in (1, 2)] + \
+        [f"%itx_ms{c}_{arr}" for arr in sorted(gen.uses_ms_views) for c in (0, 1, 2)]
     psb = gen.uses_psb
     tex = gen.uses_tex
     sg = gen.uses_subgroup
@@ -15715,7 +15758,7 @@ def assemble(gen):
     if gen.uses_fmt_tables:
         gen.cu(128)
         gen.cu(17)
-    if gen.uses_store_views or gen.uses_int_fetch:
+    if gen.uses_store_views or gen.uses_int_fetch or gen.uses_ms_views:
         gen.cu(16)
         for words in Gen.int_format_masks():
             for w in words:
@@ -15741,7 +15784,7 @@ def assemble(gen):
         types.append(f"{fn_type} = OpTypeFunction %uint " + " ".join(["%uint"] * arity))
     # dedupe_types keeps the first uvec4 it meets: when the typed-image types follow, declare the ballot type after
     # them, so a shader that gains a ballot keeps the name %v4uint_st (SHADER-1016).
-    st_types = gen.uses_store_views or gen.uses_int_fetch or gen.uses_d16_image
+    st_types = gen.uses_store_views or gen.uses_int_fetch or gen.uses_d16_image or gen.uses_ms_views
     if gen.uses_ballot and not st_types:
         types.append("%v4uint_bal = OpTypeVector %uint 4")       # dedupe_types merges it with any other uvec4
     if gen.uses_bvh and not any(t.startswith("%v3float = ") for t in types):
@@ -15798,7 +15841,7 @@ def assemble(gen):
                      " ".join(gen.lconsts[v] for v in Gen.fmt_norm_reps()))
         gvars += ["%fmt_desc_tab = OpVariable %_ptr_Private_fmt_desc Private %fmt_desc_init",
                   "%fmt_norm_rep_tab = OpVariable %_ptr_Private_fmt_rep Private %fmt_norm_rep_init"]
-    if gen.uses_store_views or gen.uses_int_fetch or gen.uses_d16_image:
+    if gen.uses_store_views or gen.uses_int_fetch or gen.uses_d16_image or gen.uses_ms_views:
         u, si = Gen.int_format_masks()
         types += ["%v4uint_st = OpTypeVector %uint 4", "%v4int_st = OpTypeVector %int 4",
                   *(["%v4uint_bal = OpTypeVector %uint 4"] if gen.uses_ballot else []),
@@ -15826,6 +15869,16 @@ def assemble(gen):
                 dec += [f"OpDecorate %itx{cls}_{di} DescriptorSet 0",
                         f"OpDecorate %itx{cls}_{di} Binding {Gen.SAMPLED_BINDINGS[di]}"]
                 gvars += [f"%itx{cls}_{di} = OpVariable %_ptr_UC_rt_itx{cls}_{di} UniformConstant"]
+        for arr in sorted(gen.uses_ms_views):
+            for cls, st in enumerate(("%float", "%uint", "%int")):
+                binding = 20 + 2 * cls + arr
+                types += [f"%itximg_ms{cls}_{arr} = OpTypeImage {st} 2D 0 {arr} 1 1 Unknown",
+                          f"%rt_itx_ms{cls}_{arr} = OpTypeRuntimeArray %itximg_ms{cls}_{arr}",
+                          f"%_ptr_UC_rt_itx_ms{cls}_{arr} = OpTypePointer UniformConstant %rt_itx_ms{cls}_{arr}",
+                          f"%_ptr_UC_itx_ms{cls}_{arr} = OpTypePointer UniformConstant %itximg_ms{cls}_{arr}"]
+                dec += [f"OpDecorate %itx_ms{cls}_{arr} DescriptorSet 0",
+                        f"OpDecorate %itx_ms{cls}_{arr} Binding {binding}"]
+                gvars += [f"%itx_ms{cls}_{arr} = OpVariable %_ptr_UC_rt_itx_ms{cls}_{arr} UniformConstant"]
         for di in sorted(gen.uses_store_views):
             _, sdim, arr, _ = next(v for v in Gen.STORE_DIMS.values() if v[0] == di)
             for cls, st in enumerate(("%float", "%uint", "%int")):

@@ -786,8 +786,8 @@ def _x_memory_order_access(op):
         return None
     if op.startswith("ds_"):
         kind = "lds"
-    elif op.startswith(("buffer_", "tbuffer_", "global_", "flat_", "image_load", "image_store", "image_atomic",
-                        "s_load_", "s_buffer_load_")):
+    elif op.startswith(("buffer_", "tbuffer_", "global_", "flat_", "image_load", "image_msaa_load",
+                        "image_store", "image_atomic", "s_load_", "s_buffer_load_")):
         kind = "mem"
     else:
         return None
