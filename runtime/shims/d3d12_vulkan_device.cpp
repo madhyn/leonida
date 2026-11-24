@@ -2042,6 +2042,7 @@ public:
                                  (heap_.Type == D3D12_HEAP_TYPE_CUSTOM &&
                                   heap_.CPUPageProperty == D3D12_CPU_PAGE_PROPERTY_WRITE_BACK));
         binding.va = va_;
+        binding.bda = buffer_va_;
         device_.context->add_resource(id(), binding);
         // Committed resources start zeroed unless the heap says otherwise; the host cannot reach device-local memory,
         // so the next submission fills it (D3D-71).
@@ -2167,6 +2168,7 @@ public:
         binding.host = static_cast<const std::uint8_t*>(address);
         binding.host_readable = true;
         binding.va = va_;
+        binding.bda = buffer_va_;
         device_.context->add_resource(id(), binding);
         return S_OK;
     }
@@ -6140,7 +6142,7 @@ public:
         if (out) *out = nullptr;
         if (node_mask & ~1u) return d3d12_trace::result(method, E_INVALIDARG);  // one node, as the host answers
         // The initial pipeline state is set as SetPipelineState would set it (a bundle's is its first deferred call).
-        HRESULT hr = create_command_list(type, allocator, riid, out, identity(), state);
+        HRESULT hr = create_command_list(type, allocator, riid, out, identity(), state, state_.context.get());
         return d3d12_trace::result(method, hr);
     }
 
@@ -6158,7 +6160,7 @@ public:
         HRESULT hr = create_command_allocator(type, IID_PPV_ARGS(&allocator), identity());
         if (FAILED(hr)) return d3d12_trace::result(method, hr);
         ID3D12GraphicsCommandList* list = nullptr;
-        hr = create_command_list(type, allocator, IID_PPV_ARGS(&list), identity());
+        hr = create_command_list(type, allocator, IID_PPV_ARGS(&list), identity(), nullptr, state_.context.get());
         allocator->Release();
         if (FAILED(hr)) return d3d12_trace::result(method, hr);
         list->Close();
@@ -6847,7 +6849,7 @@ public:
     // heap_base (arena.address) lands on the Vulkan-imported BDA.
     std::uint64_t resolve_shader_va(std::uint64_t va) const {
         if (!va || va < state_.arena.size || !state_.context || !state_.arena.address) return va;
-        const auto bda = state_.context->resolve_title_bda(va);
+        const auto bda = state_.context->resolve_gpu_bda(va);
         if (!bda || *bda < state_.arena.address) return va;
         const std::uint64_t rel = *bda - state_.arena.address;
         return (rel >> 48) == 0 ? rel : va;

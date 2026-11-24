@@ -1191,6 +1191,15 @@ public:
     }
     void sync_title_regions() { title_regions_.sync_pending(); }
     std::optional<std::uint64_t> resolve_title_bda(std::uint64_t va) { return title_regions_.resolve_bda(va); }
+    std::optional<std::uint64_t> resolve_gpu_bda(std::uint64_t va) {
+        if (!va) return std::nullopt;
+        BufferVaIndex<ResourceId>::Hit hit{};
+        if (buffer_vas_.find(va, hit)) {
+            const ResourceBinding* b = resolve(hit.id);
+            if (b && b->bda) return b->bda + (va - b->va);
+        }
+        return title_regions_.resolve_bda(va);
+    }
     void record_title_barrier(VkCommandBuffer cb) const { title_regions_.record_host_write_barrier(cb); }
     VkDevice device() const { return device_; }
 

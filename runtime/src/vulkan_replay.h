@@ -79,6 +79,7 @@ struct ResourceBinding {
     VkDeviceSize size = 0;             // its size in bytes
     const std::uint8_t* host = nullptr;  // mapped CPU-written bytes (UPLOAD/write-back), for small CPU-side reads
     std::uint64_t va = 0;              // a buffer's console VA (GetGPUVirtualAddress), for vertex/index views
+    std::uint64_t bda = 0;             // Vulkan VkDeviceAddress for host-imported buffers outside the arena
     std::uint32_t depth = 1;
     bool volume = false;               // one array layer, including at mips with a single slice
     bool line = false;                 // a 1D image (TEXTURE1D): its attachment views are 1D arrays
