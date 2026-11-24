@@ -748,7 +748,13 @@ void test_coalesced_run_partial_unmap(const PhysicalApi& api) {
     check(api.map(window + kPage64k, 1, &pages[1]) == window + kPage64k,
           "remap the split middle page back");
     check(page_holds(window + kPage64k, 0xA0010000u), "remapped middle page keeps its data");
-    check(api.map(window, 4, nullptr) == window, "unmap the 4-page coalesced run");
+    // Unmap a multi-page middle sub-range [1..3) via null page array and verify prefix/suffix survival.
+    check(api.map(window, 4, pages) == window, "remap 4 contiguous physical pages");
+    check(api.map(window + kPage64k, 2, nullptr) == window + kPage64k,
+          "range-unmap middle 2 pages of a 4-page coalesced run");
+    check(page_holds(window, 0xA0000000u), "prefix page 0 keeps its data after range unmap");
+    check(page_holds(window + 3 * kPage64k, 0xA0030000u), "suffix page 3 keeps its data after range unmap");
+    check(api.map(window, 4, nullptr) == window, "unmap the remaining 4-page window");
     check(api.free_pages(4, pages) == TRUE, "free the 4 physical pages");
 }
 
