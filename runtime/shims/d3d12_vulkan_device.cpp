@@ -263,6 +263,28 @@ constexpr Format rgb96_format(VkFormat wide, bool typeless = false) {
 // DXGI -> Vulkan for the formats render targets, depth buffers and common textures use. R32 and R16 typeless become
 // depth formats when the resource allows depth-stencil; R32G8X24 and R24G8 always do, as Vulkan has no colour format
 // with their layout.
+// Xbox Series extensions to DXGI_FORMAT, past B4G4R4A4_UNORM (115), in the console's numbering:
+// 118 D16_UNORM_S8_UINT and its two plane views, 119 R16_UNORM_X8_TYPELESS (depth) and 120 X16_TYPELESS_G8_UINT
+// (stencil). The 1.0.2.1 executable names 118 as a pipeline DSVFormat and in GetResourceAllocationInfo at start-up,
+// and asserts when the allocation answer is the invalid one. Vulkan's D16_UNORM_S8_UINT is missing on NVIDIA and
+// RADV, so the texture is a D32_SFLOAT_S8_UINT image: every 16-bit depth value is held without loss and read back
+// through the depth view as the same [0, 1] value. A copy of its depth plane to a buffer has the D32 footprint (4
+// bytes a texel, not 2); nothing measured makes one yet.
+constexpr DXGI_FORMAT kXboxD16UnormS8Uint = static_cast<DXGI_FORMAT>(118);
+constexpr DXGI_FORMAT kXboxR16UnormX8Typeless = static_cast<DXGI_FORMAT>(119);
+constexpr DXGI_FORMAT kXboxX16TypelessG8Uint = static_cast<DXGI_FORMAT>(120);
+
+// The PC format whose answers stand in for an Xbox depth-stencil format in CheckFeatureSupport; the format itself
+// otherwise.
+DXGI_FORMAT pc_alias_of_xbox_depth_format(DXGI_FORMAT format) {
+    switch (format) {
+    case kXboxD16UnormS8Uint: return DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
+    case kXboxR16UnormX8Typeless: return DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
+    case kXboxX16TypelessG8Uint: return DXGI_FORMAT_X32_TYPELESS_G8X24_UINT;
+    default: return format;
+    }
+}
+
 Format vulkan_format(DXGI_FORMAT format, bool depth) {
     constexpr VkImageAspectFlags color = VK_IMAGE_ASPECT_COLOR_BIT, d = VK_IMAGE_ASPECT_DEPTH_BIT,
                                  ds = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
@@ -364,6 +386,7 @@ Format vulkan_format(DXGI_FORMAT format, bool depth) {
     case DXGI_FORMAT_D16_UNORM: return {VK_FORMAT_D16_UNORM, d};
     case DXGI_FORMAT_D32_FLOAT_S8X24_UINT: return {VK_FORMAT_D32_SFLOAT_S8_UINT, ds};
     case DXGI_FORMAT_D24_UNORM_S8_UINT: return {VK_FORMAT_D24_UNORM_S8_UINT, ds};
+    case kXboxD16UnormS8Uint: return {VK_FORMAT_D32_SFLOAT_S8_UINT, ds};
     case DXGI_FORMAT_R32_TYPELESS:
         return depth ? Format{VK_FORMAT_D32_SFLOAT, d, true} : Format{VK_FORMAT_R32_SFLOAT, color, true};
     case DXGI_FORMAT_R16_TYPELESS:
@@ -1475,6 +1498,7 @@ DXGI_FORMAT format_family(DXGI_FORMAT format) {
     if (in(15, 18)) return DXGI_FORMAT_R32G32_TYPELESS;
     if (in(19, 22)) return DXGI_FORMAT_R32G8X24_TYPELESS;
     if (in(23, 25)) return DXGI_FORMAT_R10G10B10A2_TYPELESS;
+    if (in(118, 120)) return kXboxD16UnormS8Uint;  // the Xbox D16S8 format and its two plane views
     if (in(27, 32)) return DXGI_FORMAT_R8G8B8A8_TYPELESS;
     if (in(33, 38)) return DXGI_FORMAT_R16G16_TYPELESS;
     if (in(39, 43)) return DXGI_FORMAT_R32_TYPELESS;
@@ -1499,7 +1523,8 @@ DXGI_FORMAT format_family(DXGI_FORMAT format) {
 bool depth_stencil_family(DXGI_FORMAT format) {
     const DXGI_FORMAT family = format_family(format);
     return family == DXGI_FORMAT_R32_TYPELESS || family == DXGI_FORMAT_R16_TYPELESS ||
-           family == DXGI_FORMAT_R24G8_TYPELESS || family == DXGI_FORMAT_R32G8X24_TYPELESS;
+           family == DXGI_FORMAT_R24G8_TYPELESS || family == DXGI_FORMAT_R32G8X24_TYPELESS ||
+           family == kXboxD16UnormS8Uint;
 }
 
 // ALLOW_RENDER_TARGET: the host refuses the families below and accepts the rest, D32_FLOAT, D16_UNORM,
@@ -4830,7 +4855,8 @@ bool image_descriptor(const Resource& resource, const TextureView& view, leonida
         (view.format == DXGI_FORMAT_X24_TYPELESS_G8_UINT &&
          (desc.Format == DXGI_FORMAT_R24G8_TYPELESS || desc.Format == DXGI_FORMAT_D24_UNORM_S8_UINT)) ||
         (view.format == DXGI_FORMAT_X32_TYPELESS_G8X24_UINT &&
-         (desc.Format == DXGI_FORMAT_R32G8X24_TYPELESS || desc.Format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT));
+         (desc.Format == DXGI_FORMAT_R32G8X24_TYPELESS || desc.Format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT)) ||
+        (view.format == kXboxX16TypelessG8Uint && desc.Format == kXboxD16UnormS8Uint);
     if (stencil && !stencil_format_fits) {
         log_once("a stencil-plane view needs its texture family's stencil view format; format", int(view.format));
         return false;
@@ -4890,7 +4916,9 @@ bool image_descriptor(const Resource& resource, const TextureView& view, leonida
             (desc.Format == DXGI_FORMAT_R24G8_TYPELESS && view.format == DXGI_FORMAT_R24_UNORM_X8_TYPELESS) ||
             (desc.Format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT &&
              (view.format == DXGI_FORMAT_UNKNOWN || view.format == DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS)) ||
-            (desc.Format == DXGI_FORMAT_R32G8X24_TYPELESS && view.format == DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS);
+            (desc.Format == DXGI_FORMAT_R32G8X24_TYPELESS && view.format == DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS) ||
+            (desc.Format == kXboxD16UnormS8Uint &&
+             (view.format == DXGI_FORMAT_UNKNOWN || view.format == kXboxR16UnormX8Typeless));
         if (!depth_format_fits) {
             log_once("incompatible depth shader-resource view format:", int(view.format));
             return false;
@@ -7991,6 +8019,9 @@ public:
             case DXGI_FORMAT_D24_UNORM_S8_UINT:
             case DXGI_FORMAT_R24_UNORM_X8_TYPELESS:
             case DXGI_FORMAT_X24_TYPELESS_G8_UINT:
+            case kXboxD16UnormS8Uint:
+            case kXboxR16UnormX8Typeless:
+            case kXboxX16TypelessG8Uint:
             case DXGI_FORMAT_NV12:
             case DXGI_FORMAT_P010:
             case DXGI_FORMAT_P016:
@@ -8013,6 +8044,12 @@ public:
         case D3D12_FEATURE_FORMAT_SUPPORT: {
             if (size != sizeof(D3D12_FEATURE_DATA_FORMAT_SUPPORT)) return d3d12_trace::result(method, E_INVALIDARG);
             auto* fs = static_cast<D3D12_FEATURE_DATA_FORMAT_SUPPORT*>(data);
+            struct RestoreFormat {
+                D3D12_FEATURE_DATA_FORMAT_SUPPORT* fs;
+                DXGI_FORMAT asked;
+                ~RestoreFormat() { fs->Format = asked; }
+            } restore{fs, fs->Format};
+            fs->Format = pc_alias_of_xbox_depth_format(fs->Format);  // what the texture is stored as
             fs->Support1 = D3D12_FORMAT_SUPPORT1_NONE;
             fs->Support2 = D3D12_FORMAT_SUPPORT2_NONE;
             // The host runtime's format table (compare_invalid_arguments, "format support:"): a value it has no entry

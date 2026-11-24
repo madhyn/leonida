@@ -240,6 +240,16 @@ What is implemented (all of it testable without the game):
   depth with stencil (two planes), a D24 stored as D32, and multisampled textures; they are still refused. A float
   written into a `D32_SFLOAT` image outside [0, 1] is undefined in Vulkan without `VK_EXT_depth_range_unrestricted`,
   where D3D12 keeps the bits; `d3d12_copy_xfmt_test` uses values in [0, 1).
+  **The Xbox D16_UNORM_S8_UINT** (DXGI_FORMAT 118, past B4G4R4A4_UNORM; plane views 119 R16_UNORM_X8_TYPELESS
+  and 120 X16_TYPELESS_G8_UINT): the retail executable sizes one with `GetResourceAllocationInfo` at start-up,
+  asserts when the answer is the invalid one, and names 118 as a pipeline `DSVFormat`. Vulkan's
+  `D16_UNORM_S8_UINT` is missing on NVIDIA and RADV, so the layer stores `D32_SFLOAT_S8_UINT` on every GPU: each
+  16-bit depth value is held as a float and read back through the depth view as the same [0, 1] value.
+  `CheckFeatureSupport` answers the three formats with the D32S8 family's answers (two planes; depth-stencil for 118,
+  shader-readable for the views) and gives the caller its format back. Not done: a footprint copy of the depth
+  plane has the D32 texel size, 4 bytes, not the console's 2 (no conversion pass as for D24); nothing measured
+  copies one yet. `d3d12_xbox_d16s8_test` checks the queries, the allocation size, creation with a 118 clear value
+  and depth-and-stencil clears through a typed and an UNKNOWN DSV.
   **D24_UNORM_S8_UINT without a native D24** (the Radeon 880M, AMD hardware generally, RADV): the layer stores
   `D32_SFLOAT_S8_UINT` and makes it behave as D24 (`src/depth24.h`, `src/vulkan_depth24.h`). A footprint
   of the depth plane holds 24-bit UNORM words (bits 0-23; the top byte is unspecified, the PC runtime reads it as
