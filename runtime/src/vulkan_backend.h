@@ -1822,6 +1822,23 @@ public:
             return UINT64_MAX;
         }
         if (result != VK_SUCCESS) return 0;
+        // A driver can show a lost device here without an error: the query succeeds and the counter reads UINT64_MAX
+        // (measured on NVIDIA 621.24, RTX 4080; vkWaitSemaphores on it succeeds too). A title reads that value as
+        // "device removed" and stops, so without this the layer never learned its device was gone and said nothing.
+        // No fence of the layer is signalled to UINT64_MAX, but the value alone is not taken as proof: vkDeviceWaitIdle
+        // is asked, under the submit lock its queues need, and only its VK_ERROR_DEVICE_LOST records the loss. That
+        // call is also what lets the driver answer vkGetDeviceFaultInfoEXT, which it refuses before it has reported
+        // the loss through a return code.
+        if (value == UINT64_MAX) {
+            VkResult idle = VK_SUCCESS;
+            {
+                std::lock_guard lock(context_.submit_mutex());
+                idle = context_.vk.vkDeviceWaitIdle(context_.device());
+            }
+            if (idle == VK_ERROR_DEVICE_LOST)
+                context_.mark_device_lost("a fence's counter read UINT64_MAX and vkDeviceWaitIdle then returned "
+                                          "VK_ERROR_DEVICE_LOST");
+        }
         return value;
     }
 
