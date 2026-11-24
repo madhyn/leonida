@@ -2015,7 +2015,8 @@ void proxy_create_sampler_x(DeviceProxy* self, const D3D12_SAMPLER_DESC* desc, s
         return;
     }
     D3D12_CPU_DESCRIPTOR_HANDLE handle{};
-    handle.ptr = static_cast<SIZE_T>(dest);
+    // A destination in the title's own descriptor range is translated to the real heap's, as device slots 17 to 24 do.
+    handle = translate_cpu_handle(self, D3D12_CPU_DESCRIPTOR_HANDLE{static_cast<SIZE_T>(dest)});
     self->real->CreateSampler(desc, handle);
 }
 
