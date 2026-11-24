@@ -18,6 +18,8 @@
 #include <malloc.h>
 #include <psapi.h>
 
+#include "../src/title_host_regions.h"
+
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
@@ -902,7 +904,28 @@ constexpr DWORD kMemGraphics = 0x10000000;
 constexpr DWORD kMemTitle = 0x40000000;
 
 LPVOID WINAPI TitleVirtualAlloc(LPVOID address, SIZE_T size, DWORD allocation_type, DWORD protect) {
-    return VirtualAlloc(address, size, allocation_type & ~(kMemGraphics | kMemTitle), host_protect(protect));
+    LPVOID const result =
+        VirtualAlloc(address, size, allocation_type & ~(kMemGraphics | kMemTitle), host_protect(protect));
+    if (result && (allocation_type & MEM_COMMIT) != 0) {
+        leonida::title_host_regions().register_range(reinterpret_cast<uint64_t>(result), size, 1);
+    }
+    return result;
+}
+
+BOOL WINAPI TitleVirtualFree(LPVOID address, SIZE_T size, DWORD free_type) {
+    if (address && (free_type & (MEM_DECOMMIT | MEM_RELEASE)) != 0) {
+        uint64_t unreg_size = size;
+        if (unreg_size == 0) {
+            MEMORY_BASIC_INFORMATION mbi{};
+            if (VirtualQuery(address, &mbi, sizeof(mbi))) {
+                unreg_size = mbi.RegionSize;
+            }
+        }
+        if (unreg_size != 0) {
+            leonida::title_host_regions().unregister_range(reinterpret_cast<uint64_t>(address), unreg_size);
+        }
+    }
+    return VirtualFree(address, size, free_type);
 }
 
 }  // namespace
@@ -960,7 +983,9 @@ bool commit_physical_pages(const uint64_t* page_array, size_t count) {
 
 }
 
-#define TITLE_VIRTUAL_ALLOC(dll) {dll, "VirtualAlloc", reinterpret_cast<void*>(&TitleVirtualAlloc)}
+#define TITLE_VIRTUAL_ALLOC(dll) \
+    {dll, "VirtualAlloc", reinterpret_cast<void*>(&TitleVirtualAlloc)}, \
+    {dll, "VirtualFree", reinterpret_cast<void*>(&TitleVirtualFree)}
 
 // The classic libraries and the memory api sets a title's imports name.
 SHIM_TABLE(title_memory,

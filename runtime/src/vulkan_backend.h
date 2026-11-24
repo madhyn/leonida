@@ -20,6 +20,7 @@
 #include "vulkan_device_fault.h"
 #include "vulkan_indirect_dispatch_count.h"
 #include "vulkan_scratch.h"
+#include "vulkan_title_regions.h"
 #include "vulkan_replay.h"
 #include "queue_families.h"
 #include "resource_tiling.h"
@@ -1026,27 +1027,37 @@ public:
         // buffer as out of bounds, which is no reason to drop the submission.
         replay_.buffer_at = [this](std::uint64_t va, std::uint64_t& size, VkBuffer& buffer, VkDeviceSize& offset) {
             BufferVaIndex<ResourceId>::Hit hit{};
-            if (!buffer_vas_.find(va, hit, size)) return false;  // prefers an aliasing buffer that holds all of it
-            const ResourceBinding* b = resolve(hit.id);
-            if (!b) return false;
-            buffer = b->buffer;
-            offset = b->buffer_offset + (va - b->va);
-            size = std::min<std::uint64_t>(size, b->size - (va - b->va));
-            return true;
+            if (buffer_vas_.find(va, hit, size)) {  // prefers an aliasing buffer that holds all of it
+                const ResourceBinding* b = resolve(hit.id);
+                if (!b) return false;
+                buffer = b->buffer;
+                offset = b->buffer_offset + (va - b->va);
+                size = std::min<std::uint64_t>(size, b->size - (va - b->va));
+                return true;
+            }
+            return title_regions_.lookup(va, size, buffer, offset);
         };
         // Host reads of small CPU-written inputs. Unlike buffer_at, the whole range must be in one CPU-writable
         // mapping: a partial read would see bytes the application has not written through the D3D12 API. The
         // binding's host pointer is null on DEFAULT and READBACK heaps, whose mapped bytes the GPU can write.
         replay_.host_at = [this](std::uint64_t va, std::uint64_t bytes, const std::uint8_t*& host) {
             BufferVaIndex<ResourceId>::Hit hit{};
-            if (!buffer_vas_.find(va, hit)) return HostReadStatus::absent;
-            const ResourceBinding* b = resolve(hit.id);
-            if (!b) return HostReadStatus::absent;
-            if (!b->host) return HostReadStatus::not_cpu_written;
-            const std::uint64_t offset = va - b->va;
-            if (offset > b->size || bytes > b->size - offset) return HostReadStatus::absent;
-            host = b->host + offset;
-            return HostReadStatus::ok;
+            if (buffer_vas_.find(va, hit)) {
+                const ResourceBinding* b = resolve(hit.id);
+                if (!b) return HostReadStatus::absent;
+                if (!b->host) return HostReadStatus::not_cpu_written;
+                const std::uint64_t offset = va - b->va;
+                if (offset > b->size || bytes > b->size - offset) return HostReadStatus::absent;
+                host = b->host + offset;
+                return HostReadStatus::ok;
+            }
+            VkBuffer dummy_buffer = VK_NULL_HANDLE;
+            VkDeviceSize dummy_offset = 0;
+            std::uint64_t available = bytes;
+            if (title_regions_.lookup(va, available, dummy_buffer, dummy_offset, &host) && available >= bytes) {
+                return HostReadStatus::ok;
+            }
+            return HostReadStatus::absent;
         };
         if (xdxr && loaded_) {
             xdxr_ = std::make_unique<XdxrBuilder>(get, device);
@@ -1162,6 +1173,25 @@ public:
         std::unique_lock lock(resource_mutex_);
         quad_indices_ = std::make_unique<QuadIndexExpander>(get, device_, limits);
     }
+    void configure_title_regions(PFN_vkGetMemoryHostPointerPropertiesEXT get_props, VkDeviceSize alignment,
+                                 const VkPhysicalDeviceMemoryProperties& memory,
+                                 TitleHostRegions* regions = &title_host_regions()) {
+        VulkanTitleRegionFunctions fn{};
+        fn.vkCreateBuffer = vk.vkCreateBuffer;
+        fn.vkDestroyBuffer = vk.vkDestroyBuffer;
+        fn.vkGetBufferMemoryRequirements = vk.vkGetBufferMemoryRequirements;
+        fn.vkAllocateMemory = vk.vkAllocateMemory;
+        fn.vkFreeMemory = vk.vkFreeMemory;
+        fn.vkBindBufferMemory = vk.vkBindBufferMemory;
+        fn.vkGetBufferDeviceAddress = vk.vkGetBufferDeviceAddress;
+        fn.vkDeviceWaitIdle = vk.vkDeviceWaitIdle;
+        fn.vkCmdPipelineBarrier = vk.vkCmdPipelineBarrier;
+        fn.vkGetMemoryHostPointerPropertiesEXT = get_props;
+        title_regions_.configure(device_, fn, alignment, memory, regions);
+    }
+    void sync_title_regions() { title_regions_.sync_pending(); }
+    std::optional<std::uint64_t> resolve_title_bda(std::uint64_t va) { return title_regions_.resolve_bda(va); }
+    void record_title_barrier(VkCommandBuffer cb) const { title_regions_.record_host_write_barrier(cb); }
     VkDevice device() const { return device_; }
 
     // Debug markers become labels from here on; call before any queue or list uses the context. Incomplete sets
@@ -1738,6 +1768,7 @@ private:
     QueueHolds<VkSemaphore> holds_;
     std::unordered_map<ResourceId, ResourceBinding> resources_;
     BufferVaIndex<ResourceId> buffer_vas_;  // the addressable buffers of resources_, by VA range (buffer_at)
+    VulkanTitleRegions title_regions_;
     std::unordered_map<ResourceId, std::shared_ptr<SparseResource>> sparse_resources_;
     std::unordered_map<std::uintptr_t, ComputePipeline> pipelines_;
     std::unordered_map<std::uintptr_t, GraphicsPipeline> graphics_pipelines_;
@@ -2629,6 +2660,8 @@ private:
             discard();
             return ReplayResult::unsupported;
         }
+        context_.sync_title_regions();
+        context_.record_title_barrier(command_buffer);
         if (!tracker_lock.owns_lock()) tracker_lock.lock();
         if (!transfer_only && context_.bindless_prepare_ && !context_.bindless_prepare_(command_buffer)) {
             const bool ended = context_.vk.vkEndCommandBuffer(command_buffer) == VK_SUCCESS;

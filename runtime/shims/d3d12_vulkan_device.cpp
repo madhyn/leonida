@@ -5492,9 +5492,12 @@ public:
             }
         }
         if (info.host_image_copy) load_host_image_copy(get_device);
-        if (info.host_pointer_alignment)
+        if (info.host_pointer_alignment) {
             state_.get_host_pointer_properties = reinterpret_cast<PFN_vkGetMemoryHostPointerPropertiesEXT>(
                 get_device(info.device, "vkGetMemoryHostPointerPropertiesEXT"));
+            state_.context->configure_title_regions(state_.get_host_pointer_properties, info.host_pointer_alignment,
+                                                    state_.memory);
+        }
         // Depth <-> colour copies are staged through scratch buffers (vulkan_scratch.h), on every GPU. With buffer
         // device addresses the same scratch holds the triangle indices of indexed quad lists (quad_index_expand.h):
         // a compute pass writes them through the chunk's address and the draw binds the chunk as its index buffer.
