@@ -7581,8 +7581,15 @@ class Gen:
             if self.is_mask_op(x):
                 raise Unsupported(op + " on a lane mask")
             if d["k"] == "special" and d.get("t", "").startswith(("exec", "vcc")):
-                if op != "s_bitreplicate_b64_b32" or d["t"] != "exec":
+                if op != "s_bitreplicate_b64_b32" or d["t"] not in ("exec", "vcc"):
                     raise Unsupported(op + " on a lane mask")
+                if d["t"] == "vcc":
+                    # VCC's bit for lane L is scalar-source bit L // 2 too, stored as mov64 stores a mask into VCC
+                    # (this lane's bit as 0xFFFFFFFF / 0).
+                    half = self.tmp()
+                    self.emit(f"{half} = OpShiftRightLogical %uint {self.wave_lane()} {self.cu(1)}")
+                    self.emit(f"OpStore %vcc {self._scalar_word_lane_bit(self.src_u(x), half)}")
+                    return
                 # EXEC's bit for lane L comes from scalar-source bit L // 2.
                 shift, shifted, bit = (self.tmp() for _ in range(3))
                 lane = self.wave_lane()
@@ -8342,11 +8349,15 @@ class Gen:
             # Leading-bit count of a 64-bit value, from bit 63 down: b64 counts the zeros before the first 1; i64
             # counts the bits before the first one that differs from the sign bit (b64 of ~S0 when S0 < 0). -1 when
             # there is none (0, and for i64 also -1). SCC is not written. The pair is 64-bit data (as for
-            # s_lshl_b64); a lane-mask source stays Unsupported (#210).
+            # s_lshl_b64); a lane-mask source of b64 is the wave's mask (wave_mask); of i64 it stays Unsupported.
             x = a[1]
             if self.holds_lane_mask(x):
-                raise Unsupported(op + " of a lane mask")
-            if x["k"] == "sgpr" and x.get("n") == 2:
+                if op != "s_flbit_i32_b64":
+                    raise Unsupported(op + " of a lane mask")
+                # The wave's mask as real bits, as s_ff1_i32_b64 reads one: the result is the zeros above the
+                # wave's last active lane.
+                lo, hi = self.wave_mask(x)
+            elif x["k"] == "sgpr" and x.get("n") == 2:
                 lo, hi = self.load_reg("sgpr", x["r"]), self.load_reg("sgpr", x["r"] + 1)
             elif x["k"] == "imm":
                 v = x["v"] & 0xFFFFFFFFFFFFFFFF
