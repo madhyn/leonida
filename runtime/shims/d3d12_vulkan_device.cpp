@@ -2986,6 +2986,48 @@ private:
     bool image_tiles_ = false;
 };
 
+// ID3D12LifetimeTracker (ID3D12Device5::CreateLifetimeTracker): notifies its ID3D12LifetimeOwner when tracked
+// device children finish GPU use. Does NOT AddRef the owner (per Microsoft D3D12 contract: the owner owns the
+// tracker, avoiding a circular reference). When DestroyOwnedObject is called, any pending GPU work on the device
+// is synced before notifying D3D12_LIFETIME_STATE_NOT_IN_USE so the owner can safely reclaim underlying memory.
+class LifetimeTracker final
+    : public Child<LifetimeTracker, ID3D12LifetimeTracker, ID3D12Object, ID3D12DeviceChild, ID3D12LifetimeTracker> {
+public:
+    static constexpr GUID kTag{0x8c7b6a51, 0x4e3d, 0x42f0, {0x9a, 0x1b, 0x2c, 0x3d, 0x4e, 0x5f, 0x60, 0x71}};
+
+    LifetimeTracker(DeviceState& device, ID3D12LifetimeOwner* owner) : device_(device), owner_(owner) {}
+
+    HRESULT STDMETHODCALLTYPE DestroyOwnedObject(ID3D12DeviceChild* object) override {
+        constexpr auto method = "ID3D12LifetimeTracker::DestroyOwnedObject";
+        if (!object) return d3d12_trace::result(method, E_INVALIDARG);
+        // Reject objects created by a different D3D12 device.
+        ID3D12Device* obj_device = nullptr;
+        if (FAILED(object->GetDevice(IID_PPV_ARGS(&obj_device))) || !obj_device)
+            return d3d12_trace::result(method, E_INVALIDARG);
+        IUnknown* obj_unk = nullptr;
+        IUnknown* my_unk = nullptr;
+        (void)obj_device->QueryInterface(IID_PPV_ARGS(&obj_unk));
+        if (attached_device()) (void)attached_device()->QueryInterface(IID_PPV_ARGS(&my_unk));
+        const bool same_device = (obj_unk != nullptr && obj_unk == my_unk);
+        if (obj_unk) obj_unk->Release();
+        if (my_unk) my_unk->Release();
+        obj_device->Release();
+        if (!same_device) return d3d12_trace::result(method, E_INVALIDARG);
+
+        // Ensure no in-flight Vulkan work still touches the destroyed child before signalling NOT_IN_USE.
+        if (device_.context && device_.context->loaded()) {
+            std::lock_guard lock(device_.context->submit_mutex());
+            device_.context->vk.vkDeviceWaitIdle(device_.info.device);
+        }
+        if (owner_) owner_->LifetimeStateUpdated(D3D12_LIFETIME_STATE_NOT_IN_USE);
+        return d3d12_trace::result(method, S_OK);
+    }
+
+private:
+    DeviceState& device_;
+    ID3D12LifetimeOwner* owner_ = nullptr;  // non-owning per D3D12 spec (owner owns tracker)
+};
+
 // The S#s a shader builds from immediates (literal_samplers in its index entry) are named by no heap slot, so
 // nothing else gives them a sampler and a hash-table key: without this their lookup finds the fallback sampler
 // (index 0) and the shader samples with the wrong filter and address modes (docs/design.md, Literal samplers).
@@ -7553,12 +7595,14 @@ public:
         return d3d12_trace::result(method, E_NOTIMPL);
     }
 
-    HRESULT STDMETHODCALLTYPE CreateLifetimeTracker(ID3D12LifetimeOwner* owner, REFIID, void** out) override {
+    HRESULT STDMETHODCALLTYPE CreateLifetimeTracker(ID3D12LifetimeOwner* owner, REFIID riid, void** out) override {
         constexpr auto method = "ID3D12Device5::CreateLifetimeTracker";
         if (out) *out = nullptr;
-        if (!owner || !out) return d3d12_trace::result(method, E_INVALIDARG);
-        log_once("CreateLifetimeTracker (not supported)", 0);
-        return d3d12_trace::result(method, E_NOTIMPL);
+        if (!owner) return d3d12_trace::result(method, E_INVALIDARG);
+        if (!out) return d3d12_trace::result(method, E_UNEXPECTED);  // measured on Windows 11 D3D12 (WARP)
+        auto* tracker = new LifetimeTracker(state_, owner);
+        tracker->attach_device(identity());
+        return d3d12_trace::result(method, hand_out(tracker, riid, out));
     }
 
     HRESULT STDMETHODCALLTYPE CreateHeap(const D3D12_HEAP_DESC* desc, REFIID riid, void** out) override {
