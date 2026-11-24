@@ -832,6 +832,42 @@ int main() {
         EXPECT(reads_after_late == reads_before_late);
     }
 
+    // An exception thrown by an injected clock (from now_us or wait, with the pacer mutex still held) must still
+    // release the waiter registration so subsequent waits and ~FramePacer teardown complete cleanly.
+    for (int mode = 0; mode < 2; ++mode) {
+        struct ThrowingClock final : FrameClock {
+            int throw_mode = 0;  // 0 = throw in now_us once, 1 = throw in wait once
+            std::atomic<bool> armed{false};
+            std::atomic<std::uint64_t> now{1000};
+            std::uint64_t now_us() override {
+                if (throw_mode == 0 && armed.exchange(false)) throw std::runtime_error("clock now_us");
+                return now.load();
+            }
+            void wait(std::unique_lock<std::mutex>&, std::condition_variable&, std::uint64_t) override {
+                if (throw_mode == 1 && armed.exchange(false)) throw std::runtime_error("clock wait");
+                now.fetch_add(50000);
+            }
+        } clock;
+        clock.throw_mode = mode;
+
+        auto pacer = std::make_unique<FramePacer>(clock);
+        EXPECT(setup(*pacer, 1));
+        clock.armed.store(true);
+        bool caught = false;
+        try {
+            std::uint64_t tok = 0;
+            (void)pacer->wait_frame_event(frame_event_origin, 100, 0, &tok);
+        } catch (const std::runtime_error&) {
+            caught = true;
+        }
+        EXPECT(caught);
+        const Result ok_r = wait_async(*pacer, 100).get();
+        EXPECT(ok_r.hr == pacer_hr::ok);
+        std::future<void> dtor = std::async(std::launch::async, [&] { pacer.reset(); });
+        EXPECT(dtor.wait_for(std::chrono::seconds(2)) == std::future_status::ready);
+        dtor.get();
+    }
+
     std::printf("frame_pacer_test: all cases pass\n");
     return 0;
 }

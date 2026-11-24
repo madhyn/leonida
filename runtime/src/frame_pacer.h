@@ -238,9 +238,15 @@ public:
         std::unique_lock lock(mutex_);
         if (shutdown_) return pacer_hr::invalid_state;
         ++waiters_;
-        const std::int32_t result = wait_locked(lock, event, timeout_ms, flags, token);
-        if (--waiters_ == 0) cv_.notify_all();
-        return result;
+        // Decrement before `lock` unlocks so an exception from an injected clock does not strand `~FramePacer`.
+        struct WaiterRegistration {
+            std::uint32_t& count;
+            std::condition_variable& cv;
+            ~WaiterRegistration() {
+                if (--count == 0) cv.notify_all();
+            }
+        } waiter{waiters_, cv_};
+        return wait_locked(lock, event, timeout_ms, flags, token);
     }
 
     // GetFrameStatisticsX(token, type_mask, &count, array). `count` is the room in `out` on entry and the number of
