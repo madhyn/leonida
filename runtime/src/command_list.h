@@ -421,6 +421,13 @@ struct DrawViews {
 // and index buffers and the topology.
 // Render targets and vertex buffer views are inlined (8 simultaneous targets, 32 input slots), eliminating heap allocations
 // during command list recording (D3D-289).
+struct MeshIndirectArguments {
+    ResourceId buffer;
+    std::uint64_t offset;
+    std::uint32_t stride;
+    std::uint32_t count;
+};
+
 struct Draw {
     std::uintptr_t pipeline = 0;
     std::array<std::uint32_t, 32> user_data{};
@@ -440,6 +447,7 @@ struct Draw {
     std::int32_t base_vertex = 0;
     std::uint32_t first_instance = 0;
     bool mesh = false;
+    std::optional<MeshIndirectArguments> mesh_indirect;
 };
 
 // D3D12_TEXTURE_DATA_PITCH_ALIGNMENT and D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT.
@@ -587,8 +595,6 @@ enum class IndirectKind : std::uint8_t {
     draw = 0,
     draw_indexed = 1,
     dispatch = 2,
-    // D3D12_DISPATCH_MESH_ARGUMENTS. Created on a device with mesh shaders; ExecuteIndirect with it records nothing
-    // yet (the replay is #3777's), so a title that only creates such a signature at startup goes on.
     dispatch_mesh = 3,
 };
 
@@ -749,13 +755,18 @@ public:
     // not recorded.
     bool draw(const Draw& draw) {
         if (!draw.pipeline) return false;
-        if (!draw.count || !draw.instances || (draw.mesh && !draw.first)) return !closed_;
+        if (!has_draw_work(draw)) return !closed_;
         return append(draw);
     }
     bool draw(Draw&& draw) {
         if (!draw.pipeline) return false;
-        if (!draw.count || !draw.instances) return !closed_;
+        if (!has_draw_work(draw)) return !closed_;
         return append(std::move(draw));
+    }
+
+    static bool has_draw_work(const Draw& draw) {
+        if (draw.mesh_indirect) return draw.mesh_indirect->count != 0;
+        return draw.count && draw.instances && (!draw.mesh || draw.first);
     }
 
     // ClearRenderTargetView; the resource must be in render_target state at execution. No rects: the whole view.

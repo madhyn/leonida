@@ -7,7 +7,8 @@
 //     refuses (MS with VS, CS with PS, a subobject twice or in two versions, an unknown type, a truncated stream) are E_INVALIDARG, and
 //     state not built yet (an amplification shader, a depth-bounds test) is E_NOTIMPL.
 //   - Draws: DispatchMesh(2, 2, 1) with root constants (0, 0) and a red tint fills the top-left quadrant;
-//     DispatchMesh(1, 1, 2) moved by (1, -1) with a green tint fills the top half of the bottom-right one, so the
+//     ExecuteIndirect with a padded DISPATCH_MESH signature runs an empty grid and then a (1, 1, 2) grid. The grid
+//     moved by (1, -1) with a green tint fills the top half of the bottom-right quadrant, so the
 //     Y and Z counts reach the shader; the stream's VS PSO draws a full-screen triangle through a viewport on the
 //     bottom-left quadrant (yellow). Each pixel is read back and compared.
 //   - A vertex draw with the mesh PSO, and DispatchMesh with the VS one, fail at execution (ReplayResult::
@@ -304,7 +305,19 @@ int main() {
         std::uint8_t* up = nullptr;
         EXPECT(SUCCEEDED(upload->Map(0, nullptr, reinterpret_cast<void**>(&up))));
         for (int i = 0; i < 3; ++i) std::memcpy(up + 256 * i, tints[i], sizeof(tints[i]));
+        constexpr UINT mesh_args_offset = 1024;
+        struct MeshRecord {
+            D3D12_DISPATCH_MESH_ARGUMENTS grid;
+            UINT padding;
+        };
+        const MeshRecord mesh_args[] = {{{0, 0, 0}, 0}, {{1, 1, 2}, 0}};
+        std::memcpy(up + mesh_args_offset, mesh_args, sizeof(mesh_args));
         const D3D12_GPU_VIRTUAL_ADDRESS upload_va = upload->GetGPUVirtualAddress();
+        const D3D12_INDIRECT_ARGUMENT_DESC mesh_argument{D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH};
+        const D3D12_COMMAND_SIGNATURE_DESC mesh_signature_desc{sizeof(MeshRecord), 1, &mesh_argument, 0};
+        Ref<ID3D12CommandSignature> mesh_signature;
+        EXPECT(SUCCEEDED(device->CreateCommandSignature(&mesh_signature_desc, nullptr,
+                                                        IID_PPV_ARGS(&mesh_signature.p))));
 
         const D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
         Ref<ID3D12DescriptorHeap> rtv_heap;
@@ -349,7 +362,7 @@ int main() {
         // of the bottom-right quadrant.
         list->SetGraphicsRoot32BitConstants(0, 2, down_right, 0);
         list->SetGraphicsRootConstantBufferView(1, upload_va + 256);
-        list6->DispatchMesh(1, 1, 2);
+        list->ExecuteIndirect(mesh_signature.p, 2, upload.p, mesh_args_offset, nullptr, 0);
         // The stream's VS PSO: a full-screen triangle through a viewport on the bottom-left quadrant, yellow.
         const D3D12_VIEWPORT bottom_left{0, float(size / 2), float(size / 2), float(size / 2), 0, 1};
         list->RSSetViewports(1, &bottom_left);
@@ -507,6 +520,7 @@ int main() {
         for (auto* p : {&mesh_pso, &vs_pso, &refused}) p->reset();
         root.reset();
         rtv_heap.reset();
+        mesh_signature.reset();
         list6.reset();
         list.reset();
         allocator.reset();
@@ -538,7 +552,7 @@ int main() {
         return 1;
     }
     std::printf("D3D-29: mesh tier 1; mesh and VS PSOs from pipeline state streams (9 refused as invalid, 2 as not "
-                "implemented); DispatchMesh over X, Y and Z and a stream VS draw matched all %u pixels; wrong-kind "
+                "implemented); direct and indirect mesh dispatches and a stream VS draw matched all %u pixels; wrong-kind "
                 "draws fail at execution, oversized grids at Close; statistics queries around mesh draws resolve\n",
                 size * size);
     return 0;

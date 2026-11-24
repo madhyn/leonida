@@ -849,13 +849,18 @@ public:
             UINT64(max_command_count) > (arg_desc.Width - argument_buffer_offset) / stride)
             return check(false);
         if (kind == leonida::IndirectKind::dispatch_mesh) {
-            // Not replayed yet (#3777 replays it as vkCmdDrawMeshTasksIndirectEXT): nothing is recorded, and the
-            // first such call says so. The list stays valid.
-            static std::atomic<bool> logged{false};
-            if (!logged.exchange(true, std::memory_order_relaxed))
-                std::fprintf(stderr, "[rt] d3d12: ExecuteIndirect with a DISPATCH_MESH signature is not replayed yet; "
-                                     "nothing was recorded\n");
-            return;
+            if (type_ != D3D12_COMMAND_LIST_TYPE_DIRECT || count_buffer) return check(false);
+            if (!max_command_count) return;
+            if (!graphics_pipeline_ || !graphics_.layout) return check(false);
+            if (!(viewport_.width > 0) || !(viewport_.height > 0)) return;
+            const auto arguments = resource_id(argument_buffer);
+            if (!arguments) return check(false);
+            leonida::Draw draw{graphics_pipeline_, graphics_.data, draw_views(), depth_, {}, 0, viewport_,
+                               scissor_, blend_factor_, front_stencil_ref_, back_stencil_ref_};
+            draw.mesh = true;
+            draw.mesh_indirect = leonida::MeshIndirectArguments{arguments, argument_buffer_offset, stride,
+                                                                max_command_count};
+            return check(list_.draw(std::move(draw)));
         }
         leonida::ExecuteIndirect cmd{};
         cmd.kind = kind;

@@ -860,6 +860,7 @@ struct ReplayFunctions {
     PFN_vkCmdSetBlendConstants set_blend_constants = nullptr;
     PFN_vkCmdDraw draw = nullptr;
     PFN_vkCmdDrawMeshTasksEXT draw_mesh_tasks = nullptr;  // VK_EXT_mesh_shader; null: mesh draws are unsupported
+    PFN_vkCmdDrawMeshTasksIndirectEXT draw_mesh_tasks_indirect = nullptr;
     PFN_vkCmdDrawIndexed draw_indexed = nullptr;
     std::function<const GraphicsPipeline*(std::uintptr_t)> graphics_pipeline;
     // The buffer and offset a console VA range starts in (from ResourceBinding::va), false when none does. `size` is
@@ -1566,6 +1567,7 @@ inline VkDeviceSize indirect_record_size(IndirectKind kind) {
     case IndirectKind::draw: return sizeof(VkDrawIndirectCommand);
     case IndirectKind::draw_indexed: return sizeof(VkDrawIndexedIndirectCommand);
     case IndirectKind::dispatch: return sizeof(VkDispatchIndirectCommand);
+    case IndirectKind::dispatch_mesh: return 0;  // Mesh dispatches use Draw to capture graphics state.
     }
     return 0;
 }
@@ -2109,7 +2111,8 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
     const GraphicsPipeline* pipeline = vk.graphics_pipeline(draw.pipeline);
     if (!pipeline || !pipeline->pipeline) return ReplayResult::unresolved_resource;
     if (pipeline->mesh != draw.mesh) return ReplayResult::invalid_draw;
-    if (draw.mesh && !vk.draw_mesh_tasks) return ReplayResult::unsupported;
+    if (draw.mesh_indirect && !vk.draw_mesh_tasks_indirect) return ReplayResult::unsupported;
+    if (draw.mesh && !draw.mesh_indirect && !vk.draw_mesh_tasks) return ReplayResult::unsupported;
     if (pipeline->bindless_set && !vk.bind_descriptor_sets) return ReplayResult::unsupported;
     if (pipeline->color_formats.size() > max_render_targets) return ReplayResult::unsupported;
     p.graphics = pipeline;
@@ -3151,6 +3154,13 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             if (pipeline->bindless_set && !vk.bind_descriptor_sets) return ReplayResult::unsupported;
             p.pipeline = *pipeline;
         } else if (const auto* draw = std::get_if<Draw>(&command)) {
+            if (draw->mesh_indirect) {
+                const auto& args = *draw->mesh_indirect;
+                if (!bind(args.buffer) || !p.binding.buffer) return ReplayResult::unresolved_resource;
+                if (!draw->mesh || args.stride < sizeof(VkDrawMeshTasksIndirectCommandEXT) || args.stride % 4 ||
+                    !detail::indirect_range(p.binding, args.offset, VkDeviceSize(args.count) * args.stride))
+                    return ReplayResult::invalid_indirect_arguments;
+            }
             if (out.draw_count == out.draws.size()) out.draws.emplace_back();
             auto& prepared_draw = out.draws[out.draw_count];
             prepared_draw.reset();
@@ -4212,7 +4222,14 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 vk.bind_vertex_buffers2(command_buffer, slot, 1, &d.vertex_buffers[slot], &d.vertex_offsets[slot],
                                         &d.vertex_sizes[slot], &d.vertex_strides[slot]);
             }
-            if (draw->mesh) {
+            if (draw->mesh_indirect) {
+                const auto& args = *draw->mesh_indirect;
+                const VkDeviceSize offset = p.binding.buffer_offset + args.offset;
+                // A single record per call also works without Vulkan's multiDrawIndirect feature.
+                for (std::uint32_t record = 0; record < args.count; ++record)
+                    vk.draw_mesh_tasks_indirect(command_buffer, p.binding.buffer,
+                                                offset + VkDeviceSize(record) * args.stride, 1, args.stride);
+            } else if (draw->mesh) {
                 vk.draw_mesh_tasks(command_buffer, draw->count, draw->instances, draw->first);
             } else if (draw->indexed) {
                 vk.bind_index_buffer(command_buffer, d.index_buffer, d.index_offset, d.index_type);

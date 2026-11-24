@@ -5866,8 +5866,8 @@ public:
         case D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED: kind = leonida::IndirectKind::draw_indexed; break;
         case D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH: kind = leonida::IndirectKind::dispatch; break;
         case D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH:
-            // As DispatchMesh: only a device with mesh shaders (MeshShaderTier 1) takes it.
-            if (!state_.info.mesh_shader) return E_NOTIMPL;
+            if (desc->NumArgumentDescs != 1 || !state_.info.mesh_shader ||
+                !state_.context->vk.vkCmdDrawMeshTasksIndirectEXT) return E_NOTIMPL;
             kind = leonida::IndirectKind::dispatch_mesh;
             break;
         default: return E_NOTIMPL;
