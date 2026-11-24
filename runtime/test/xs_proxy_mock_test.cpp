@@ -329,6 +329,7 @@ std::uint64_t mock_call(Mock* m, unsigned slot, const std::uint64_t* words) {
     if (m->kind == Kind::fence && slot == 8) return kCompletedValue;  // GetCompletedValue
     if (m->kind == Kind::queue && slot == 10) copy_array(m, slot, a2, a1);  // ExecuteCommandLists(count, lists)
     if (m->kind == Kind::command_list && slot == 28) copy_array(m, slot, a2, a1);  // SetDescriptorHeaps(count, heaps)
+    if (m->kind == Kind::command_list && slot == 46) copy_array(m, slot, a2, a1);  // OMSetRenderTargets(count, handles)
     if (m->kind == Kind::heap && slot == 9) {
         if (a1) reinterpret_cast<D3D12_CPU_DESCRIPTOR_HANDLE*>(a1)->ptr = kMockHeapCpuStart;
         return kMockHeapCpuStart;
@@ -1933,6 +1934,54 @@ int check_descriptor_heap_hooks() {
                                                             D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
         EXPECT(real->array[23][0] == kMockHeapCpuStart + off3 && real->array[23][1] == outside);
         EXPECT(real->array[24][0] == kMockHeapCpuStart + off7 && real->array[24][1] == 0x99990000ull);
+    }
+
+    // The command-list methods that take CPU descriptor handles translate the same range: console slots 50
+    // (OMSetRenderTargets), 51 (ClearDepthStencilView), 52 (ClearRenderTargetView), 53 and 54 (the two
+    // ClearUnorderedAccessView). A handle outside the range is passed as it is, and the caller's arrays are not written.
+    {
+        const IID alloc_iid = __uuidof(ID3D12CommandAllocator);
+        const IID list_iid = __uuidof(ID3D12GraphicsCommandList);
+        void* allocator = nullptr;
+        EXPECT(hr_of(raw(device, 9, 0, word(&alloc_iid), word(&allocator))) == S_OK);
+        struct {
+            std::uint32_t type, node_mask;
+            std::uint64_t reserved[2];
+        } list_desc{static_cast<std::uint32_t>(D3D12_COMMAND_LIST_TYPE_DIRECT), 0, {0, 0}};
+        void* list = nullptr;
+        EXPECT(hr_of(raw(device, 73, word(&list_desc), word(allocator), 0, word(&list_iid), word(&list))) == S_OK);
+        EXPECT(xs::is_command_list_proxy(list));
+        Mock* const real_list = reinterpret_cast<Mock*>(xs::command_list_proxy_real_list(list));
+
+        raw(list, 52, kCustomBase + off3, 0x1234, 0, 0);                                // ClearRenderTargetView
+        EXPECT(real_list->calls[48] == 1 && real_list->args[48][0] == kMockHeapCpuStart + off3);
+        raw(list, 52, outside, 0x1234, 0, 0);
+        EXPECT(real_list->calls[48] == 2 && real_list->args[48][0] == outside);
+        raw(list, 53, kMockHeapGpuStart + off7, kCustomBase + off7, 0x55, 0x66, 0, 0);  // ClearUnorderedAccessViewUint
+        EXPECT(real_list->args[49][0] == kMockHeapGpuStart + off7 && real_list->args[49][1] == kMockHeapCpuStart + off7);
+        raw(list, 54, kMockHeapGpuStart + off3, kCustomBase + off3, 0x55, 0x66, 0, 0);  // ClearUnorderedAccessViewFloat
+        EXPECT(real_list->args[50][0] == kMockHeapGpuStart + off3 && real_list->args[50][1] == kMockHeapCpuStart + off3);
+
+        D3D12_CPU_DESCRIPTOR_HANDLE targets[2] = {{kCustomBase + off3}, {outside}};
+        D3D12_CPU_DESCRIPTOR_HANDLE depth{kCustomBase + off7};
+        raw(list, 50, 2, word(targets), 0, word(&depth));                               // OMSetRenderTargets
+        EXPECT(real_list->calls[46] == 1 && real_list->args[46][0] == 2);
+        EXPECT(real_list->args[46][1] != word(targets) && real_list->args[46][3] != word(&depth));
+        EXPECT(real_list->array[46][0] == kMockHeapCpuStart + off3 && real_list->array[46][1] == outside);
+        EXPECT(targets[0].ptr == kCustomBase + off3 && targets[1].ptr == outside && depth.ptr == kCustomBase + off7);
+
+        // Slot 51 has a typed thunk, because its depth is a FLOAT in XMM3. The mock's integer prototype cannot see
+        // the float; what it can see is that the call arrives at PC slot 47 with the translated handle and flags.
+        using ClearDsvFn = void(WINAPI*)(void*, D3D12_CPU_DESCRIPTOR_HANDLE, D3D12_CLEAR_FLAGS, FLOAT, UINT8, UINT,
+                                         const D3D12_RECT*);
+        void* const* list_vtable = *reinterpret_cast<void* const* const*>(list);
+        reinterpret_cast<ClearDsvFn>(list_vtable[51])(list, D3D12_CPU_DESCRIPTOR_HANDLE{kCustomBase + off7},
+                                                      D3D12_CLEAR_FLAG_DEPTH, 0.5f, 3, 0, nullptr);
+        EXPECT(real_list->calls[47] == 1 && real_list->args[47][0] == kMockHeapCpuStart + off7 &&
+               static_cast<std::uint32_t>(real_list->args[47][1]) == D3D12_CLEAR_FLAG_DEPTH);
+
+        EXPECT(release(list) == 0);
+        EXPECT(release(allocator) == 0);
     }
 
     // Releasing the heap unregisters the range and invokes the free callback with the same attribute word.
