@@ -6433,21 +6433,35 @@ public:
         const rt::rootsig::StagePackResult graphics = rt::rootsig::pack_stage(parsed.sig, rt::rootsig::Stage::Vertex);
         const rt::rootsig::StagePackResult mesh = rt::rootsig::pack_stage(parsed.sig, rt::rootsig::Stage::Mesh);
         const rt::rootsig::StagePackResult compute = rt::rootsig::pack_stage(parsed.sig, rt::rootsig::Stage::Compute);
-        const rt::rootsig::PackResult fallback = graphics.ok ? rt::rootsig::PackResult{} : rt::rootsig::pack(parsed.sig);
-        const bool graphics_usable = graphics.ok || fallback.ok;
+        // LEONIDA_GRAPHICS_ROOT_LAYOUT=pc (diagnostic, #974 review): every graphics signature keeps pack()'s layout,
+        // as before the console layout, so one build compares both on the retail title. Mesh draws are refused then
+        // (a mesh shader translated with the root window reads the console layout only). Compute is unaffected.
+        std::size_t layout_length = 0;
+        char layout_value[8] = {};
+        const bool graphics_pc = getenv_s(&layout_length, layout_value, "LEONIDA_GRAPHICS_ROOT_LAYOUT") == 0 &&
+                                 layout_length > 1 && _stricmp(layout_value, "pc") == 0;
+        static std::atomic<bool> graphics_pc_said{false};
+        if (graphics_pc && !graphics_pc_said.exchange(true))
+            std::fprintf(stderr, "[rt] d3d12: LEONIDA_GRAPHICS_ROOT_LAYOUT=pc: graphics root arguments from s0, two "
+                                 "dwords per table, for every root signature (diagnostic)\n");
+        const bool graphics_console = graphics.ok && !graphics_pc;
+        const rt::rootsig::PackResult fallback =
+            graphics_console ? rt::rootsig::PackResult{} : rt::rootsig::pack(parsed.sig);
+        const bool graphics_usable = graphics_console || fallback.ok;
         if (!graphics_usable && !compute.ok) {
-            std::fprintf(stderr, "[rt] d3d12: root signature refused: %s (compute: %s)\n", graphics.error.c_str(),
-                         compute.error.c_str());
+            std::fprintf(stderr, "[rt] d3d12: root signature refused: %s (compute: %s)\n",
+                         graphics.ok ? fallback.error.c_str() : graphics.error.c_str(), compute.error.c_str());
             return E_INVALIDARG;
         }
         if (!graphics_usable)
-            std::fprintf(stderr, "[rt] d3d12: root signature usable for compute only: %s\n", graphics.error.c_str());
+            std::fprintf(stderr, "[rt] d3d12: root signature usable for compute only: %s\n",
+                         graphics.ok ? fallback.error.c_str() : graphics.error.c_str());
         else if (!graphics.ok)
             std::fprintf(stderr,
                          "[rt] d3d12: root signature past the console's graphics window (%s): graphics keeps the PC "
                          "layout from s0 until the argument block behind s[0:1] is modelled\n",
                          graphics.error.c_str());
-        else if (!mesh.ok)
+        else if (graphics_console && !mesh.ok)
             std::fprintf(stderr, "[rt] d3d12: root signature too large for a mesh shader's root window: %s\n",
                          mesh.error.c_str());
         if (!compute.ok)
@@ -6455,12 +6469,12 @@ public:
         RootArgumentLayout layout;
         layout.flags = parsed.sig.flags;
         layout.graphics_ok = graphics_usable;
-        layout.graphics_console = graphics.ok;
-        layout.mesh_ok = graphics.ok && mesh.ok;
+        layout.graphics_console = graphics_console;
+        layout.mesh_ok = graphics_console && mesh.ok;
         layout.compute_ok = compute.ok;
         for (std::size_t i = 0; i < parsed.sig.params.size(); ++i) {
             std::uint32_t first = rt::rootsig::kNoSgpr;
-            if (graphics.ok) {
+            if (graphics_console) {
                 first = graphics.first_sgpr[i];
             } else if (fallback.ok) {
                 for (std::uint32_t d = 0; d < fallback.dword_count; ++d)

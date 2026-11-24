@@ -468,7 +468,25 @@ int main() {
             list->RSSetViewports(1, &viewport);
             list6->DispatchMesh(1, 1, 1);
             EXPECT(list->Close() == E_INVALIDARG);  // a mesh shader still cannot read it
->>>>>>> 74e55acfb (D3D-448-GRAPHICS: a graphics signature past the console window keeps the PC layout instead of being refused)
+            // LEONIDA_GRAPHICS_ROOT_LAYOUT=pc (diagnostic): even a signature that fits every window keeps the PC
+            // layout at the graphics bind point, so a mesh shader, which reads the console layout, may not use it.
+            EXPECT(_putenv_s("LEONIDA_GRAPHICS_ROOT_LAYOUT", "pc") == 0);
+            Ref<ID3D12RootSignature> pc_layout;
+            EXPECT(wide_root_signature(device.p, pc_layout, 4));
+            EXPECT(_putenv_s("LEONIDA_GRAPHICS_ROOT_LAYOUT", "") == 0);
+            EXPECT(SUCCEEDED(list->Reset(allocator.p, mesh_pso.p)));
+            list->SetGraphicsRootSignature(pc_layout.p);
+            list->RSSetViewports(1, &viewport);
+            list6->DispatchMesh(1, 1, 1);
+            EXPECT(list->Close() == E_INVALIDARG);
+            // The same signature without the variable: console layout, the mesh window holds it.
+            Ref<ID3D12RootSignature> console_layout;
+            EXPECT(wide_root_signature(device.p, console_layout, 4));
+            EXPECT(SUCCEEDED(list->Reset(allocator.p, mesh_pso.p)));
+            list->SetGraphicsRootSignature(console_layout.p);
+            list->RSSetViewports(1, &viewport);
+            list6->DispatchMesh(1, 1, 1);
+            EXPECT(SUCCEEDED(list->Close()));
         }
         EXPECT(SUCCEEDED(queue->Signal(fence.p, 2)) && SUCCEEDED(fence->SetEventOnCompletion(2, nullptr)));
 
