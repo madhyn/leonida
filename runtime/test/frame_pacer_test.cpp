@@ -771,6 +771,65 @@ int main() {
         EXPECT(r.hr == pacer_hr::ok && r.token == 1);
     }
 
+    // A waiter arriving after ~FramePacer has begun shutting down returns invalid_state immediately without
+    // entering wait_locked (zero late clock reads) or hanging.
+    {
+        struct HoldingClock final : FrameClock {
+            std::atomic<std::uint64_t> now{0};
+            std::atomic<int> now_calls{0};
+            std::mutex gate_mutex;
+            std::condition_variable gate_cv;
+            bool in_wait = false;
+            bool release = false;
+
+            std::uint64_t now_us() override {
+                ++now_calls;
+                return now.load();
+            }
+            void wait(std::unique_lock<std::mutex>& lock, std::condition_variable& cv, std::uint64_t) override {
+                {
+                    std::lock_guard g(gate_mutex);
+                    in_wait = true;
+                }
+                gate_cv.notify_all();
+                cv.wait(lock);
+                // Release the pacer mutex while holding this waiter out of returning, so ~FramePacer parks on
+                // waiters_ == 0 and a late waiter can enter wait_frame_event concurrently.
+                lock.unlock();
+                {
+                    std::unique_lock g(gate_mutex);
+                    gate_cv.wait(g, [this] { return release; });
+                }
+                lock.lock();
+            }
+        } clock;
+
+        auto pacer = std::make_unique<FramePacer>(clock);
+        FramePacer* const raw = pacer.get();
+        EXPECT(setup(*raw, 1));
+        std::future<Result> first = wait_async(*raw, infinite_timeout_ms);
+        {
+            std::unique_lock g(clock.gate_mutex);
+            clock.gate_cv.wait(g, [&] { return clock.in_wait; });
+        }
+        std::future<void> dtor = std::async(std::launch::async, [&] { pacer.reset(); });
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        const int reads_before_late = clock.now_calls.load();
+        std::future<Result> late = wait_async(*raw, infinite_timeout_ms);
+        EXPECT(late.wait_for(std::chrono::seconds(2)) == std::future_status::ready);
+        const Result late_r = late.get();
+        EXPECT(late_r.hr == pacer_hr::invalid_state && late_r.token == 0);
+        EXPECT(clock.now_calls.load() == reads_before_late);
+        {
+            std::lock_guard g(clock.gate_mutex);
+            clock.release = true;
+        }
+        clock.gate_cv.notify_all();
+        EXPECT(dtor.wait_for(std::chrono::seconds(2)) == std::future_status::ready);
+        dtor.get();
+        EXPECT(first.get().hr == pacer_hr::invalid_state);
+    }
+
     std::printf("frame_pacer_test: all cases pass\n");
     return 0;
 }
