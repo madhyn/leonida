@@ -2628,7 +2628,8 @@ HRESULT proxy_create_placed_resource_x(DeviceProxy* self, void* va, const D3D12_
     constexpr std::uint32_t kPcResourceFlags = 0x5ff;
     D3D12_RESOURCE_DESC pc_desc = *xbox_desc;
     const auto xbox_flags = static_cast<std::uint32_t>(pc_desc.Flags);
-    pc_desc.Flags = static_cast<D3D12_RESOURCE_FLAGS>(xbox_flags & kPcResourceFlags);
+    pc_desc.Flags = static_cast<D3D12_RESOURCE_FLAGS>(
+        without_depth_stencil_uav(pc_desc.Dimension, xbox_flags & kPcResourceFlags));
     // The Xbox layout word (0x101 tiled, 0x1 row-major buffer) is no PC layout: ROW_MAJOR for a buffer and UNKNOWN
     // for everything else, as slot 76 does.
     pc_desc.Layout = pc_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? D3D12_TEXTURE_LAYOUT_ROW_MAJOR
@@ -2679,12 +2680,6 @@ D3D12_HEAP_PROPERTIES* proxy_get_custom_heap_properties(D3D12_HEAP_PROPERTIES* o
 // state of slot 133 as well. The words take the positions the thunk received them in (see the top of the file).
 constexpr unsigned kCreateCommittedResource3X = 127;
 constexpr unsigned kPcCreateCommittedResource3 = 76;  // ID3D12Device10, the PC device's 77th method
-constexpr std::uint32_t kPcResourceFlagsMask =
-    D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL |
-    D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS | D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE |
-    D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER | D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS |
-    D3D12_RESOURCE_FLAG_VIDEO_DECODE_REFERENCE_ONLY | D3D12_RESOURCE_FLAG_VIDEO_ENCODE_REFERENCE_ONLY |
-    D3D12_RESOURCE_FLAG_RAYTRACING_ACCELERATION_STRUCTURE;
 
 HRESULT proxy_create_committed_resource3_x(DeviceProxy* self, std::uint64_t heap_word, std::uint64_t heap_flags,
                                            std::uint64_t desc_word, std::uint64_t layout_word,
@@ -2712,7 +2707,7 @@ HRESULT proxy_create_committed_resource3_x(DeviceProxy* self, std::uint64_t heap
     const auto xbox_flags = static_cast<std::uint32_t>(pc_desc.Flags);
     pc_desc.Layout = pc_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? D3D12_TEXTURE_LAYOUT_ROW_MAJOR
                                                                          : D3D12_TEXTURE_LAYOUT_UNKNOWN;
-    pc_desc.Flags = static_cast<D3D12_RESOURCE_FLAGS>(xbox_flags & kPcResourceFlagsMask);
+    pc_desc.Flags = static_cast<D3D12_RESOURCE_FLAGS>(pc_resource_flags(pc_desc.Dimension, xbox_flags));
 
     static std::atomic<bool> logged{false};
     if (first_call(logged))

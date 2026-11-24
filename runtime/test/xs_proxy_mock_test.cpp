@@ -674,6 +674,21 @@ int check_levels() {
             EXPECT(std::memcmp(&seen_iid, &resource_iid, sizeof(GUID)) == 0);
             EXPECT(seen_layout == 0xFFFFFFFFu);  // the title's third word, passed through as the barrier layout
             EXPECT(xs::device_slot_overridden(133));
+
+            xs::set_placed_at_va_handler(handler);
+            D3D12_RESOURCE_DESC depth_desc = xbox_desc;
+            depth_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+            depth_desc.Height = 256;
+            depth_desc.Format = DXGI_FORMAT_R32G8X24_TYPELESS;
+            depth_desc.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x101);
+            depth_desc.Flags = static_cast<D3D12_RESOURCE_FLAGS>(0x20006);
+            placed = nullptr;
+            const HRESULT depth_hr = hr_of(raw(device, 133, word(va), word(&depth_desc), 0xFFFFFFFFull, 0,
+                                               word(&resource_iid), word(&placed)));
+            xs::set_placed_at_va_handler(nullptr);
+            EXPECT(depth_hr == S_OK && placed == reinterpret_cast<void*>(0x1330));
+            EXPECT(static_cast<std::uint32_t>(seen_desc.Flags) == D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
+            EXPECT(seen_desc.Layout == D3D12_TEXTURE_LAYOUT_UNKNOWN);
         }
 
         // 133 with a pages hook (set_placed_at_va_pages_hook): a buffer's range [va, va + width) is handed to it
@@ -2384,6 +2399,23 @@ int check_committed_resource3_x() {
     resource = nullptr;
     EXPECT(hr_of(raw10(device, 127, words)) == S_OK && resource);
     EXPECT(g_committed3.calls == 2 && g_committed3.desc.Layout == D3D12_TEXTURE_LAYOUT_ROW_MAJOR);
+    EXPECT(g_committed3.desc.Flags ==
+           (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS));
+
+    D3D12_RESOURCE_DESC1 depth = texture;
+    depth.Format = DXGI_FORMAT_R32G8X24_TYPELESS;
+    depth.Flags = static_cast<D3D12_RESOURCE_FLAGS>(D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL |
+                                                    D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS | kXboxFlagBit);
+    words[2] = word(&depth);
+    resource = nullptr;
+    EXPECT(hr_of(raw10(device, 127, words)) == S_OK && resource);
+    EXPECT(g_committed3.calls == 3 && g_committed3.desc.Flags == D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
+    EXPECT(depth.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+
+    depth.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+    resource = nullptr;
+    EXPECT(hr_of(raw10(device, 127, words)) == S_OK && resource);
+    EXPECT(g_committed3.calls == 4 && g_committed3.desc.Flags == D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
 
     // The PC device's own refusal reaches the title with a null object.
     mock->create_result = E_OUTOFMEMORY;
