@@ -692,6 +692,11 @@ side inwards:
     `TEXTURE2DMS` view reads layer zero, while `TEXTURE2DMSARRAY` selects a range starting at
     `FirstArraySlice` (`ArraySize = UINT_MAX` selects the remaining layers). The format-support query
     advertises `MULTISAMPLE_LOAD` when the format can be sampled with MSAA and its binding pair is available.
+  - Xbox device slots 70 (SRV) and 71 (UAV) can select a live texture created by slot 133.
+    The address and resource description select the most recent compatible placement, including when
+    several live resources share an address. UAVs require writable backing. A 3D UAV can select one
+    complete mip. A missing placement or unsupported view gives a null descriptor.
+    Set `LEONIDA_PLACED_TEXTURE_UAV=0` to restore null placed UAVs.
   - A texture is named in its T#s by an address of its own, above 4 GiB and 256 bytes apart, that nothing
     dereferences; its entries leave the set and the table when it is destroyed.
   - `VulkanDeviceInfo::bindless` says the Vulkan device has the features this needs: `runtimeDescriptorArray`,

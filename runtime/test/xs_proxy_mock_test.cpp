@@ -1569,7 +1569,9 @@ int run_env_slots(bool valid, bool on_slot74 = false) {
         EXPECT(hr_of(raw(device, 78, 0, 16667, 1, 0)) == S_OK && mock->calls[78] == 0);
         EXPECT(hr_of(raw(device, 79, 0, 0, 0, 0)) == S_OK && mock->calls[79] == 0);
         EXPECT(hr_of(raw(device, 80, 0, 0, 0, 0, word(&token))) == S_OK && token && mock->calls[80] == 0);
-        EXPECT(hr_of(raw(device, 71)) == S_OK && mock->calls[71] == 1);  // not an Xbox slot: forwarded
+        // Slot 71 is an Xbox route now (a placed texture UAV), so the probe is the next PC slot.
+        EXPECT(!xs::device_slot_overridden(72));
+        EXPECT(hr_of(raw(device, 72)) == S_OK && mock->calls[72] == 1);  // not an Xbox slot: forwarded
     }
     EXPECT(release(device) == 0 && mock->refs == 0);
     std::printf("%s: environment slot overrides %s\n", g_label,
@@ -1668,17 +1670,17 @@ int check_resource_allocation_info() {
     return 0;
 }
 
-// ---- 8. Device slot 70: a view from raw words, never the PC CreatePlacedResource1 ----
+// ---- 8. Device slots 70/71: raw views, including the fallback on a plain PC device ----
 
-int check_slot70() {
+int check_placed_views() {
     // Level 9 has the PC slot 70; level 0 does not (44 PC slots). Neither may reach CreatePlacedResource1.
     for (const int level : {9, 0}) {
         Mock* mock = nullptr;
         void* device = make_device(mock, level, true);
-        EXPECT(device && xs::device_slot_overridden(70));
+        EXPECT(device && xs::device_slot_overridden(70) && xs::device_slot_overridden(71));
         xs::reset_device_proxy_stats();
-        const std::uint32_t words[8] = {0x1000, 0, 0, 0, 0, 0, 0, 0};
-        const std::uint32_t view[8] = {};
+        const std::uint32_t words[14] = {0x1000, 0, 0, 0, 0, 0, 0, 0};
+        const std::uint32_t view[16] = {};
         const std::uint64_t destination = 0x7000;
         raw(device, 70, word(words), word(view), destination);
         EXPECT(mock->calls[70] == 0 && xs::device_slot_hits(70) == 1);
@@ -1689,6 +1691,12 @@ int check_slot70() {
         // No destination, no write.
         raw(device, 70, word(words), word(view), 0);
         EXPECT(mock->calls[70] == 0 && mock->calls[18] == 1);
+        raw(device, 71, word(words), word(view), destination);
+        EXPECT(mock->calls[71] == 0 && xs::device_slot_hits(71) == 1);
+        EXPECT(mock->calls[19] == 1 && mock->args[19][0] == 0 && mock->args[19][1] == 0 &&
+               mock->args[19][2] != 0 && mock->args[19][3] == destination);
+        raw(device, 71, word(words), word(view), 0);
+        EXPECT(mock->calls[19] == 1);
         EXPECT(release(device) == 0 && mock->refs == 0);
     }
     return 0;
@@ -2753,7 +2761,7 @@ int main(int argc, char** argv) {
     if (check_tail(true) || check_levels() || check_slot48() || check_fence1() || check_fence_completed_value() || check_create_failures() || check_open_shared() ||
         check_alloc_failures() || check_allocators() || check_xbox_slots() || check_console_command_list() ||
         check_custom_heap_properties() ||
-        check_resource_allocation_info() || check_slot70() || check_committed_resource3_x() ||
+        check_resource_allocation_info() || check_placed_views() || check_committed_resource3_x() ||
         check_descriptor_heap_hooks() ||
         check_render_target_sizes() ||
         check_allocation_descriptions_cleaned() ||

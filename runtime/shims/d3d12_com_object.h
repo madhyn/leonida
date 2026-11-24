@@ -26,7 +26,7 @@ class Object : public Stubs {
 public:
     ULONG STDMETHODCALLTYPE AddRef() override { return ++refs_; }
     ULONG STDMETHODCALLTYPE Release() override {
-        const ULONG left = --refs_;
+        const ULONG left = drop_reference();
         if (!left) delete static_cast<Derived*>(this);
         return left;
     }
@@ -120,6 +120,9 @@ public:
     }
 
 protected:
+    // An indexed resource removes its weak entry before deleting the last reference.
+    ULONG drop_reference() { return --refs_; }
+
     virtual ~Object() {
         for (auto& entry : data_)
             if (entry.object) entry.object->Release();

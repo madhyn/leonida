@@ -21,10 +21,12 @@
 #include "d3d12_test_shaders.h"
 #include "../shims/d3d12_com.h"
 #include "../shims/d3d12_xs_device.h"
+#include "../src/gfx10_descriptors.h"
 #include "../src/shader_library.h"
 
 #include <array>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -52,6 +54,82 @@ Texel gradient(UINT x, UINT y) {
 }
 // The second texture: the first one point-reflected, so no texel of it is in the same place.
 Texel reflected(UINT x, UINT y) { return gradient(texture_size - 1 - x, texture_size - 1 - y); }
+
+// Exercise the console ABI: slot 133 publishes a placement and slots 70/71 receive descriptions
+// plus an address, with no resource pointer. The address itself is opaque to these GPU-only tests.
+HRESULT place(ID3D12Device* dev, void* address, const D3D12_RESOURCE_DESC& desc, UINT layout, ID3D12Resource** out) {
+    using Fn = HRESULT(WINAPI*)(ID3D12Device*, void*, const D3D12_RESOURCE_DESC*, UINT, const void*, REFIID, void**);
+    return reinterpret_cast<Fn>(slot(dev, 133))(dev, address, &desc, layout, nullptr, IID_PPV_ARGS(out));
+}
+
+template<class View>
+void placed_view(ID3D12Device* dev, UINT method, const D3D12_RESOURCE_DESC& desc, const View& view,
+                 const void* address, D3D12_CPU_DESCRIPTOR_HANDLE dest) {
+    std::array<UINT, 16> words{};
+    static_assert(sizeof(View) <= 10 * sizeof(UINT));
+    std::memcpy(words.data(), &view, sizeof(view));
+    std::memcpy(words.data() + 10, &address, sizeof(address));
+    using Fn = void(WINAPI*)(ID3D12Device*, const D3D12_RESOURCE_DESC*, const void*, D3D12_CPU_DESCRIPTOR_HANDLE);
+    reinterpret_cast<Fn>(slot(dev, method))(dev, &desc, words.data(), dest);
+}
+
+int check_placed_uavs(ID3D12Device* device) {
+    alignas(256) std::byte address{};
+    D3D12_RESOURCE_DESC array{};
+    array.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    array.Width = array.Height = 8;
+    array.DepthOrArraySize = 6;
+    array.MipLevels = array.SampleDesc.Count = 1;
+    array.Format = DXGI_FORMAT_R32_UINT;
+    array.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    auto face = array;
+    face.DepthOrArraySize = 1;
+    Ref<ID3D12Resource> older, newer;
+    EXPECT(SUCCEEDED(place(device, &address, array, 3, &older.p)));
+    EXPECT(SUCCEEDED(place(device, &address, face, 3, &newer.p)));
+
+    D3D12_UNORDERED_ACCESS_VIEW_DESC view{};
+    view.Format = array.Format;
+    view.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2DARRAY;
+    view.Texture2DArray.FirstArraySlice = 5;
+    view.Texture2DArray.ArraySize = 1;
+    using Words = std::array<UINT, 8>;
+    Words expected{}, got{};
+    const D3D12_CPU_DESCRIPTOR_HANDLE dest{reinterpret_cast<SIZE_T>(got.data())};
+    device->CreateUnorderedAccessView(older.p, nullptr, &view, {reinterpret_cast<SIZE_T>(expected.data())});
+    EXPECT(expected != Words{});
+    const char* value = std::getenv("LEONIDA_PLACED_TEXTURE_UAV");
+    const bool enabled = !value || std::strcmp(value, "0") != 0;
+    placed_view(device, 71, array, view, &address, dest);
+    EXPECT(got == (enabled ? expected : Words{}));
+    older.reset();
+    got.fill(~0u);
+    placed_view(device, 71, array, view, &address, dest);
+    EXPECT(got == Words{});  // The remaining single-layer image cannot supply layer 5.
+
+    auto volume = face;
+    volume.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+    volume.DepthOrArraySize = 8;
+    volume.MipLevels = 2;
+    Ref<ID3D12Resource> volume_target;
+    EXPECT(SUCCEEDED(place(device, &address, volume, 3, &volume_target.p)));
+    view.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE3D;
+    view.Texture3D = {1, 0, 4};
+    placed_view(device, 71, volume, view, &address, dest);
+    leonida::gfx10::Image decoded{};
+    if (enabled) {
+        EXPECT(leonida::gfx10::decode(got, decoded) && decoded.type == leonida::gfx10::ImageType::image_3d &&
+               decoded.first_mip == 1 && decoded.mip_count == 1);
+    } else {
+        EXPECT(got == Words{});
+    }
+    view.Texture3D.WSize = 2;
+    got.fill(~0u);
+    placed_view(device, 71, volume, view, &address, dest);
+    EXPECT(got == Words{});
+    std::printf("placed UAVs: %u matching views, %u null controls\n", enabled ? 2 : 0, enabled ? 2 : 4);
+    return 0;
+}
 
 }  // namespace
 
@@ -163,10 +241,12 @@ int main() {
         texture_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
         texture_desc.SampleDesc.Count = 1;
         Ref<ID3D12Resource> textures[2], upload, output, readback;
-        for (auto& texture : textures)
-            EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &texture_desc,
-                                                             D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
-                                                             IID_PPV_ARGS(&texture.p))));
+        EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &texture_desc,
+                                                         D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                         IID_PPV_ARGS(&textures[0].p))));
+        alignas(256) std::byte placement{};
+        EXPECT(SUCCEEDED(place(device.p, &placement, texture_desc, 8, &textures[1].p)));
+        EXPECT(check_placed_uavs(device.p) == 0);
         // The upload buffer: texture A at 0, texture B at 2048 (8 rows of the 256-byte pitch).
         constexpr UINT64 b_offset = 2048;
         const auto upload_desc = buffer_desc(4096);
@@ -219,8 +299,9 @@ int main() {
             srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
             srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
             srv.Texture2D = {0, 1, 0, 0.0f};
-            device->CreateShaderResourceView(textures[i].p, &srv,
-                                             D3D12_CPU_DESCRIPTOR_HANDLE{SIZE_T(view_cpu + i * view_step)});
+            const D3D12_CPU_DESCRIPTOR_HANDLE dest{SIZE_T(view_cpu + i * view_step)};
+            if (i == 0) device->CreateShaderResourceView(textures[i].p, &srv, dest);
+            else placed_view(device.p, 70, texture_desc, srv, &placement, dest);
         }
         // Slot 2: bytes no view was made for. The hash table has no entry for them.
         std::uint32_t unknown[8];

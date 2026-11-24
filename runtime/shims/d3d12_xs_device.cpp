@@ -69,6 +69,7 @@ constexpr unsigned kMaxSlots = 192;
 static_assert(kMaxSlots > 133, "the proxy table must cover the slots the retail title calls (up to 133)");
 
 // Set by the Vulkan device behind the proxy; slot 14 uses it for a console-extended CreateDescriptorHeap.
+std::atomic<PlacedTextureViewHandler> g_placed_texture_view{nullptr};
 std::atomic<ConsoleDescriptorHeapHandler> g_console_descriptor_heap{nullptr};
 static_assert(kMaxSlots > 83, "the proxy table must cover ID3D12Device14 (83 slots)");
 static_assert(sizeof(void*) == 8, "the Xbox-ABI proxy is x64-only");
@@ -261,6 +262,7 @@ const char* slot_name(unsigned slot) {
         case 62: return "Xbox CreateComputePipelineState";
         case 67: return "Xbox DeserializeComputePipelineStateX";
         case 70: return "Xbox shader-resource view from raw words";
+        case 71: return "Xbox unordered-access view from raw words";
         case 73: return "Xbox CreateCommandListX -> PC CreateCommandList";
         case 74: return "Xbox (pointer, u32, pointer) stand-in";
         case 75: return "CreateCommandQueue1 -> queue proxy";
@@ -2030,24 +2032,43 @@ HRESULT proxy_create_command_queue_xbox(DeviceProxy* self, const std::uint32_t* 
     return proxy_create_command_queue(self, &pc, riid, out);
 }
 
-// Xbox device slot 70: (texture_words, view_desc, destination), no return value. The retail executable's SRV writer
-// makes a view from raw descriptions and a GPU address with no resource object (docs/retail_boot_chain.md, stop 14,
-// measured by call shape only). The PC slot 70 is ID3D12Device8::CreatePlacedResource1, which would take the
-// destination handle for a resource description and write through it. The layout of the raw words is not measured,
-// so nothing reads them: the destination gets the PC's null shader-resource view, which a shader reads as zeros, and
-// the call returns. A view that reaches the GPU address needs that layout.
-void proxy_create_srv_from_raw_x(DeviceProxy* self, std::uint64_t texture_words, std::uint64_t view_desc,
-                                 std::uint64_t destination) {
-    note_slot(70);
-    log_xbox_route_once(70, "CreateShaderResourceView from raw words (null view)", texture_words, view_desc,
-                        destination, 0, 0);
+// Slots 70/71 take a resource description and an SRV/UAV description followed by the placement address
+// in dwords 10-11 (the console ABI also recorded by VIctory, victory-gpu/descriptor). The PC methods at
+// these slots have different arguments. A backend without a matching image supplies a null descriptor.
+void proxy_create_placed_view(DeviceProxy* self, bool unordered, std::uint64_t resource_words,
+                              std::uint64_t view_words, std::uint64_t destination) {
+    const unsigned slot = unordered ? 71 : 70;
+    note_slot(slot);
+    log_xbox_route_once(slot, unordered ? "placed texture UAV" : "placed texture SRV",
+                        resource_words, view_words, destination, 0, 0);
     if (!destination) return;
-    D3D12_SHADER_RESOURCE_VIEW_DESC null_view{};
-    null_view.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-    null_view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-    null_view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-    null_view.Texture2D.MipLevels = 1;
-    self->real->CreateShaderResourceView(nullptr, &null_view, D3D12_CPU_DESCRIPTOR_HANDLE{destination});
+    const D3D12_CPU_DESCRIPTOR_HANDLE dest{destination};
+    if (const auto handler = g_placed_texture_view.load(std::memory_order_acquire)) {
+        D3D12_RESOURCE_DESC resource{};
+        std::uint32_t view[12]{};
+        if (ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(resource_words),
+                              &resource, sizeof(resource), nullptr) &&
+            resource.Dimension >= D3D12_RESOURCE_DIMENSION_TEXTURE1D &&
+            resource.Dimension <= D3D12_RESOURCE_DIMENSION_TEXTURE3D &&
+            ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(view_words),
+                              view, sizeof(view), nullptr)) {
+            const auto address = UINT64(view[10]) | (UINT64(view[11]) << 32);
+            if (address && handler(self->real, unordered, resource, view, address, dest)) return;
+        }
+    }
+    if (unordered) {
+        D3D12_UNORDERED_ACCESS_VIEW_DESC null_view{};
+        null_view.Format = DXGI_FORMAT_R32_UINT;
+        null_view.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+        self->real->CreateUnorderedAccessView(nullptr, nullptr, &null_view, dest);
+    } else {
+        D3D12_SHADER_RESOURCE_VIEW_DESC null_view{};
+        null_view.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        null_view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        null_view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        null_view.Texture2D.MipLevels = 1;
+        self->real->CreateShaderResourceView(nullptr, &null_view, dest);
+    }
 }
 
 // Device slot 75: ID3D12Device9::CreateCommandQueue1(desc, creator_id, riid, out), called by slot index.
@@ -3093,8 +3114,8 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
                                                         reinterpret_cast<const D3D12_RESOURCE_DESC*>(a2),
                                                         static_cast<std::uint32_t>(a3), reinterpret_cast<const IID*>(a5),
                                                         reinterpret_cast<void**>(a6)));
-    } else if constexpr (Slot == 70) {
-        proxy_create_srv_from_raw_x(self, a1, a2, a3);
+    } else if constexpr (Slot == 70 || Slot == 71) {
+        proxy_create_placed_view(self, Slot == 71, a1, a2, a3);
         return 0;
     } else if constexpr (Slot == 76) {
         return hr_to_u64(proxy_create_resource(
@@ -3412,6 +3433,10 @@ unsigned device_proxy_slot_count(const void* device) {
     return static_cast<const DeviceProxy*>(device)->slot_count;
 }
 
+void set_placed_texture_view_handler(PlacedTextureViewHandler handler) {
+    g_placed_texture_view.store(handler, std::memory_order_release);
+}
+
 void set_placed_at_va_handler(PlacedAtVaHandler handler) {
     g_placed_at_va.store(handler, std::memory_order_release);
 }
@@ -3437,7 +3462,7 @@ std::shared_ptr<leonida::FrameTokenSource> device_frame_tokens(const void* devic
 bool device_slot_overridden(unsigned slot) {
     if (slot <= 2 || slot == 8 || slot == 9 || slot == 14 || (slot >= 17 && slot <= 24) || slot == 25 || slot == 26 || slot == 31 || slot == 32 || slot == 34 || slot == 35 ||
         slot == 36 || slot == 41 || slot == 45 || slot == 46 || slot == 50 || slot == 56 || slot == 61 || slot == 74 || slot == 62 || slot == 67 ||
-        slot == 70 || slot == 75 || slot == 76 || slot == 86 || slot == 101 || slot == 108 || slot == 133 || slot == kCreateCommittedResource3X)
+        slot == 70 || slot == 71 || slot == 75 || slot == 76 || slot == 86 || slot == 101 || slot == 108 || slot == 133 || slot == kCreateCommittedResource3X)
         return true;
     const XboxDeviceSlotRoutes& routes = xbox_device_slot_routes();
     return slot == routes.frame_interval || slot == routes.schedule_event || slot == routes.wait_event ||

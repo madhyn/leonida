@@ -3020,6 +3020,8 @@ if(TARGET Vulkan::Headers)
       target_compile_options(d3d12_set0_compute_test PRIVATE /W4 /permissive- /utf-8)
       add_test(NAME d3d12_set0_compute COMMAND d3d12_set0_compute_test)
       set_tests_properties(d3d12_set0_compute PROPERTIES SKIP_RETURN_CODE 77)
+      add_test(NAME d3d12_placed_texture_uav_off COMMAND d3d12_set0_compute_test)
+      set_tests_properties(d3d12_placed_texture_uav_off PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT LEONIDA_PLACED_TEXTURE_UAV=0)
       # Bindless table churn on a direct and a compute queue: the table grows and live keys move without a
       # device-idle wait (D3D-314); the same shader, run twice (deferred retirement, and the old wait for timing).
       add_executable(d3d12_bindless_churn_test test/d3d12_bindless_churn_test.cpp shims/d3d12_xs_device.cpp

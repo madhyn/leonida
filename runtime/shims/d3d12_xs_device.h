@@ -15,10 +15,8 @@
 //   slot 67   CreateComputePipelineState from native code (desc, iid, out): converts the Xbox native-code desc
 //             (+0x00 root signature, +0x28 code, +0x30 size) to D3D12_COMPUTE_PIPELINE_STATE_DESC and forwards
 //             to PC CreateComputePipelineState (slot 11). The PC slot 67 is CreateProtectedResourceSession1.
-//   slot 70   (texture words, view desc, destination handle), no return value: a shader-resource view from raw words
-//             and a GPU address, with no resource (retail boot chain stop 14). The PC slot 70 is CreatePlacedResource1.
-//             The words are not measured, so the destination gets the PC null view (PC CreateShaderResourceView
-//             with no resource) and the call returns.
+//   slots 70/71   (resource desc, view words, destination handle): create an SRV/UAV of the matching live
+//                 texture placed at the address in view dwords 10-11. An unavailable image gives a null view.
 //   slot 74   (pointer, u32, pointer): not measured, returns S_OK. The PC slot 74 is ShaderCacheControl(kinds, control),
 //             which reads the first word as flags and returns E_INVALIDARG. Nothing is written, the PC device is not called.
 //   slot 76   resource creation -> PC CreateCommittedResource (PC slot 27), with the Xbox layout word ignored.
@@ -140,6 +138,11 @@ unsigned device_proxy_slot_count(const void* device);
 
 // The PC device behind a proxy. Null when `device` is not a proxy.
 ID3D12Device* device_proxy_real_device(const void* device);
+
+// A placed texture view names its resource by address and description. False selects the null view.
+using PlacedTextureViewHandler = bool (*)(ID3D12Device*, bool unordered, const D3D12_RESOURCE_DESC&,
+                                          const std::uint32_t* view, UINT64 address, D3D12_CPU_DESCRIPTOR_HANDLE);
+void set_placed_texture_view_handler(PlacedTextureViewHandler handler);
 
 // Device slot 133 (the console's CreatePlacedResourceX) makes a buffer on the title's pages at `va`. The proxy does
 // not create it itself: the device behind it does, through this handler, which the Vulkan layer registers
