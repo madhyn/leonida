@@ -32,6 +32,8 @@
 
 #include "command_list.h"
 #include "depth24.h"
+#include "quad_index_expand.h"
+#include "rect_list_geometry.h"
 #include "uav_clear.h"
 
 #include <vulkan/vulkan.h>
@@ -43,6 +45,7 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <functional>
 #include <limits>
 #include <map>
@@ -876,6 +879,10 @@ struct ReplayFunctions {
     VkBuffer zero_buffer = VK_NULL_HANDLE;
     VkDeviceSize zero_offset = 0;
     VkDeviceSize zero_size = 0;
+    // 32-bit triangle indices for non-indexed quad lists: 0, 1, 2, 0, 2, 3, then the same pattern for each quad.
+    VkBuffer quad_indices = VK_NULL_HANDLE;
+    VkDeviceSize quad_indices_offset = 0;
+    std::uint32_t quad_index_count = 0;
     std::uint64_t heap_base = 0;  // device address of the GPU address arena (push-constant dwords 32-33)
     // Resolves available binary-occlusion queries to 64-bit 0/1 values, outside conditional rendering.
     std::function<void(VkCommandBuffer, VkQueryPool, std::uint32_t first, std::uint32_t count,
@@ -905,6 +912,14 @@ struct ReplayFunctions {
     std::function<bool(VkBuffer, VkDeviceSize, VkBuffer, VkDeviceSize, std::uint32_t, std::uint32_t,
                        CountedDispatch&)> prepare_counted_dispatch;
     std::function<void(VkCommandBuffer, const CountedDispatch&)> emit_counted_dispatch;
+    // An indexed quad list draws from triangle-list indices that a compute prepass writes from the application's
+    // index buffer (quad_index_expand.h): the index buffer and the offset of the draw's first index, the index type,
+    // how many indices from there the view holds, the quads, and QuadIndexExpander::bytes(quads) of `copy_scratch`.
+    // That scratch must be usable as an index buffer and through its device address. Without both such a draw is
+    // unsupported.
+    std::function<bool(VkBuffer, VkDeviceSize, VkIndexType, std::uint64_t, std::uint32_t, VkBuffer, VkDeviceSize,
+                       QuadIndexExpansion&)> prepare_quad_indices;
+    std::function<void(VkCommandBuffer, const QuadIndexExpansion&)> emit_quad_indices;
     // Optional VK_KHR_acceleration_structure: BuildRaytracingAccelerationStructure.
     PFN_vkCmdBuildAccelerationStructuresKHR build_acceleration_structures = nullptr;
     // A KHR TLAS built from D3D12_ELEMENTS_LAYOUT_ARRAY_OF_POINTERS needs a pointer array whose entries are Vulkan
@@ -948,7 +963,8 @@ struct ReplayFunctions {
     std::function<bool(Depth24Job&, std::vector<Depth24Job>&)> depth24_prepare;  // whole copy in, dispatches out
     std::function<void(VkCommandBuffer, const Depth24Job&)> depth24_run;
     // `bytes` of transfer scratch that stays alive until the submission completes (vulkan_scratch.h): depth <-> colour
-    // copies go through it, image to buffer to image. Without it such a copy is unsupported.
+    // copies go through it, image to buffer to image. Without it such a copy is unsupported. The expanded indices of
+    // an indexed quad list are written there too (prepare_quad_indices).
     std::function<bool(VkDeviceSize bytes, VkBuffer&, VkDeviceSize&)> copy_scratch;
     // Returns the query heap with that ID, or nullptr; it stays valid while the lists that use it run.
     std::function<QueryPool*(QueryHeapId)> query_pool;
@@ -1071,7 +1087,9 @@ struct PreparedDraw {
     std::vector<VkDeviceSize> vertex_offsets, vertex_sizes, vertex_strides;
     VkBuffer index_buffer = VK_NULL_HANDLE;
     VkDeviceSize index_offset = 0;
+    VkDeviceSize index_size = 0;  // the bytes of the index buffer view inside its buffer; 0 with no index buffer
     VkIndexType index_type = VK_INDEX_TYPE_UINT16;
+    QuadIndexExpansion quad_indices;  // an indexed quad list: the triangle indices its draw binds instead
     VkExtent2D area{};
     std::uint32_t layers = 1;  // the fewest layers any bound attachment view has
 
@@ -1087,7 +1105,9 @@ struct PreparedDraw {
         vertex_strides.clear();
         index_buffer = VK_NULL_HANDLE;
         index_offset = 0;
+        index_size = 0;
         index_type = VK_INDEX_TYPE_UINT16;
+        quad_indices = {};
         area = {};
         layers = 1;
     }
@@ -2209,6 +2229,9 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
         p.vertex_sizes[slot] = size;
         p.vertex_strides[slot] = (pipeline->zero_step_slots & (1u << slot)) ? 0 : view.stride;
     }
+    // A non-indexed quad list is drawn from the shared triangle index buffer (emit).
+    if (!draw.indexed && !draw.mesh && draw.topology == topology_quad_list && !vk.quad_indices)
+        return ReplayResult::unresolved_resource;
     if (draw.indexed) {
         if (draw.index.format == 57) p.index_type = VK_INDEX_TYPE_UINT16;
         else if (draw.index.format == 42) p.index_type = VK_INDEX_TYPE_UINT32;
@@ -2221,8 +2244,33 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
             std::uint64_t size = draw.index.size;
             if (!vk.buffer_at(draw.index.va, size, p.index_buffer, p.index_offset))
                 return ReplayResult::unresolved_resource;
+            p.index_size = size;
         }
     }
+    return ReplayResult::success;
+}
+
+// An indexed quad list (D3D_PRIMITIVE_TOPOLOGY 19): the scratch and the compute job that turn the application's
+// indices into triangle-list indices (quad_index_expand.h). `p` is the draw as prepare_draw left it. A draw of
+// fewer than four indices has no quad and needs nothing.
+inline ReplayResult prepare_quad_indices(const Draw& draw, const ReplayFunctions& vk, PreparedDraw& p) {
+    const std::uint32_t quads = draw.count / 4;
+    if (!quads) return ReplayResult::success;
+    if (!vk.prepare_quad_indices || !vk.emit_quad_indices || !vk.copy_scratch ||
+        quads > QuadIndexExpander::max_quads)
+        return ReplayResult::unsupported;
+    // The indices from the draw's first one that the view holds; the pass reads the rest as 0, like D3D12. With no
+    // index buffer (the zero page) that is all of them.
+    const std::uint32_t index_bytes = p.index_type == VK_INDEX_TYPE_UINT16 ? 2 : 4;
+    const std::uint64_t in_view = p.index_size / index_bytes;
+    const std::uint64_t readable = in_view > draw.first ? in_view - draw.first : 0;
+    const VkDeviceSize first = readable ? p.index_offset + VkDeviceSize(draw.first) * index_bytes : p.index_offset;
+    VkBuffer scratch = VK_NULL_HANDLE;
+    VkDeviceSize scratch_offset = 0;
+    if (!vk.copy_scratch(QuadIndexExpander::bytes(quads), scratch, scratch_offset) ||
+        !vk.prepare_quad_indices(p.index_buffer, first, p.index_type, readable, quads, scratch, scratch_offset,
+                                 p.quad_indices))
+        return ReplayResult::unsupported;
     return ReplayResult::success;
 }
 
@@ -2243,6 +2291,10 @@ inline VkPrimitiveTopology vulkan_topology(std::uint32_t topology) {
     case 11: return VK_PRIMITIVE_TOPOLOGY_LINE_STRIP_WITH_ADJACENCY;
     case 12: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST_WITH_ADJACENCY;
     case 13: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP_WITH_ADJACENCY;
+    // Rectangles draw as triangle lists through a geometry stage, quads as triangle lists through indices: the
+    // shared ones for a non-indexed draw, the application's own, expanded, for an indexed one (emit).
+    case topology_rect_list: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    case topology_quad_list: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
     default: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
     }
 }
@@ -2357,6 +2409,17 @@ inline ReplayResult plan_occlusion_segments(PreparedList& out) {
     return active.empty() ? ReplayResult::success : ReplayResult::invalid_query;
 }
 
+// True for a command that records a compute dispatch of the layer's own before the application's work: a predicate
+// capture, a predicated copy, a depth24 or rgb96 conversion, the count clamp of an ExecuteIndirect dispatch, or the
+// index expansion of an indexed quad list (which is also a draw).
+inline bool has_helper_dispatch(const PreparedList& out, std::size_t i) {
+    const auto& p = out.commands[i];
+    if (p.predicate.scratch || !p.predicated_copy.empty() || p.has_depth24 || p.counted_dispatch.indirect)
+        return true;
+    return std::holds_alternative<Draw>(out.list->commands()[i]) && p.draw < out.draws.size() &&
+           out.draws[p.draw].quad_indices.buffer;
+}
+
 // Helper dispatches must not contribute to the application's CSInvocations (D3D-162). Query resolves and
 // ordinary helper commands share one sequence of physical statistics segments. Resolve dispatch requirements
 // depend on heap state at planning time, so every non-timestamp resolve splits conservatively.
@@ -2376,8 +2439,7 @@ inline void plan_statistics_segments(PreparedList& out) {
     const auto commands = out.list->commands();
     for (std::size_t i = 0; i < out.commands.size(); ++i) {
         auto& p = out.commands[i];
-        if (begin && (p.predicate.scratch || !p.predicated_copy.empty() || p.has_depth24 ||
-                      p.counted_dispatch.indirect)) {
+        if (begin && has_helper_dispatch(out, i)) {
             inner.push_back({&p.statistics_end, &p.statistics_begin, -1});
             splits = true;
         }
@@ -2462,13 +2524,12 @@ inline ReplayResult plan_overlapping_statistics_segments(PreparedList& out) {
             query = &out.queries[next_query++];
         if (!query) {
             // A helper dispatch while a query runs would be counted into it (D3D-162): close the shared physical
-            // segment before it and open a new one after, the way resolves do.
-            if (!active.empty() && (p.predicate.scratch || !p.predicated_copy.empty() || p.has_depth24 ||
-                                    p.counted_dispatch.indirect)) {
+            // segment before it and open a new one after, the way resolves do. An indexed quad list is a helper and
+            // a draw: the new segment is the one its draw runs in, and its kind is recorded below.
+            if (!active.empty() && has_helper_dispatch(out, i)) {
                 p.statistics_end = current;
                 current = open();
                 p.statistics_begin = current;
-                continue;
             }
             // A draw of the other kind than the open segment's starts a segment in its own pool (D3D-291).
             int draw = -1;
@@ -3177,6 +3238,12 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             p.draw = std::uint32_t(out.draw_count++);
             if (const auto r = detail::prepare_draw(*draw, resolve, vk, prepared_draw); r != ReplayResult::success)
                 return r;
+            if (draw->indexed && !draw->mesh && draw->topology == topology_quad_list) {
+                // The index expansion is a helper dispatch: inside a statistics query it needs the segment pool.
+                if (statistics_active && !statistics_helpers && draw->count >= 4) return ReplayResult::unsupported;
+                if (const auto r = detail::prepare_quad_indices(*draw, vk, prepared_draw); r != ReplayResult::success)
+                    return r;
+            }
         }
     }
     if (ordinary_active || binary_active) return ReplayResult::invalid_query;
@@ -3469,9 +3536,13 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             detail::begin_statistics_segment(prepared, p.statistics_begin, command_buffer, vk);
         };
         // A draw of the other kind inside a statistics query starts a segment in its pool (D3D-291), before the
-        // draw's own rendering scope begins.
+        // draw's own rendering scope begins. The index expansion of an indexed quad list runs here too: outside the
+        // rendering scope, and between the segments so that no query counts its dispatch (D3D-162). It stays inside
+        // the predicate, which skips it together with its draw.
         if (std::holds_alternative<Draw>(command) || std::holds_alternative<ExecuteIndirect>(command)) {
             end_statistics();
+            if (std::holds_alternative<Draw>(command) && prepared.draws[p.draw].quad_indices.buffer)
+                vk.emit_quad_indices(command_buffer, prepared.draws[p.draw].quad_indices);
             begin_statistics();
         }
         if (const auto* predication = std::get_if<Predication>(&command)) {
@@ -4241,6 +4312,33 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                                                 offset + VkDeviceSize(record) * args.stride, 1, args.stride);
             } else if (draw->mesh) {
                 vk.draw_mesh_tasks(command_buffer, draw->count, draw->instances, draw->first);
+            } else if (draw->topology == topology_quad_list) {
+                if (draw->indexed) {
+                    // The triangle indices the compute pass wrote before this rendering scope, (i0 i1 i2) (i0 i2 i3)
+                    // for each quad of the application's indices from draw->first on: one draw, so instances run
+                    // in D3D12's order, flat inputs come from each quad's first vertex, and VertexIndex - BaseVertex
+                    // is still the application's index. A draw of fewer than four indices has no quad.
+                    const QuadIndexExpansion& quads = d.quad_indices;
+                    if (quads.buffer) {
+                        vk.bind_index_buffer(command_buffer, quads.buffer, quads.offset, VK_INDEX_TYPE_UINT32);
+                        vk.draw_indexed(command_buffer, quads.quads * QuadIndexExpander::indices_per_quad,
+                                        draw->instances, 0, draw->base_vertex, draw->first_instance);
+                    }
+                } else {
+                    // Both triangles start at the quad's first vertex for flat inputs. One draw also preserves
+                    // the original instance order, and VertexIndex - BaseVertex still gives 4q + k.
+                    constexpr auto indices_per_quad = std::uint32_t(quad_triangle_indices.size());
+                    const std::uint32_t wanted = draw->count / 4;
+                    const std::uint32_t quads = std::min(wanted, vk.quad_index_count / indices_per_quad);
+                    if (quads < wanted)
+                        std::fprintf(stderr, "[rt] d3d12: a non-indexed quad list of %u quads draws only the first %u\n",
+                                     wanted, quads);
+                    if (quads) {
+                        vk.bind_index_buffer(command_buffer, vk.quad_indices, vk.quad_indices_offset, VK_INDEX_TYPE_UINT32);
+                        vk.draw_indexed(command_buffer, quads * indices_per_quad, draw->instances, 0,
+                                        std::int32_t(draw->first), draw->first_instance);
+                    }
+                }
             } else if (draw->indexed) {
                 vk.bind_index_buffer(command_buffer, d.index_buffer, d.index_offset, d.index_type);
                 vk.draw_indexed(command_buffer, draw->count, draw->instances, draw->first, draw->base_vertex,

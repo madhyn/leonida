@@ -55,9 +55,9 @@ This page collects the setup steps and the problems testers have run into so far
 
 ## Build the test programs
 
-On a Windows runtime build with Vulkan enabled, CMake only registers `d3d12_translated_draw`, `d3d12_m2_textured`,
-`d3d12_m2_formats`, `d3d12_m3_frame`, `d3d12_m4_compute` and `d3d12_buffer_uav` when it finds `llvm-mc`,
-`spirv-as` and `spirv-val`. It registers `d3d12_subgroup` only when it finds `llvm-mc` and `glslangValidator`.
+On a Windows runtime build with Vulkan enabled, CMake only registers `d3d12_translated_draw`, `d3d12_rect_list`,
+`d3d12_quad_index`, `d3d12_m2_textured`, `d3d12_m2_formats`, `d3d12_m3_frame`, `d3d12_m4_compute` and
+`d3d12_buffer_uav` when it finds `llvm-mc`, `spirv-as` and `spirv-val`. It registers `d3d12_subgroup` only when it finds `llvm-mc` and `glslangValidator`.
 Without `glslangValidator`, other tests are also omitted, including `d3d12_compute`, `d3d12_draw`,
 `d3d12_set0_compute` and `d3d12_mesh`; some registered tests run only part of their checks. These tests can be
 **absent**, not reported as skipped, when their build prerequisites are missing, so a passing `ctest` percentage

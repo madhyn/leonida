@@ -175,7 +175,7 @@ The command-list surface maps to the IR as follows:
 | `SetGraphicsRootSignature` / `SetComputeRootSignature` | state; select the pipeline layout and root map |
 | `Set*Root32BitConstant(s)` / `Set*Root*View` / `Set*RootDescriptorTable` | update root args; build the push-constant block at the draw/dispatch |
 | `SetDescriptorHeaps` | state; scan/populate the bindless arrays and hash table at execute |
-| `IASetVertexBuffers` / `IASetIndexBuffer` / `IASetPrimitiveTopology` | state; bind arena buffer + offset, dynamic topology |
+| `IASetVertexBuffers` / `IASetIndexBuffer` / `IASetPrimitiveTopology` | state; bind arena buffer + offset, dynamic topology. The console's rectangle list (17, PSO topology type 19) and quad list (19) are drawn as triangles, see *Console rectangle and quad lists* below |
 | `RSSetViewports` / `RSSetScissorRects` | state; dynamic viewport/scissor |
 | `OMSetRenderTargets` / `OMSetBlendFactor` / `OMSetStencilRef` | state; rendering scope and dynamic state |
 | `DrawInstanced` / `DrawIndexedInstanced` | command with a state snapshot |
@@ -2149,6 +2149,42 @@ The trace will enumerate them.
   - **The three draws:** a 2×2×1 and a 1×1×2 mesh grid, plus a VS PSO from a stream.
   - **What it doesn't cover:** whether the console flattens a 3D `DispatchMesh` grid the same way. That is an open
     question in `docs/design.md`, "Mesh shaders"; the test shader reads the workgroup ID directly.
+
+### Console rectangle and quad lists
+
+The console has two list topologies Vulkan lacks: rectangle list (`IASetPrimitiveTopology(17)`, with a PSO whose topology type is 19) and quad list (`IASetPrimitiveTopology(19)`). The facts are from xvalkyrie (GPL-3.0, commit `53af7df77c10`; no code taken): a rectangle is three corners and the fourth is v2 + v3 - v1 for the position and every interpolant, after the vertex stage; a quad is four vertices. The layer draws both as triangles (`d3d12_rect_list_test`, RTX 4090: 4096 of 4096 pixels, the colour plane exact, quad list bit-exact; `d3d12_quad_index_test` for indexed quads).
+- **Rectangle list**: PSO type 19 builds a triangle-list pipeline plus a generated geometry stage (`src/rect_list_geometry.h`, written from the vertex shader's own outputs) that takes the three corners and emits the strip v1 v2 v3 v4 (same winding). It has to be post-vertex-stage: the translated vertex shaders fetch by V# themselves, and the fourth corner is a function of what they write. A corner value with the same bits at all three corners (a flat attribute) is copied. Needs `geometryShader` (else `E_NOTIMPL`), no application GS, and a vertex shader with no ClipDistance, CullDistance, Layer or ViewportIndex output.
+- **Quad list**: one triangle-list draw whose indices are `i0 i1 i2, i0 i2 i3` for each quad. Both triangles start
+  at the quad's first vertex, the one Vulkan takes flat inputs from, and one draw keeps D3D12's instance order
+  (instance by instance, not quad by quad). The PSO type is the ordinary triangle type.
+  - **Non-indexed**: a shared index buffer in the arena holds the pattern `0 1 2, 0 2 3` for 16384 quads (a draw
+    with more is cut off there, with a log line). The draw's first vertex becomes the vertex offset.
+  - **Indexed**: a compute pass (`src/quad_index_expand.comp`, run by `src/quad_index_expand.h`) reads the
+    application's index buffer on the GPU and writes the six 32-bit indices of each quad into copy scratch
+    (`src/vulkan_scratch.h`); the draw binds that scratch with the application's instance count, base vertex and
+    first instance. The host never reads the indices: a copy or a shader earlier in the same list can have written
+    them. The pass runs before the draw's rendering scope, after a barrier that makes earlier writes visible to it
+    and before one that makes its indices visible to the draw, and between two segments of an active
+    pipeline-statistics query so that `CSInvocations` does not count it (as for the other helper dispatches,
+    D3D-162).
+    - Index values are copied as they are, a 16-bit one zero-extended, so `VertexIndex - BaseVertex` is still the
+      application's index in a translated vertex shader.
+    - The strip-cut values `0xFFFF` and `0xFFFFFFFF` are ordinary indices, as in every list topology: the replay
+      enables primitive restart for strips only. What the console does with one inside a quad is not measured.
+    - An index past the end of the index buffer view reads 0, as in D3D12. The pass reads a 16-bit index from its
+      aligned 32-bit word, so standalone shader-addressable Vulkan buffers round their backing size up to a word.
+      The D3D buffer size and view bounds are unchanged. A draw's last one to three indices that do not make a quad
+      are dropped.
+    - Needs `bufferDeviceAddress` (the pass uses device addresses, no descriptors). Without it, and inside a
+      statistics query that cannot be split, the list fails as unsupported instead of drawing something else.
+  - **Why not a triangle fan per quad** (the first version of the indexed path): a fan takes a flat input from
+    each triangle's own first vertex, the quad's second and third, and a draw per quad runs every instance of one
+    quad before the next quad. `d3d12_quad_index_test` shows both on an RTX 4070 SUPER: a quad with a red first
+    vertex came out black and blue (0 of 4096 pixels red), and of two overlapping instances the first one's
+    second quad ended on top (2048 of 4096 pixels right). With the expansion the seven test frames cover 16-bit and
+    32-bit indices, a first index at an address of 2 modulo 4, a base vertex, two instances, and a view that ends
+    inside the second quad, plus a 16-bit draw that reaches the end of a standalone upload buffer.
+  - **Not covered**: quad and rectangle lists through `ExecuteIndirect`, whose draws do not record a topology.
 
 ## 4. Object model mapping
 

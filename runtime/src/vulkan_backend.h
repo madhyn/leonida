@@ -1118,6 +1118,13 @@ public:
         std::unique_lock lock(resource_mutex_);
         counted_dispatch_ = std::make_unique<IndirectDispatchCounter>(get, device_, memory, limits);
     }
+    // Indexed quad lists are drawn from triangle indices a compute pass writes into the copy scratch
+    // (quad_index_expand.h). Call only with bufferDeviceAddress enabled and after an enable_copy_scratch whose chunks
+    // have INDEX_BUFFER and SHADER_DEVICE_ADDRESS usage on memory allocated with a device address.
+    void configure_quad_indices(PFN_vkGetDeviceProcAddr get, const VkPhysicalDeviceLimits& limits) {
+        std::unique_lock lock(resource_mutex_);
+        quad_indices_ = std::make_unique<QuadIndexExpander>(get, device_, limits);
+    }
     VkDevice device() const { return device_; }
 
     // Debug markers become labels from here on; call before any queue or list uses the context. Incomplete sets
@@ -1270,6 +1277,14 @@ public:
         replay_.zero_size = size;
     }
 
+    // Pre-expanded 32-bit triangle indices for non-indexed quad lists (ReplayFunctions::quad_indices).
+    void set_quad_indices(VkBuffer buffer, VkDeviceSize offset, std::uint32_t count) {
+        std::unique_lock lock(resource_mutex_);
+        replay_.quad_indices = buffer;
+        replay_.quad_indices_offset = offset;
+        replay_.quad_index_count = count;
+    }
+
     // Physical-device COLOR_ATTACHMENT format check for reinterpreted UAV clears.
     void set_color_attachment_format(std::function<bool(VkFormat)> check) {
         std::unique_lock lock(resource_mutex_);
@@ -1407,10 +1422,12 @@ public:
     }
 
     // Copies the replay stages through a buffer (depth <-> colour, vulkan_replay.h) take device-local scratch from
-    // `allocate`. Without this such a copy is refused as unsupported.
-    void enable_copy_scratch(PFN_vkGetDeviceProcAddr get, ScratchBuffers::Allocate allocate) {
+    // `allocate`. Without this such a copy is refused as unsupported. `extra_usage` is added to the chunks' transfer
+    // usage, for configure_quad_indices.
+    void enable_copy_scratch(PFN_vkGetDeviceProcAddr get, ScratchBuffers::Allocate allocate,
+                             VkBufferUsageFlags extra_usage = 0) {
         std::unique_lock lock(resource_mutex_);
-        scratch_ = std::make_unique<ScratchBuffers>(get, device_, std::move(allocate));
+        scratch_ = std::make_unique<ScratchBuffers>(get, device_, std::move(allocate), extra_usage);
         if (!scratch_->loaded()) scratch_.reset();
     }
 
@@ -1717,6 +1734,7 @@ private:
     std::unique_ptr<PredicateReducer> predicate_reducer_;
     std::unique_ptr<PredicatedBufferCopier> predicated_copier_;
     std::unique_ptr<IndirectDispatchCounter> counted_dispatch_;
+    std::unique_ptr<QuadIndexExpander> quad_indices_;
     std::uint32_t predicate_family_ = UINT32_MAX;
     std::uint32_t transfer_only_family_ = UINT32_MAX;
     DebugLabelFunctions labels_;
@@ -2371,6 +2389,19 @@ private:
             };
             replay.emit_counted_dispatch = [this](VkCommandBuffer cb, const CountedDispatch& job) {
                 context_.counted_dispatch_->emit(cb, job);
+            };
+        }
+        if (kind_ != QueueKind::copy && context_.quad_indices_ && context_.scratch_) {
+            replay.prepare_quad_indices = [this, &tracker_lock](
+                VkBuffer indices, VkDeviceSize offset, VkIndexType type, std::uint64_t readable, std::uint32_t quads,
+                VkBuffer scratch, VkDeviceSize scratch_offset, QuadIndexExpansion& out) {
+                // Pipeline creation is lazy and shared across queues; serialize it with other replay preparation.
+                if (!tracker_lock.owns_lock()) tracker_lock.lock();
+                return context_.quad_indices_->prepare(indices, offset, type, readable, quads, scratch,
+                                                       scratch_offset, out);
+            };
+            replay.emit_quad_indices = [this](VkCommandBuffer cb, const QuadIndexExpansion& job) {
+                context_.quad_indices_->emit(cb, job);
             };
         }
         if (context_.depth24_ && !transfer_only) {

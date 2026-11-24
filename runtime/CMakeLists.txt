@@ -2444,6 +2444,40 @@ if(TARGET Vulkan::Headers)
       add_test(NAME d3d12_translated_draw COMMAND d3d12_translated_draw_test)
       set_tests_properties(d3d12_translated_draw PROPERTIES SKIP_RETURN_CODE 77)
 
+      # The console's rectangle and quad lists (src/rect_list_geometry.h), through the same translated vs_m15 / ps_m15.
+      add_executable(d3d12_rect_list_test test/d3d12_rect_list_test.cpp shims/d3d12_xs_device.cpp ${LEONIDA_M15_FILES})
+      target_link_libraries(d3d12_rect_list_test PRIVATE gta6rt_d3d12_com)
+      target_compile_definitions(d3d12_rect_list_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
+                                 LEONIDA_TEST_M15_DIR="${LEONIDA_M15_DIR}")
+      target_compile_options(d3d12_rect_list_test PRIVATE /W4 /permissive- /utf-8)
+      add_test(NAME d3d12_rect_list COMMAND d3d12_rect_list_test)
+      set_tests_properties(d3d12_rect_list PROPERTIES SKIP_RETURN_CODE 77)
+
+      # Indexed quad lists (src/quad_index_expand.h): a vertex shader that reads the instance id and a pixel shader
+      # with a flat colour input, translated like vs_m15 and ps_m15.
+      set(LEONIDA_QUAD_DIR ${CMAKE_CURRENT_BINARY_DIR}/generated/quad_shaders)
+      set(LEONIDA_QUAD_FILES ${LEONIDA_QUAD_DIR}/spirv/index.json ${LEONIDA_QUAD_DIR}/fssm/vs_quad_inst.fssm
+                             ${LEONIDA_QUAD_DIR}/fssm/ps_quad_flat.fssm)
+      add_custom_command(
+        OUTPUT ${LEONIDA_QUAD_FILES}
+        COMMAND ${CMAKE_COMMAND} -E remove_directory ${LEONIDA_QUAD_DIR}
+        COMMAND ${CMAKE_COMMAND} -E env "LLVM_MC=${LEONIDA_LLVM_MC}" "LEONIDA_SPIRV_TOOLS=${LEONIDA_SPIRV_TOOLS_NATIVE}"
+                $<TARGET_FILE:Python3::Interpreter> -I ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
+                ${LEONIDA_QUAD_DIR} vs_quad_inst ps_quad_flat
+        DEPENDS ${LEONIDA_TRANSLATOR_DEPS}
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/vs_quad_inst.asm
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/ps_quad_flat.asm
+        COMMENT "Translating vs_quad_inst and ps_quad_flat for the indexed quad list test"
+        VERBATIM)
+      add_executable(d3d12_quad_index_test test/d3d12_quad_index_test.cpp shims/d3d12_xs_device.cpp
+                     ${LEONIDA_QUAD_FILES})
+      target_link_libraries(d3d12_quad_index_test PRIVATE gta6rt_d3d12_com)
+      target_compile_definitions(d3d12_quad_index_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
+                                 LEONIDA_TEST_QUAD_DIR="${LEONIDA_QUAD_DIR}")
+      target_compile_options(d3d12_quad_index_test PRIVATE /W4 /permissive- /utf-8)
+      add_test(NAME d3d12_quad_index COMMAND d3d12_quad_index_test)
+      set_tests_properties(d3d12_quad_index PROPERTIES SKIP_RETURN_CODE 77)
+
       # vk_bindless_test (the bindless set and its table at the Vulkan level, no D3D12) takes the translated vs_ids,
       # ps_tex and ps_imgatomic; it was only run by scripts/run_gpu_tests.py and check.py until D3D-314 needed it.
       set(LEONIDA_BINDLESS_DIR ${CMAKE_CURRENT_BINARY_DIR}/generated/bindless_shaders)
@@ -3280,6 +3314,12 @@ if(TARGET Vulkan::Headers)
       target_compile_definitions(replay_readback_stages_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     endif()
     add_test(NAME replay_readback_stages COMMAND replay_readback_stages_test)
+    add_executable(replay_quad_list_test test/replay_quad_list_test.cpp)
+    target_link_libraries(replay_quad_list_test PRIVATE Vulkan::Headers)
+    if(WIN32)
+      target_compile_definitions(replay_quad_list_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    endif()
+    add_test(NAME replay_quad_list COMMAND replay_quad_list_test)
     # emit of an enhanced texture barrier: no heap allocation for one layout piece, one barrier for each piece (no GPU).
     add_executable(replay_texture_barrier_test test/replay_texture_barrier_test.cpp)
     target_link_libraries(replay_texture_barrier_test PRIVATE Vulkan::Headers)
