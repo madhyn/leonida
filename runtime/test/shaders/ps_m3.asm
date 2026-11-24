@@ -4,6 +4,11 @@
 ;   mrt1 = (c1 + c2)           an R32_FLOAT target: one float add, so the CPU gets the same bits
 ; fssm-at: 0x10
 ; fssm-data: 0x33535350 0x20535020
+; Console root layout (D3D-448): root arguments from s8, a descriptor table is one dword (its 32-bit VA; the heaps
+; live below 4 GiB, so the high half is 0). The first lines rebuild the registers the program below was written for.
+s_mov_b32 s5, s13
+s_mov_b32 s6, s14
+s_mov_b32 s7, s15
 v_mov_b32_e32 v2, s5
 v_mov_b32_e32 v3, s6
 v_mov_b32_e32 v4, s7

@@ -827,6 +827,9 @@ struct ShaderEntry {
     // subgroup size. Empty for a native translation.
     std::string wave64_exchange;
     bool emulated() const { return wave64_exchange == "workgroup"; }
+    // Mesh shaders: the index's "root_window" is {"sgpr": 16, "dword": 8}, so the module reads its root arguments
+    // from the graphics window (push dword 8 = root dword 0, D3D-448 follow-up). False for one translated before it.
+    bool graphics_root_window = false;
     std::vector<SignatureElement> input_signature;  // vertex shaders: what the input layout must feed
     std::vector<std::uint32_t> inputs;              // pixel shaders: input locations declared
     std::vector<std::uint32_t> outputs;             // pixel/vertex shaders: output locations written
@@ -1032,6 +1035,12 @@ private:
                 e.subgroup_size = u32(g);
             if (const Json* x = meta.find("wave64_exchange"); x && x->kind == Json::Kind::string)
                 e.wave64_exchange = x->string;
+            if (const Json* r = meta.find("root_window"); r && r->kind == Json::Kind::object) {
+                const Json* sgpr = r->find("sgpr");
+                const Json* dword = r->find("dword");
+                e.graphics_root_window = sgpr && dword && sgpr->kind == Json::Kind::number &&
+                                         dword->kind == Json::Kind::number && u32(sgpr) == 16 && u32(dword) == 8;
+            }
             if (const Json* s = meta.find("input_signature"); s && s->kind == Json::Kind::array) {
                 for (const Json& item : s->array) {
                     SignatureElement element;

@@ -109,19 +109,26 @@ int main() {
     EXPECT(device_status == vktest::DeviceStatus::ready);
 
     const auto ms_program = fssm_program({0x4d530001, 0xbf810000});
+    // The same mesh shader listed without "root_window": one translated before the graphics root window (D3D-448).
+    const auto ms_old_program = fssm_program({0x4d530002, 0xbf810000});
     const auto ps_program = fssm_program({0x50530001, 0xbf810000});
     const auto vs_program = fssm_program({0x56530002, 0xbf810000});
     const auto ms_container = shader_container(ms_program), ps_container = shader_container(ps_program);
+    const auto ms_old_container = shader_container(ms_old_program);
     const auto vs_container = shader_container(vs_program);
     const auto library = std::filesystem::temp_directory_path() / "leonida_mesh_test";
     std::filesystem::create_directories(library);
     std::filesystem::copy_file(LEONIDA_TEST_MS_SPV, library / "ms_draw.spv", std::filesystem::copy_options::overwrite_existing);
+    std::filesystem::copy_file(LEONIDA_TEST_MS_SPV, library / "ms_old.spv", std::filesystem::copy_options::overwrite_existing);
     std::filesystem::copy_file(LEONIDA_TEST_PS_SPV, library / "ps_draw.spv", std::filesystem::copy_options::overwrite_existing);
     std::filesystem::copy_file(LEONIDA_TEST_VS_FULLSCREEN_SPV, library / "vs_fullscreen.spv",
                                std::filesystem::copy_options::overwrite_existing);
     {
         std::ofstream index(library / "index.json", std::ios::binary);
         index << "{\"ms_draw\": {\"stage\": \"ms\", \"fssm_sha256\": \"" << leonida::sha256_hex(ms_program)
+              << "\", \"bindings\": [], \"push_constant_bytes\": 144, \"local_size\": [32, 1, 1], "
+                 "\"max_vertices\": 4, \"max_primitives\": 2, \"root_window\": {\"sgpr\": 16, \"dword\": 8}},\n"
+                 " \"ms_old\": {\"stage\": \"ms\", \"fssm_sha256\": \"" << leonida::sha256_hex(ms_old_program)
               << "\", \"bindings\": [], \"push_constant_bytes\": 144, \"local_size\": [32, 1, 1], "
                  "\"max_vertices\": 4, \"max_primitives\": 2},\n"
                  " \"vs_fullscreen\": {\"stage\": \"vs\", \"fssm_sha256\": \"" << leonida::sha256_hex(vs_program)
@@ -154,7 +161,8 @@ int main() {
         return true;
     };
     const auto root_signature = [&](ID3D12Device* device, Ref<ID3D12RootSignature>& root) {
-        // [0] two constants (s0, s1: offset), [1] a root CBV (s2:s3: tint), as in d3d12_draw_test.
+        // [0] two constants (push dwords 8, 9: offset), [1] a root CBV (10, 11: tint), as in d3d12_draw_test. The
+        // mesh shader reads them as s16..s19 and the pixel shader as s8..s11 (the graphics root window, D3D-448).
         D3D12_ROOT_PARAMETER params[2] = {};
         params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
         params[0].Constants = {0, 0, 2};
@@ -167,7 +175,20 @@ int main() {
         return !blob.empty() &&
                SUCCEEDED(device->CreateRootSignature(0, blob.data(), blob.size(), IID_PPV_ARGS(&root.p)));
     };
+    // Twenty constants: s8..s27 for a pixel shader, but past a mesh shader's 16-dword window (s16..s31).
+    const auto wide_root_signature = [&](ID3D12Device* device, Ref<ID3D12RootSignature>& root) {
+        D3D12_ROOT_PARAMETER param{};
+        param.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        param.Constants = {0, 0, 20};
+        D3D12_VERSIONED_ROOT_SIGNATURE_DESC root_desc{};
+        root_desc.Version = D3D_ROOT_SIGNATURE_VERSION_1_0;
+        root_desc.Desc_1_0 = {1, &param, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+        const auto blob = serialize_root_signature(root_desc);
+        return !blob.empty() &&
+               SUCCEEDED(device->CreateRootSignature(0, blob.data(), blob.size(), IID_PPV_ARGS(&root.p)));
+    };
     const D3D12_SHADER_BYTECODE ms{ms_container.data(), ms_container.size()};
+    const D3D12_SHADER_BYTECODE ms_old{ms_old_container.data(), ms_old_container.size()};
     const D3D12_SHADER_BYTECODE ps{ps_container.data(), ps_container.size()};
     const D3D12_SHADER_BYTECODE vs{vs_container.data(), vs_container.size()};
 
@@ -218,6 +239,14 @@ int main() {
         vs_stream.add(TopologySubobject{.inner = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE});
         vs_stream.add(TargetsSubobject{.inner = one_target()});
         EXPECT(SUCCEEDED(create(device.p, vs_stream, vs_pso)));
+        // A mesh shader translated before the graphics root window would read its root arguments from the wrong
+        // dwords: refused, with a log line that asks for the shaders stage again.
+        {
+            Stream old_stream;
+            old_stream.add(RootSubobject{.inner = root.p}).add(MsSubobject{.inner = ms_old}).add(PsSubobject{.inner = ps});
+            old_stream.add(TargetsSubobject{.inner = one_target()});
+            EXPECT(create(device.p, old_stream, refused) == E_INVALIDARG && !refused.p);
+        }
 
         // Streams the PC runtime refuses.
         Stream bad = mesh_stream;
@@ -418,11 +447,19 @@ int main() {
         list->RSSetViewports(1, &viewport);
         list6->DispatchMesh(4096, 1025, 1);
         EXPECT(list->Close() == E_INVALIDARG);
-        // A DISPATCH_MESH command signature (D3D12_DISPATCH_MESH_ARGUMENTS, 12 bytes) is created; a stride below its
-        // 12 bytes is refused as the PC runtime refuses it. ExecuteIndirect with it records nothing yet (#3777 replays
-        // it), so the list still closes.
+            list->ExecuteIndirect(sig.p, 1, upload.p, 0, nullptr, 0);
+            EXPECT(list->Close() == S_OK);
+        }
+        // A root signature the graphics bind point places (s8..s27) but a mesh shader's window cannot (s16..s31): a
+        // vertex draw may use it, DispatchMesh may not.
         {
-            const D3D12_INDIRECT_ARGUMENT_DESC mesh_arg{D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH};
+            Ref<ID3D12RootSignature> wide;
+            EXPECT(wide_root_signature(device.p, wide));
+            EXPECT(SUCCEEDED(list->Reset(allocator.p, mesh_pso.p)));
+            list->SetGraphicsRootSignature(wide.p);
+            list->RSSetViewports(1, &viewport);
+            list6->DispatchMesh(1, 1, 1);
+            EXPECT(list->Close() == E_INVALIDARG);
             const D3D12_COMMAND_SIGNATURE_DESC mesh_sig{12, 1, &mesh_arg, 0};
             const D3D12_COMMAND_SIGNATURE_DESC short_sig{8, 1, &mesh_arg, 0};
             Ref<ID3D12CommandSignature> sig, short_one;
@@ -432,6 +469,18 @@ int main() {
             list->SetGraphicsRootSignature(root.p);
             list->ExecuteIndirect(sig.p, 1, upload.p, 0, nullptr, 0);
             EXPECT(list->Close() == S_OK);
+=======
+        // A root signature the graphics bind point places (s8..s27) but a mesh shader's window cannot (s16..s31): a
+        // vertex draw may use it, DispatchMesh may not.
+        {
+            Ref<ID3D12RootSignature> wide;
+            EXPECT(wide_root_signature(device.p, wide));
+            EXPECT(SUCCEEDED(list->Reset(allocator.p, mesh_pso.p)));
+            list->SetGraphicsRootSignature(wide.p);
+            list->RSSetViewports(1, &viewport);
+            list6->DispatchMesh(1, 1, 1);
+            EXPECT(list->Close() == E_INVALIDARG);
+>>>>>>> 5fdd6abbc (D3D-448-GRAPHICS: graphics root arguments in the console layout, mesh shaders through a window)
         }
         EXPECT(SUCCEEDED(queue->Signal(fence.p, 2)) && SUCCEEDED(fence->SetEventOnCompletion(2, nullptr)));
 

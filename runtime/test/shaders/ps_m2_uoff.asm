@@ -6,6 +6,14 @@
 ; the descriptor index and byte stride, respectively.
 ; fssm-at: 0x10
 ; fssm-data: 0x324d5350 0x4f465520
+; Console root layout (D3D-448): root arguments from s8, a descriptor table is one dword (its 32-bit VA; the heaps
+; live below 4 GiB, so the high half is 0). The first lines rebuild the registers the program below was written for.
+s_mov_b32 s0, s8
+s_mov_b32 s2, s9
+s_mov_b32 s4, s10
+s_mov_b32 s5, s11
+s_mov_b32 s1, 0
+s_mov_b32 s3, 0
 s_mul_i32 s20, s4, s5
 s_load_dwordx8 s[8:15], s[0:1], s20
 s_load_dwordx4 s[16:19], s[2:3], 0x0

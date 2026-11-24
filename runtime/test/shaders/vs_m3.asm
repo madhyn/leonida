@@ -8,6 +8,16 @@
 ; The corners are multiples of 1/32 and the depths are dyadic, so every operation here is exact however it is fused.
 ; fssm-at: 0x10
 ; fssm-data: 0x33534d56 0x20535620
+; Console root layout (D3D-448): root arguments from s8, a descriptor table is one dword (its 32-bit VA; the heaps
+; live below 4 GiB, so the high half is 0). The first lines rebuild the registers the program below was written for.
+s_mov_b32 s0, s8
+s_mov_b32 s1, s9
+s_mov_b32 s2, s10
+s_mov_b32 s3, s11
+s_mov_b32 s4, s12
+s_mov_b32 s5, s13
+s_mov_b32 s6, s14
+s_mov_b32 s7, s15
 v_and_b32_e32 v1, 1, v0
 v_and_b32_e32 v2, 2, v0
 v_cvt_f32_u32_e32 v1, v1

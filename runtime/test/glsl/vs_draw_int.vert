@@ -14,7 +14,7 @@ layout(push_constant) uniform UserData {
 } pc;
 
 void main() {
-    const vec2 offset = vec2(uintBitsToFloat(pc.s[0]), uintBitsToFloat(pc.s[1]));
+    const vec2 offset = vec2(uintBitsToFloat(pc.s[8]), uintBitsToFloat(pc.s[9]));
     gl_Position = vec4(position.xy + offset, 0.0, 1.0);
     out_color = vec4(color);
 }

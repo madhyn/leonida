@@ -381,21 +381,25 @@ std::unique_ptr<WindowPresenter> create_window_presenter(ID3D12Device* device, H
 
 // Where each root parameter's arguments go in the 32 user-data dwords the translated shaders read (docs section
 // 3.5). Built when a Vulkan device creates the root signature. A signature can be bound at either bind point, so it
-// carries both layouts:
-//   - graphics: rt::rootsig::pack() (from s0, two dwords per table; D3D-448 keeps it until per-stage user-data windows
-//     exist, because a mesh shader (s16) and a pixel shader (s8) share one push-constant block);
-//   - compute: rt::rootsig::pack_stage(Stage::Compute), the measured console layout (from s4, one dword per table).
+// carries both layouts, each the console layout rt::rootsig::pack_stage() gives (one dword per table):
+//   - graphics: Stage::Vertex, from s8. A vertex, pixel or geometry shader reads SGPR i from push dword i, so root
+//     dword k is push dword 8 + k for all three. A mesh shader's root arguments start at s16; the translator loads its
+//     s16.. from push dwords 8.. ("root_window" in index.json), so the same block serves both stages of a mesh
+//     pipeline. Its window is 16 dwords: mesh_ok says whether Stage::Mesh places the signature too, and a mesh draw
+//     with one it refuses invalidates the list (D3D-448 follow-up);
+//   - compute: Stage::Compute, from s4 (measured, D3D-448).
 // A layout that refuses the signature is marked unusable; binding the signature there invalidates the list.
 struct RootArgumentLayout {
     struct Parameter {
         rt::rootsig::ParamType type;
-        std::uint32_t user_offset;     // graphics: first dword; unused for a parameter with no dwords
+        std::uint32_t user_offset;     // graphics: first push dword; unused for a parameter with no dwords
         std::uint32_t constant_count;  // constants only
         std::uint32_t compute_offset = rt::rootsig::kNoSgpr;  // compute: first user SGPR
     };
     std::vector<Parameter> parameters;
     std::uint32_t flags = 0;  // D3D12_ROOT_SIGNATURE_FLAGS from the serialized blob
     bool graphics_ok = true;
+    bool mesh_ok = true;  // the graphics layout also fits a mesh shader's 16-dword window
     bool compute_ok = true;
 };
 

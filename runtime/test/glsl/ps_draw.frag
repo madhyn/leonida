@@ -1,6 +1,6 @@
 #version 460
 // A pixel shader written to the translator's runtime contract, standing in for a translated one in
-// d3d12_draw_test. s2:s3 is a root CBV: the console VA of three floats (a tint), read at heap base + VA. The output
+// d3d12_draw_test. s10:s11 is a root CBV: the console VA of three floats (a tint), read at heap base + VA. The output
 // is (red * tint.x, tint.y, blue * tint.z, 1).
 #extension GL_EXT_buffer_reference : require
 #extension GL_EXT_buffer_reference_uvec2 : require
@@ -25,6 +25,6 @@ uvec2 add64(uvec2 a, uvec2 b) {
 }
 
 void main() {
-    Floats tint = Floats(add64(pc.heap_base, uvec2(pc.s[2], pc.s[3])));
+    Floats tint = Floats(add64(pc.heap_base, uvec2(pc.s[10], pc.s[11])));
     target = vec4(color.r * tint.f[0], tint.f[1], color.b * tint.f[2], 1.0);
 }

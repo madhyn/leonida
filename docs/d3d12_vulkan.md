@@ -818,9 +818,11 @@ The compute path, end to end:
     so descriptor bytes the application writes itself are what shaders load.
   - Upload and readback buffers keep their own memory, and their VA is their device address minus the heap base.
   - Shader programs (FSSM blobs) are copied in as the code base.
-- **`CreateRootSignature`** parses the blob with `parse_rts0` and keeps each parameter's place in two layouts:
-  `pack()` for the graphics bind point and `pack_stage(Stage::Compute)` for the compute one (from s4, one dword per
-  table; section 3.5, D3D-448). A signature neither can place (more than 32 user dwords: the spill layout is open; the
+- **`CreateRootSignature`** parses the blob with `parse_rts0` and keeps each parameter's place in two layouts, both
+  the console's (one dword per table; section 3.5, D3D-448): `pack_stage(Stage::Vertex)` for the graphics bind point
+  (from s8, the graphics root window) and `pack_stage(Stage::Compute)` for the compute one (from s4). It also checks
+  `pack_stage(Stage::Mesh)`: a signature past a mesh shader's 16-dword window is logged, and `DispatchMesh` with it
+  invalidates the list. A signature neither bind point can place (past s31: the spill layout is open; the
   translated shaders have no below-base spill-pointer candidates) is refused with both reasons; one only a single layout places is created with a log line, and binding it at the other bind point
   invalidates the list. Before
   that it answers as the host runtime does (`compare_invalid_arguments`, "root signature:", RTX 5070 / 621.14):
@@ -1742,7 +1744,8 @@ This is the least verifiable part of the layer. D3D12 gives the application a ro
 turns it into the user SGPRs (`s0..s31`) that the shader reads. The translator already copies those 32 dwords from
 push constants into `s0..s31`. The layer must produce them.
 
-The default mapping (implemented by `rt::rootsig::pack` in `runtime/src/root_signature.{h,cpp}`) follows root
+The first mapping the layer used (`rt::rootsig::pack` in `runtime/src/root_signature.{h,cpp}`, kept for the tools and
+tests that compare the two models; the runtime now uses the console layout below at both bind points) follows root
 parameter order:
 
 | Root parameter | User-data dwords |
@@ -1782,12 +1785,23 @@ below 4 GiB). A parameter that does not fit goes, with every later one, to the s
 - **Vertex/pixel/geometry s8 and mesh s16: a hypothesis.** It rests on the census above only; no signature
   confirms these bases, and visibility is not modelled (every parameter takes its place in every stage).
 
-The runtime uses the console layout for the **compute** bind point only. Graphics keeps `pack()`: every stage of a
-pipeline reads `s0..s31` from one push-constant block at offset 0 (`tools/rdna2spirv.py`, `ShaderUserData` in
-`runtime/src/vulkan_replay.h`), so a mesh shader (base s16) and a pixel shader (base s8) in one pipeline would need
-the same root argument at two offsets. That needs per-stage user-data windows in the translator's push-constant
-contract (D3D-448 follow-up). A root signature carries both layouts; one that only one of them can place is
-created, and binding it at the other bind point invalidates the command list (`Close` returns `E_INVALIDARG`).
+The runtime uses the console layout at **both** bind points. Every stage of a pipeline reads one push-constant block
+(`ShaderUserData` in `runtime/src/vulkan_replay.h`), so the graphics bind point lays a signature out once with
+`pack_stage(Stage::Vertex)`: root dword k at push dword 8 + k. A vertex, pixel or geometry shader reads SGPR i from
+push dword i, so it finds the arguments at s8.. as the console puts them. **The graphics root window (D3D-448
+follow-up):** a mesh shader's root arguments start at s16, so the translator loads its s16..s31 from push dwords
+8..23 instead (`user_data_dword` in `tools/rdna2spirv.py`); a mesh and a pixel shader of one pipeline then find each
+argument in the same dword. A mesh shader's s8..s15 are below its base and read 0; s0..s7 stay push dwords 0..7
+for every stage. The index records the window as `"root_window": {"sgpr": 16, "dword": 8}`, and a mesh PSO whose
+mesh shader lacks it (translated before) is refused with a log line asking for the shaders stage again. The mesh
+window holds 16 dwords (s16..s31) where the others hold 24 (s8..s31): a signature that fits the graphics layout but
+not the mesh window is created with a log line, and `DispatchMesh` with it invalidates the list. Live evidence for
+s8 and one dword per table: on the retail frame loop the VS of a textured draw reads table slots 0 and 2 through s8
+and its PS slot 1, which hold exactly the buffer, constants and texture the title bound (issue #14, comment
+7131556366, native Windows, RTX 5080). What a mesh shader reads in s8..s15 is not measured:
+`user_sgpr_census.py --base ms=16` on a corpus lists any read below s16. A root signature carries both layouts;
+one that only one of them can place is created, and binding it at the other bind point invalidates the command list
+(`Close` returns `E_INVALIDARG`).
 `s0..s3` of a compute dispatch are the driver's block; the layer leaves them zero (109 CS read `s1` as a constant,
 42 `s3`; their meaning is open).
 
