@@ -759,7 +759,11 @@ void* WINAPI XMemMapPhysicalPages(void* address, uint64_t page_count, const uint
     }
     const std::lock_guard lock(g_phys_mutex);
     if (!page_array) {
-        return unmap_range(start, page_count) ? address : nullptr;
+        if (unmap_range(start, page_count)) {
+            leonida::title_host_regions().unregister_range(start, page_count * kPhysicalPageSize);
+            return address;
+        }
+        return nullptr;
     }
     const Window* const window = find_window(start, page_count * kPhysicalPageSize);
     if (!window) {
@@ -800,6 +804,7 @@ void* WINAPI XMemMapPhysicalPages(void* address, uint64_t page_count, const uint
         }
         i += run;
     }
+    leonida::title_host_regions().register_range(start, page_count * kPhysicalPageSize, 1);
     return address;
 }
 

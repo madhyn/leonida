@@ -6850,7 +6850,17 @@ public:
     // heap_base (arena.address) lands on the Vulkan-imported BDA.
     std::uint64_t resolve_shader_va(std::uint64_t va) const {
         if (!va || va < state_.arena.size || !state_.context || !state_.arena.address) return va;
-        const auto bda = state_.context->resolve_gpu_bda(va);
+        auto bda = state_.context->resolve_gpu_bda(va);
+        if (!bda) {
+            MEMORY_BASIC_INFORMATION mbi{};
+            if (VirtualQuery(reinterpret_cast<LPCVOID>(va), &mbi, sizeof(mbi)) &&
+                mbi.State == MEM_COMMIT && mbi.RegionSize > 0 &&
+                !(mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD | PAGE_WRITECOMBINE | PAGE_NOCACHE))) {
+                leonida::title_host_regions().register_range(
+                    reinterpret_cast<std::uint64_t>(mbi.BaseAddress), mbi.RegionSize, 1);
+                bda = state_.context->resolve_gpu_bda(va);
+            }
+        }
         if (!bda || *bda < state_.arena.address) return va;
         const std::uint64_t rel = *bda - state_.arena.address;
         return (rel >> 48) == 0 ? rel : va;
