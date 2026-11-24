@@ -756,6 +756,8 @@ struct ComputePipeline {
     VkPipelineLayout layout = VK_NULL_HANDLE;
     std::uint64_t code_base = 0;
     VkDescriptorSet bindless_set = VK_NULL_HANDLE;  // set 0 of the layout, bound at every dispatch; null: none
+    // LEONIDA_LAZY_PSO: `pipeline` stays null and the first dispatch builds it through this (once, thread-safe).
+    std::function<VkPipeline()> build;
 };
 
 // A graphics pipeline as replay needs it: the formats its attachments must have and which vertex-input slots it
@@ -2109,14 +2111,18 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
         !vk.draw_indexed || !vk.bind_pipeline || !vk.push_constants)
         return ReplayResult::unsupported;
     const GraphicsPipeline* pipeline = vk.graphics_pipeline(draw.pipeline);
-    if (!pipeline || !pipeline->pipeline) return ReplayResult::unresolved_resource;
+    if (!pipeline) return ReplayResult::unresolved_resource;
+    // A pipeline created lazily (LEONIDA_LAZY_PSO) has no base pipeline until its first draw builds it as variant 0.
+    const VkPipeline base = pipeline->pipeline ? pipeline->pipeline
+                                               : (pipeline->variant ? pipeline->variant(0) : VK_NULL_HANDLE);
+    if (!base) return ReplayResult::unresolved_resource;
     if (pipeline->mesh != draw.mesh) return ReplayResult::invalid_draw;
     if (draw.mesh_indirect && !vk.draw_mesh_tasks_indirect) return ReplayResult::unsupported;
     if (draw.mesh && !draw.mesh_indirect && !vk.draw_mesh_tasks) return ReplayResult::unsupported;
     if (pipeline->bindless_set && !vk.bind_descriptor_sets) return ReplayResult::unsupported;
     if (pipeline->color_formats.size() > max_render_targets) return ReplayResult::unsupported;
     p.graphics = pipeline;
-    p.pipeline = pipeline->pipeline;
+    p.pipeline = base;
     p.area = {UINT32_MAX, UINT32_MAX};
     std::uint32_t layers = UINT32_MAX;
     const auto shrink = [&](const ResourceBinding& b, const TargetView& view, const VkImageSubresourceRange& range) {
@@ -3062,9 +3068,11 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             if (ind->kind == IndirectKind::dispatch && ind->pipeline) {  // the pipeline and root arguments it was recorded
                 if (!vk.bind_pipeline || !vk.push_constants || !vk.compute_pipeline) return ReplayResult::unsupported;
                 const ComputePipeline* pipeline = vk.compute_pipeline(ind->pipeline);
-                if (!pipeline || !pipeline->pipeline) return ReplayResult::unresolved_resource;
+                if (!pipeline) return ReplayResult::unresolved_resource;
                 if (pipeline->bindless_set && !vk.bind_descriptor_sets) return ReplayResult::unsupported;
                 p.pipeline = *pipeline;
+                if (!p.pipeline.pipeline && pipeline->build) p.pipeline.pipeline = pipeline->build();
+                if (!p.pipeline.pipeline) return ReplayResult::unresolved_resource;
             }
         } else if (const auto* build = std::get_if<BuildAccelerationStructure>(&command)) {
             p.khr_instances = 0;
@@ -3150,9 +3158,11 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             if (!vk.bind_pipeline || !vk.push_constants || !vk.dispatch || !vk.compute_pipeline)
                 return ReplayResult::unsupported;
             const ComputePipeline* pipeline = vk.compute_pipeline(dispatch->pipeline);
-            if (!pipeline || !pipeline->pipeline) return ReplayResult::unresolved_resource;
+            if (!pipeline) return ReplayResult::unresolved_resource;
             if (pipeline->bindless_set && !vk.bind_descriptor_sets) return ReplayResult::unsupported;
             p.pipeline = *pipeline;
+            if (!p.pipeline.pipeline && pipeline->build) p.pipeline.pipeline = pipeline->build();
+            if (!p.pipeline.pipeline) return ReplayResult::unresolved_resource;
         } else if (const auto* draw = std::get_if<Draw>(&command)) {
             if (draw->mesh_indirect) {
                 const auto& args = *draw->mesh_indirect;

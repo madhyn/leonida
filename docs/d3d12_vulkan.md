@@ -2070,6 +2070,14 @@ Pipeline creation:
   buffer device address, storage image without format, maintenance8.
 - Request the subgroup size each shader was translated for (`requiredSubgroupSize` 64 or 32) where the device lists the stage
   in `requiredSubgroupSizeStages`, and say so in the log where it cannot (section 3.2, "Subgroup size").
+- Deferred pipelines (`LEONIDA_LAZY_PSO=1`, off by default): `CreateGraphicsPipelineState` and the compute calls
+  check the description, pick and read the translated shaders and make the layout as before, but the driver pipeline
+  is built by the first draw (as `variant(0)`) or dispatch (`ComputePipeline::build`) that uses it, and a stage the
+  runtime does not edit (no f16 link, no D24 depth patch) keeps no `VkShaderModule`: one is made from the library's
+  words for each pipeline built and destroyed after. The retail title creates some 50,000 PSOs before its first frame
+  and draws with far fewer; built eagerly, their modules and pipelines ran a 16 GB machine out of commit. A pipeline
+  the driver refuses then fails its draw or dispatch (unresolved) instead of `CreatePipelineState`. Tested by
+  `d3d12_compute_lazy_pso`, `d3d12_draw_lazy_pso` and `d3d12_mesh_lazy_pso`.
 - Pipeline caches: graphics and compute PSOs use one `VkPipelineCache` per device. On first use the runtime reads
   the `pipelines` build stage's `pipeline_cache.bin` beside the executable if its Vulkan header matches the device
   and pipeline-cache UUID. When the file is absent or incompatible, the runtime starts with an empty cache.

@@ -3335,6 +3335,7 @@ public:
         const VkDevice dev = device_.info.device;
         if (registered_) device_.context->remove_pipeline(id());
         if (pipeline_.pipeline) vk.vkDestroyPipeline(dev, pipeline_.pipeline, nullptr);
+        if (lazy_compute_) vk.vkDestroyPipeline(dev, lazy_compute_, nullptr);
         if (pipeline_.layout) vk.vkDestroyPipelineLayout(dev, pipeline_.layout, nullptr);
         if (module_) vk.vkDestroyShaderModule(dev, module_, nullptr);
         if (graphics_.pipeline) vk.vkDestroyPipeline(dev, graphics_.pipeline, nullptr);
@@ -3617,8 +3618,11 @@ public:
         if (vs_stage.entry && ps_stage.entry && !ps_stage.entry->f16_halves.empty() && gs_stage.entry) {
             log_once("--f16-interp-fallback halves are linked VS->PS only; this PSO has a geometry shader", 0);
         }
-        if (vs_stage.entry && ps_stage.entry && !gs_stage.entry &&
-            (!ps_stage.entry->f16_halves.empty() || !vs_stage.entry->f16_halves.empty())) {
+        // Whether the link below may have edited the VS's and PS's words: such stages keep their modules under
+        // LEONIDA_LAZY_PSO, since the library's words are not what they run.
+        const bool f16_linked = vs_stage.entry && ps_stage.entry && !gs_stage.entry &&
+                                (!ps_stage.entry->f16_halves.empty() || !vs_stage.entry->f16_halves.empty());
+        if (f16_linked) {
             std::string link_error;
             if (!leonida::link_f16_halves(vs_stage.words, *vs_stage.entry, ps_stage.words, *ps_stage.entry,
                                           &link_error, device_.f16_half_top_location)) {
@@ -3656,16 +3660,25 @@ public:
                     stage.words = std::move(patched);
                 }
             }
-            VkShaderModuleCreateInfo module_info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-            module_info.codeSize = stage.words.size() * 4;
-            module_info.pCode = stage.words.data();
-            VkShaderModule module = VK_NULL_HANDLE;
-            if (vk.vkCreateShaderModule(dev, &module_info, nullptr, &module) != VK_SUCCESS) return E_FAIL;
-            modules_.push_back(module);
             VkPipelineShaderStageCreateInfo info{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
             info.stage = stage.bit;
-            info.module = module;
             info.pName = "main";
+            const bool edited = (f16_linked && (&stage == &vs_stage || &stage == &ps_stage)) ||
+                                (depth24_fragment && stage.bit == VK_SHADER_STAGE_FRAGMENT_BIT);
+            if (lazy_pso() && !edited) {
+                // LEONIDA_LAZY_PSO: no module is kept; build() makes one from the library's words (the same words
+                // read above) for each pipeline it creates, and destroys it after.
+                recipe_.lazy_modules.emplace_back(stage_infos.size(), *stage.entry);
+            } else {
+                VkShaderModuleCreateInfo module_info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+                module_info.codeSize = stage.words.size() * 4;
+                module_info.pCode = stage.words.data();
+                VkShaderModule module = VK_NULL_HANDLE;
+                if (vk.vkCreateShaderModule(dev, &module_info, nullptr, &module) != VK_SUCCESS) return E_FAIL;
+                modules_.push_back(module);
+                info.module = module;
+            }
+            stage.words = {};  // a lazy stage reads its words again at build time; an eager one has its module
             subgroup_size_for(*stage.entry, required_sizes[stage_infos.size()], info);
             stage_infos.push_back(info);
         }
@@ -3981,8 +3994,13 @@ public:
         recipe_.depth = depth;
         recipe_.blends = std::move(blends);
         recipe_.blend = blend;
-        graphics_.pipeline = build(0);
-        if (!graphics_.pipeline) return E_FAIL;
+        // LEONIDA_LAZY_PSO=1: the driver pipeline is built by the first draw that uses it (variant(0) in replay), not
+        // here. The retail title creates some 50,000 graphics PSOs before its first frame and draws with far fewer, so
+        // building them all costs gigabytes of driver memory up front.
+        if (!lazy_pso()) {
+            graphics_.pipeline = build(0);
+            if (!graphics_.pipeline) return E_FAIL;
+        }
         graphics_.variant = [this](std::uint32_t unbound) { return variant(unbound); };
 
         if (code_stage) {
@@ -4064,16 +4082,20 @@ public:
                 }
             }
         }
-        const std::vector<std::uint32_t> words = library->spirv(*entry);
-        if (words.empty()) {
-            std::fprintf(stderr, "[rt] d3d12: %s.spv is missing or not SPIR-V\n", entry->name.c_str());
-            return E_FAIL;
+        {
+            const std::vector<std::uint32_t> words = library->spirv(*entry);
+            if (words.empty()) {
+                std::fprintf(stderr, "[rt] d3d12: %s.spv is missing or not SPIR-V\n", entry->name.c_str());
+                return E_FAIL;
+            }
+            // LEONIDA_LAZY_PSO: no module yet; the first dispatch makes one from these words again (lazy_compute).
+            if (!lazy_pso()) {
+                VkShaderModuleCreateInfo module_info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+                module_info.codeSize = words.size() * 4;
+                module_info.pCode = words.data();
+                if (vk.vkCreateShaderModule(dev, &module_info, nullptr, &module_) != VK_SUCCESS) return E_FAIL;
+            }
         }
-
-        VkShaderModuleCreateInfo module_info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-        module_info.codeSize = words.size() * 4;
-        module_info.pCode = words.data();
-        if (vk.vkCreateShaderModule(dev, &module_info, nullptr, &module_) != VK_SUCCESS) return E_FAIL;
         const VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(leonida::ShaderUserData)};
         VkPipelineLayoutCreateInfo layout_info{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
         layout_info.pushConstantRangeCount = 1;
@@ -4086,17 +4108,23 @@ public:
             pipeline_.bindless_set = device_.bindless->set();
         }
         if (vk.vkCreatePipelineLayout(dev, &layout_info, nullptr, &pipeline_.layout) != VK_SUCCESS) return E_FAIL;
-        VkComputePipelineCreateInfo pipeline_info{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
-        pipeline_info.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
-        pipeline_info.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-        pipeline_info.stage.module = module_;
-        pipeline_info.stage.pName = "main";
-        VkPipelineShaderStageRequiredSubgroupSizeCreateInfo required_size{};
-        subgroup_size_for(*entry, required_size, pipeline_info.stage);
-        pipeline_info.layout = pipeline_.layout;
-        if (vk.vkCreateComputePipelines(dev, device_.pipeline_cache(), 1, &pipeline_info, nullptr, &pipeline_.pipeline) !=
-            VK_SUCCESS)
-            return E_FAIL;
+        // The subgroup size is decided (and recorded, and reported if unavailable) here in both modes; the compile
+        // applies it.
+        {
+            VkPipelineShaderStageCreateInfo decided{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+            decided.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+            VkPipelineShaderStageRequiredSubgroupSizeCreateInfo storage{};
+            subgroup_size_for(*entry, storage, decided);
+            compute_subgroup_ = subgroup_requests_.back();
+        }
+        if (lazy_pso()) {
+            // Compiled by the first dispatch that uses it (ComputePipeline::build in replay), as graphics PSOs are.
+            compute_entry_ = std::make_unique<leonida::ShaderEntry>(*entry);
+            pipeline_.build = [this] { return lazy_compute(); };
+        } else {
+            pipeline_.pipeline = compile_compute(module_);
+            if (!pipeline_.pipeline) return E_FAIL;
+        }
 
         // The code base: shaders read constant tables embedded in their own program through s_getpc_b64. The
         // translator's code offsets are into the bytes the key hashes (the FSSM blob, or the kind-6 program).
@@ -4130,7 +4158,69 @@ private:
         VkPipelineDepthStencilStateCreateInfo depth{};
         std::vector<VkPipelineColorBlendAttachmentState> blends;
         VkPipelineColorBlendStateCreateInfo blend{};
+        // LEONIDA_LAZY_PSO: the entries of `stages` (by index) that hold no module; build() makes each from the
+        // library's words for the pipeline it creates.
+        std::vector<std::pair<std::size_t, leonida::ShaderEntry>> lazy_modules;
     };
+
+    // LEONIDA_LAZY_PSO=1: graphics pipelines are built at their first draw and compute pipelines at their first
+    // dispatch, and neither keeps a shader module the runtime did not edit.
+    static bool lazy_pso() {
+        static const bool lazy = [] {
+            const char* v = std::getenv("LEONIDA_LAZY_PSO");
+            return v && *v && *v != '0';
+        }();
+        return lazy;
+    }
+
+    // A shader module of `words`; VK_NULL_HANDLE when they are empty or the driver refuses them.
+    VkShaderModule make_module(const std::vector<std::uint32_t>& words) const {
+        if (words.empty()) return VK_NULL_HANDLE;
+        VkShaderModuleCreateInfo module_info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        module_info.codeSize = words.size() * 4;
+        module_info.pCode = words.data();
+        VkShaderModule module = VK_NULL_HANDLE;
+        if (device_.context->vk.vkCreateShaderModule(device_.info.device, &module_info, nullptr, &module) != VK_SUCCESS)
+            return VK_NULL_HANDLE;
+        return module;
+    }
+
+    // The compute pipeline from `module`, pipeline_.layout and compute_subgroup_; VK_NULL_HANDLE when the driver
+    // refuses it.
+    VkPipeline compile_compute(VkShaderModule module) {
+        VkComputePipelineCreateInfo pipeline_info{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        pipeline_info.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+        pipeline_info.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        pipeline_info.stage.module = module;
+        pipeline_info.stage.pName = "main";
+        VkPipelineShaderStageRequiredSubgroupSizeCreateInfo required_size{};
+        leonida::apply_subgroup_request(compute_subgroup_, required_size, pipeline_info.stage);
+        pipeline_info.layout = pipeline_.layout;
+        VkPipeline pipeline = VK_NULL_HANDLE;
+        if (device_.context->vk.vkCreateComputePipelines(device_.info.device, device_.pipeline_cache(), 1,
+                                                         &pipeline_info, nullptr, &pipeline) != VK_SUCCESS)
+            return VK_NULL_HANDLE;
+        return pipeline;
+    }
+
+    // LEONIDA_LAZY_PSO: the compute pipeline, compiled by the first dispatch (from any queue) and kept until the PSO
+    // is released. Its module lives only for the compile.
+    VkPipeline lazy_compute() {
+        std::lock_guard lock(variants_mutex_);
+        if (lazy_compute_ || lazy_compute_failed_ || !compute_entry_) return lazy_compute_;
+        const leonida::ShaderLibrary* library = device_.library();
+        const VkShaderModule module = library ? make_module(library->spirv(*compute_entry_)) : VK_NULL_HANDLE;
+        if (module) {
+            lazy_compute_ = compile_compute(module);
+            device_.context->vk.vkDestroyShaderModule(device_.info.device, module, nullptr);
+        }
+        if (!lazy_compute_) {
+            lazy_compute_failed_ = true;
+            std::fprintf(stderr, "[rt] d3d12: compute pipeline %s could not be built at its first dispatch\n",
+                         compute_entry_->name.c_str());
+        }
+        return lazy_compute_;
+    }
 
     // The graphics pipeline with the formats of the `unbound` slots (leonida::GraphicsPipeline::variant) undefined.
     VkPipeline build(std::uint32_t unbound) const {
@@ -4198,9 +4288,33 @@ private:
             dynamic.pDynamicStates = dynamic_states;
         }
 
+        // LEONIDA_LAZY_PSO: stages without a module get one from the library's words for this pipeline only.
+        std::vector<VkPipelineShaderStageCreateInfo> stages = r.stages;
+        struct ModuleCleanup {
+            const PipelineState& self;
+            std::vector<VkShaderModule> modules;
+            ~ModuleCleanup() {
+                for (VkShaderModule m : modules)
+                    self.device_.context->vk.vkDestroyShaderModule(self.device_.info.device, m, nullptr);
+            }
+        } cleanup{*this, {}};
+        if (!r.lazy_modules.empty()) {
+            const leonida::ShaderLibrary* library = device_.library();
+            if (!library) return VK_NULL_HANDLE;
+            for (const auto& [index, entry] : r.lazy_modules) {
+                const VkShaderModule module = make_module(library->spirv(entry));
+                if (!module) {
+                    std::fprintf(stderr, "[rt] d3d12: no shader module for %s at pipeline build\n", entry.name.c_str());
+                    return VK_NULL_HANDLE;
+                }
+                cleanup.modules.push_back(module);
+                stages[index].module = module;
+            }
+        }
+
         VkGraphicsPipelineCreateInfo info{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, &rendering};
-        info.stageCount = std::uint32_t(r.stages.size());
-        info.pStages = r.stages.data();
+        info.stageCount = std::uint32_t(stages.size());
+        info.pStages = stages.data();
         info.pVertexInputState = r.mesh ? nullptr : &vertex_input;  // ignored with a mesh stage; null for clarity
         info.pInputAssemblyState = r.mesh ? nullptr : &r.assembly;
         info.pViewportState = &viewport;
@@ -4236,6 +4350,10 @@ private:
     Recipe recipe_;
     std::mutex variants_mutex_;
     std::map<std::uint32_t, VkPipeline> variants_;
+    std::unique_ptr<leonida::ShaderEntry> compute_entry_;  // LEONIDA_LAZY_PSO: what the first dispatch compiles
+    VkPipeline lazy_compute_ = VK_NULL_HANDLE;
+    bool lazy_compute_failed_ = false;
+    leonida::SubgroupRequest compute_subgroup_{};  // decided at creation, applied by compile_compute
     VkShaderModule module_ = VK_NULL_HANDLE;
     std::vector<VkShaderModule> modules_;
     VkDeviceSize code_base_ = 0;
