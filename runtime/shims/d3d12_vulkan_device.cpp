@@ -5796,6 +5796,12 @@ public:
                                                      ID3D12RootSignature* root_signature, REFIID riid,
                                                      void** out) override {
         if (out) *out = nullptr;
+        std::fprintf(stderr, "[exp] CreateCommandSignature: desc=%p stride=%u num=%u mask=0x%x last_type=%d\n",
+                     static_cast<const void*>(desc), desc ? desc->ByteStride : 0, desc ? desc->NumArgumentDescs : 0,
+                     desc ? desc->NodeMask : 0,
+                     (desc && desc->NumArgumentDescs && desc->pArgumentDescs)
+                         ? static_cast<int>(desc->pArgumentDescs[desc->NumArgumentDescs - 1].Type)
+                         : -1);
         // The host refuses these with E_INVALIDARG (compare_invalid_arguments, "command signature:"): one node, a
         // known type per argument, exactly one draw or dispatch and it comes last, a root signature for root
         // arguments, and a stride that is a multiple of 4 and holds every argument.
@@ -5804,12 +5810,13 @@ public:
         UINT64 size = 0;  // 64-bit: a large Num32BitValuesToSet must not wrap past ByteStride
         for (UINT i = 0; i < desc->NumArgumentDescs; ++i) {
             const D3D12_INDIRECT_ARGUMENT_DESC& arg = desc->pArgumentDescs[i];
-            switch (arg.Type) {
+            switch (static_cast<int>(arg.Type)) {
             case D3D12_INDIRECT_ARGUMENT_TYPE_DRAW: size += sizeof(D3D12_DRAW_ARGUMENTS); break;
             case D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED: size += sizeof(D3D12_DRAW_INDEXED_ARGUMENTS); break;
             case D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH: size += sizeof(D3D12_DISPATCH_ARGUMENTS); break;
             case D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_RAYS: size += sizeof(D3D12_DISPATCH_RAYS_DESC); break;
-            case D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH: size += sizeof(D3D12_DISPATCH_MESH_ARGUMENTS); break;
+            case D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH:
+            case 105: size += sizeof(D3D12_DISPATCH_MESH_ARGUMENTS); break;
             case D3D12_INDIRECT_ARGUMENT_TYPE_VERTEX_BUFFER_VIEW: size += sizeof(D3D12_VERTEX_BUFFER_VIEW); break;
             case D3D12_INDIRECT_ARGUMENT_TYPE_INDEX_BUFFER_VIEW: size += sizeof(D3D12_INDEX_BUFFER_VIEW); break;
             case D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT: size += UINT64{4} * arg.Constant.Num32BitValuesToSet; break;
@@ -5821,7 +5828,8 @@ public:
             }
             const bool draw = arg.Type <= D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH ||
                               arg.Type == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_RAYS ||
-                              arg.Type == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH;
+                              arg.Type == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH ||
+                              arg.Type == static_cast<D3D12_INDIRECT_ARGUMENT_TYPE>(105);
             const bool root_argument = !draw && arg.Type != D3D12_INDIRECT_ARGUMENT_TYPE_VERTEX_BUFFER_VIEW &&
                                        arg.Type != D3D12_INDIRECT_ARGUMENT_TYPE_INDEX_BUFFER_VIEW;
             if (draw != (i + 1 == desc->NumArgumentDescs) || (root_argument && !root_signature)) return E_INVALIDARG;
@@ -5829,10 +5837,12 @@ public:
         if (desc->ByteStride % 4 || desc->ByteStride < size) return E_INVALIDARG;
         if (!out) return E_UNEXPECTED;  // the host's answer for a valid description and no output
         leonida::IndirectKind kind;
-        switch (desc->pArgumentDescs[desc->NumArgumentDescs - 1].Type) {
+        switch (static_cast<int>(desc->pArgumentDescs[desc->NumArgumentDescs - 1].Type)) {
         case D3D12_INDIRECT_ARGUMENT_TYPE_DRAW: kind = leonida::IndirectKind::draw; break;
         case D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED: kind = leonida::IndirectKind::draw_indexed; break;
-        case D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH: kind = leonida::IndirectKind::dispatch; break;
+        case D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH:
+        case D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH:
+        case 105: kind = leonida::IndirectKind::dispatch; break;
         default: return E_NOTIMPL;
         }
         return create_command_signature(kind, desc->ByteStride, riid, out, identity());

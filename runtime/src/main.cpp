@@ -186,6 +186,23 @@ int wmain(int argc, wchar_t** argv) {
     try {
         rt::Loader loader(game_dir);
         rt::Module& main_module = loader.load(image);  // maps, binds and installs TLS; runs no image code
+        static std::uintptr_t g_exp_base = 0;
+        g_exp_base = reinterpret_cast<std::uintptr_t>(main_module.base);
+        AddVectoredExceptionHandler(1, [](EXCEPTION_POINTERS* ep) -> LONG {
+            if (ep->ExceptionRecord->ExceptionCode == EXCEPTION_BREAKPOINT) {
+                const auto rip = static_cast<std::uintptr_t>(ep->ContextRecord->Rip);
+                const auto rva = rip - g_exp_base;
+                if (rva == 0x247af2d || rva == 0x247af2e) {
+                    std::fprintf(stderr, "[exp] skipping budget int3 at RVA 0x%llx (rax=0x%llx)\n",
+                                 static_cast<unsigned long long>(rva),
+                                 static_cast<unsigned long long>(ep->ContextRecord->Rax));
+                    if (*reinterpret_cast<const std::uint8_t*>(rip) == 0xCC)
+                        ep->ContextRecord->Rip += 1;
+                    return EXCEPTION_CONTINUE_EXECUTION;
+                }
+            }
+            return EXCEPTION_CONTINUE_SEARCH;
+        });
         // The mods' archetype swaps (docs/modding.md): hooked here, before any image code runs, when the lookup's RVA
         // for this executable is given. The count of redirected calls shows whether the RVA is the real lookup.
         if (view_mode_getter_rva) {
