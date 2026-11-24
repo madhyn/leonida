@@ -17177,15 +17177,17 @@ def restore_vcc_tuples(insns, blob, code_start, code_end):
     stop = min(len(blob), code_end if code_end is not None else len(blob))
     restored, at = [], code_start
     while at + 8 <= stop:
-        found = None if at in covered else rdna2_decode.decode_bytes(blob[at:at + 20])["insns"][:1]
+        found = None if at in covered else rdna2_decode.decode_bytes(blob[at:min(at + 20, stop)])["insns"][:1]
         if found and found[0]["pc"] == 0 and any(
                 a["k"] == "slist" and ("vcc_lo" in a["r"] or "vcc_hi" in a["r"]) for a in found[0]["args"]):
             ins = found[0]
-            ins["pc"] = at
-            restored.append(ins)
-            at += len(ins["enc"]) // 2
-        else:
-            at += 4
+            nbytes = len(ins["enc"]) // 2
+            if at + nbytes <= stop:
+                ins["pc"] = at
+                restored.append(ins)
+                at += nbytes
+                continue
+        at += 4
     if not restored:
         return insns
     spans = [(r["pc"], r["pc"] + len(r["enc"]) // 2) for r in restored]
