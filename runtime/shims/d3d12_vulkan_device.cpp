@@ -64,6 +64,7 @@ namespace {
 // Every descriptor slot is this many bytes; an RTV or DSV slot holds a leonida::TargetView. The console's own
 // increments are open question 4 in docs/d3d12_vulkan.md; the application reads them from the device, as it must.
 constexpr UINT kDescriptorSize = descriptor_size;
+constexpr std::uint32_t kConstantBufferRow = 16;  // a CBV's V# STRIDE: the row an idxen access steps by (a float4)
 // The first 64 KiB of the GPU address arena are never handed out: VA 0 stays invalid, and the page is kept zero
 // for unbound vertex and index buffers to read (D3D12 reads zeros there).
 constexpr VkDeviceSize kZeroPage = 64 * 1024;  // zeroed: what unbound vertex and index buffers read
@@ -6855,6 +6856,12 @@ public:
         return (rel >> 48) == 0 ? rel : va;
     }
 
+    // STRIDE is 16, a constant buffer's row (a float4): a buffer access with idxen adds index × STRIDE to the
+    // address, and programs that index their constant buffer by row rely on it. With STRIDE 0 every index read row
+    // 0; ThatRecompDev/five-star-recomp (GPL-3.0, 4c6bce59b) measured that on the retail title, whose UI batch
+    // programs read each vertex's matrix rows by index and drew every UI shape on the line x = y. NUM_RECORDS stays in
+    // bytes and OOB_SELECT RAW, so the MUBUF bound is the view's size as before (RAW checks the offset, not
+    // index × STRIDE); an s_buffer_load bound becomes NUM_RECORDS × STRIDE, which no in-range constant load reaches.
     void STDMETHODCALLTYPE CreateConstantBufferView(const D3D12_CONSTANT_BUFFER_VIEW_DESC* desc,
                                                     D3D12_CPU_DESCRIPTOR_HANDLE destination) override {
         d3d12_trace::record("ID3D12Device::CreateConstantBufferView");
@@ -6863,7 +6870,7 @@ public:
         if (!desc || !desc->BufferLocation || !desc->SizeInBytes) return;
         leonida::gfx10::Buffer buffer{};
         buffer.address = resolve_shader_va(desc->BufferLocation);
-        buffer.stride = 0;
+        buffer.stride = kConstantBufferRow;
         buffer.num_records = desc->SizeInBytes;
         buffer.format = leonida::gfx10::format_from_vulkan(VK_FORMAT_R32_UINT);
         buffer.oob_select = leonida::gfx10::OobSelect::raw;

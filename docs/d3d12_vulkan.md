@@ -717,9 +717,15 @@ which has one array layer. `d3d12_descriptor_test` checks samples at four W coor
 volume, plus minimum-LOD clamped views (inside the mip range via `VK_EXT_image_view_min_lod`, at or below
 `MostDetailedMip`, and above the last mip).
 
-Known gaps in the descriptor path: buffer shader-resource views and constant-buffer views (the V# a shader would
-load for them; the structure is in `gfx10_descriptors.h`, the views are not written; buffer UAVs of every kind are,
-section 3.4 "Buffer UAVs", `d3d12_m4_compute_test` and `d3d12_buffer_uav_test`);
+A constant-buffer view is a raw GFX10 V# (`CreateConstantBufferView`): NUM_RECORDS is the view's size in bytes,
+OOB_SELECT RAW, and STRIDE 16, a constant buffer's row. A buffer access with `idxen` adds index × STRIDE to the address,
+and the retail title's UI batch programs read each vertex's matrix rows from their constant buffer by index: with
+STRIDE 0 every index read row 0 and every UI shape fell on the line x = y (measured by ThatRecompDev/five-star-recomp,
+GPL-3.0, commit `4c6bce59b`). RAW bounds a MUBUF access by its offset, not index × STRIDE, so the stride leaves that
+bound at the view's size; an `s_buffer_load` bound becomes NUM_RECORDS × STRIDE, past the end of any constant the
+program declares. `d3d12_compute_test` checks the words.
+
+Known gaps in the descriptor path:
 1D-array SRVs, 1D and 3D storage views, other typeless volume formats, multisampled depth/stencil and typeless
 color SRVs, and shader-translator lowering for multisample loads. Single-sampled depth-plane views (`R24_UNORM_X8_TYPELESS`,
 `R32_FLOAT_X8X24_TYPELESS`) are a T# of the texture's depth format (8_24_UNORM, X24_8_32_FLOAT) through the

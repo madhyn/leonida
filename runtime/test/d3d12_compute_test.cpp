@@ -691,8 +691,8 @@ int main() {
                 leonida::gfx10::Buffer decoded{};
                 EXPECT(leonida::gfx10::decode(raw, decoded));
                 EXPECT(decoded.address == expected_va);
-                EXPECT(decoded.stride == 0);
-                EXPECT(decoded.num_records == 256);
+                EXPECT(decoded.stride == 16);  // a constant buffer's row: an idxen access steps by it
+                EXPECT(decoded.num_records == 256);  // bytes, with OOB_SELECT RAW
                 EXPECT(decoded.format == leonida::gfx10::format_from_vulkan(VK_FORMAT_R32_UINT));
                 EXPECT(decoded.swizzle == leonida::gfx10::identity_swizzle);
                 EXPECT(decoded.oob_select == leonida::gfx10::OobSelect::raw);
