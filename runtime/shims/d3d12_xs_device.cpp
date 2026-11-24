@@ -1576,6 +1576,22 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
         if constexpr (K == ChildKind::queue && Slot == kQueueExecuteCommandLists) {
             return queue_execute_command_lists(self, a1, a2);
         }
+        if constexpr (K == ChildKind::queue && (Slot == kQueueSignal + 2 || Slot == kQueueWait + 2)) {
+            // Queue slots 16 and 17 are GetTimestampFrequency(UINT64*) and GetClockCalibration(UINT64*, UINT64*) on
+            // the PC: they write through their first argument. The retail title calls slot 16 with one of its fences
+            // and a value, the shape of Signal(fence, value): on the console queue Signal and Wait sit at 16 and 17,
+            // two later than on the PC, as the frequency getter does at 18 (above). Forwarded by number, the call
+            // wrote the frequency over the fence proxy's first word, its vtable pointer, and the title's next call on
+            // that fence went through a null pointer. The title's call with a fence proxy therefore goes to the PC
+            // Signal or Wait with the real fence. A host caller keeps the PC methods, and so does a call whose first
+            // argument is no object of this proxy, which cannot be a Signal.
+            if (is_console_caller(_ReturnAddress())) {
+                if (IUnknown* fence = proxy_real_object(reinterpret_cast<const void*>(a1))) {
+                    using Fn = HRESULT(WINAPI*)(void*, IUnknown*, UINT64);
+                    return hr_to_u64(reinterpret_cast<Fn>(self->real_vtable[Slot - 2])(self->real, fence, a2));
+                }
+            }
+        }
         if constexpr (K == ChildKind::queue && Slot == kQueueGetDesc) {
             // Queue slot 18 is GetDesc on the PC: a struct return, 16 bytes written through the hidden pointer. The
             // retail title calls slot 18 with one pointer to 8 bytes, the shape of GetTimestampFrequency(UINT64*),
