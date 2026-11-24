@@ -13858,8 +13858,31 @@ class Gen:
             return im
 
         def fetch(image, _cls, ty):
+            # Per amdgpu_isa_rdna2.xml, IMAGE_MSAA_LOAD loads up to 4 samples of 1 component from an MSAA resource,
+            # indexed sequentially from `sample` for each active bit in dmask.
+            if dmask == 0x1:
+                res = self.tmp()
+                self.emit(f"{res} = OpImageFetch {ty} {image} {iv} Sample {sample}")
+                return res
+            scalar_ty = ("%float", "%uint", "%int")[_cls]
+            zero = (self.fconst(0.0), "%c0", self.as_int("%c0"))[_cls]
+            elems = []
+            for k in range(4):
+                if (dmask >> k) & 1:
+                    if k == 0:
+                        s_id = sample
+                    else:
+                        s_id = self.tmp()
+                        self.emit(f"{s_id} = OpIAdd %int {sample} {self.as_int(f'%c{k}')}")
+                    f = self.tmp()
+                    self.emit(f"{f} = OpImageFetch {ty} {image} {iv} Sample {s_id}")
+                    c = self.tmp()
+                    self.emit(f"{c} = OpCompositeExtract {scalar_ty} {f} 0")
+                    elems.append(c)
+                else:
+                    elems.append(zero)
             res = self.tmp()
-            self.emit(f"{res} = OpImageFetch {ty} {image} {iv} Sample {sample}")
+            self.emit(f"{res} = OpCompositeConstruct {ty} {' '.join(elems)}")
             return res
         self.image_read_typed(None, t1, None, idx, dmask, vdata, d16, fetch, view=view)
 

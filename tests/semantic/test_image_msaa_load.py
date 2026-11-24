@@ -56,6 +56,16 @@ class ImageMsaaLoadTests(unittest.TestCase):
                 self.assertRegex(spv, r"= OpImageFetch %v4float %[^ ]+ %[^ ]+ Sample %[^ ]+")
                 self.assertRegex(spv, r"= OpImageFetch %v4uint_st %[^ ]+ %[^ ]+ Sample %[^ ]+")
                 self.assertRegex(spv, r"= OpImageFetch %v4int_st %[^ ]+ %[^ ]+ Sample %[^ ]+")
+                # dmask:0xf fetches 4 sequential samples (sample + 0..3) and packs their X components.
+                self.assertRegex(spv, r"= OpCompositeConstruct %v4float %[^ ]+ %[^ ]+ %[^ ]+ %[^ ]+")
+
+    def test_single_sample_dmask_emits_single_fetch(self):
+        spv = translate(
+            "ps_msaa_single",
+            f"image_msaa_load v9, v[4:6], {DESC} dmask:0x1 dim:SQ_RSRC_IMG_2D_MSAA",
+        )
+        self.assertEqual(spv.count("= OpImageFetch %v4float "), 1)
+        self.assertNotIn("OpIAdd %int", spv)
 
     def test_a16_and_d16_and_wave64_emulate(self):
         spv = translate(
