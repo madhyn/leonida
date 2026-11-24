@@ -3728,6 +3728,16 @@ public:
                 ps_stage.entry && (!ps_stage.entry->f16_halves.empty() || !vs_stage.entry->f16_halves.empty());
             rectangle_vertex_ = device_.retain_rectangle_vertex(vs_stage.entry, linked ? ps_stage.entry : nullptr, vs_stage.words);
         }
+        std::vector<std::uint32_t> rect_list_words;
+        if (rect_list) {  // compute before stage.words is cleared for LEONIDA_LAZY_PSO
+            std::string why;
+            rect_list_words = leonida::rect_list_geometry(vs_stage.words, why);
+            if (rect_list_words.empty()) {
+                std::fprintf(stderr, "[rt] d3d12: %s cannot be drawn as a rectangle list: %s\n",
+                             vs_stage.entry->name.c_str(), why.c_str());
+                return E_NOTIMPL;
+            }
+        }
         for (Stage& stage : stages) {
             if (!stage.entry) continue;
             // After the f16 link above, which can also edit the pixel shader's words.
@@ -3765,16 +3775,9 @@ public:
             stage_infos.push_back(info);
         }
         if (rect_list) {  // the stage that adds each rectangle's fourth corner, from the vertex shader's outputs
-            std::string why;
-            const std::vector<std::uint32_t> words = leonida::rect_list_geometry(vs_stage.words, why);
-            if (words.empty()) {
-                std::fprintf(stderr, "[rt] d3d12: %s cannot be drawn as a rectangle list: %s\n",
-                             vs_stage.entry->name.c_str(), why.c_str());
-                return E_NOTIMPL;
-            }
             VkShaderModuleCreateInfo module_info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-            module_info.codeSize = words.size() * 4;
-            module_info.pCode = words.data();
+            module_info.codeSize = rect_list_words.size() * 4;
+            module_info.pCode = rect_list_words.data();
             VkShaderModule module = VK_NULL_HANDLE;
             if (vk.vkCreateShaderModule(dev, &module_info, nullptr, &module) != VK_SUCCESS) return E_FAIL;
             modules_.push_back(module);
@@ -5460,6 +5463,30 @@ public:
                 return state_.allocate(requirements, 0, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, nullptr, index_scratch);
             },
             index_scratch ? VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT : 0);
+        state_.context->enable_host_scratch(
+            get_device,
+            [this](const VkMemoryRequirements& requirements) {
+                return state_.allocate(requirements, 0,
+                                       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+            },
+            VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+            [](std::uint64_t va, std::uint64_t bytes, void* dst) {
+                if (!va || !bytes || va > UINTPTR_MAX - bytes) return false;
+                for (std::uint64_t at = 0; at < bytes;) {
+                    MEMORY_BASIC_INFORMATION region{};
+                    if (!VirtualQuery(reinterpret_cast<const void*>(va + at), &region, sizeof(region)) ||
+                        region.State != MEM_COMMIT || (region.Protect & (PAGE_NOACCESS | PAGE_GUARD))) {
+                        return false;
+                    }
+                    const auto end = reinterpret_cast<std::uintptr_t>(region.BaseAddress) + region.RegionSize;
+                    const std::uint64_t avail = end - (va + at);
+                    const std::uint64_t chunk = (std::min)(bytes - at, avail);
+                    std::memcpy(static_cast<std::uint8_t*>(dst) + at, reinterpret_cast<const void*>(va + at),
+                                static_cast<std::size_t>(chunk));
+                    at += chunk;
+                }
+                return true;
+            });
         if (info.buffer_device_address && info.physical && info.get_instance_proc) {
             if (const auto get_props = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(
                     info.get_instance_proc(info.instance, "vkGetPhysicalDeviceProperties"))) {

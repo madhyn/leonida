@@ -1431,6 +1431,15 @@ public:
         if (!scratch_->loaded()) scratch_.reset();
     }
 
+    using HostCopy = std::function<bool(std::uint64_t va, std::uint64_t bytes, void* dst)>;
+    void enable_host_scratch(PFN_vkGetDeviceProcAddr get, ScratchBuffers::Allocate allocate,
+                             VkBufferUsageFlags extra_usage, HostCopy copy) {
+        std::unique_lock lock(resource_mutex_);
+        host_scratch_ = std::make_unique<ScratchBuffers>(get, device_, std::move(allocate), extra_usage);
+        if (!host_scratch_->loaded()) host_scratch_.reset();
+        host_copy_ = std::move(copy);
+    }
+
     // Called after that command buffer's submit: true when it was accepted, false when vkQueueSubmit failed. The
     // set keeps its upload pending in the second case, because the copy never reached the GPU.
     void set_bindless_commit(std::function<void(bool)> commit) {
@@ -1725,6 +1734,8 @@ private:
     std::uint64_t bindless_upload_version_ = 0;
     std::unique_ptr<Depth24Converter> depth24_;
     std::unique_ptr<ScratchBuffers> scratch_;  // copies staged through a buffer (depth <-> colour)
+    std::unique_ptr<ScratchBuffers> host_scratch_;
+    HostCopy host_copy_;
     std::function<void(bool)> bindless_commit_;
     std::unordered_map<QueryHeapId, QueryPool> query_pools_;  // element pointers stay valid across inserts
     double timestamp_period_ = 0;
@@ -1888,6 +1899,7 @@ public:
             std::lock_guard lock(context_.tracker_mutex_);
             if (context_.depth24_) context_.depth24_->forget(progress_);  // its scratch is idle now
             if (context_.scratch_) context_.scratch_->forget(progress_);
+            if (context_.host_scratch_) context_.host_scratch_->forget(progress_);
         }
         if (progress_) {
             // This queue is idle, so whatever initialisation it published (storage images, zero-filled buffers) has
@@ -2310,7 +2322,8 @@ private:
             ~ScratchGuard() {
                 if (active && scratch) scratch->retire(progress, 0);
             }
-        } scratch_guard{context_.scratch_.get(), progress_, false};
+        } scratch_guard{context_.scratch_.get(), progress_, false},
+          host_scratch_guard{context_.host_scratch_.get(), progress_, false};
         const bool transfer_only = family_ == context_.transfer_only_family_;
         if (!transfer_only) bindless_commit = context_.bindless_commit_;
         // Kept between executions: prepare refills each list's entries in the storage the last execution left, where
@@ -2366,6 +2379,20 @@ private:
                     context_.predicated_copier_->emit(cb, jobs);
                 };
             }
+        }
+        if (context_.host_scratch_ && context_.host_copy_) {
+            replay.upload_host_buffer = [this, &tracker_lock, &host_scratch_guard](std::uint64_t va, std::uint64_t bytes,
+                                                                                   VkBuffer& buffer, VkDeviceSize& offset) {
+                if (!bytes) return false;
+                if (!tracker_lock.owns_lock()) tracker_lock.lock();
+                if (!host_scratch_guard.active) {
+                    context_.host_scratch_->collect();
+                    host_scratch_guard.active = true;
+                }
+                void* mapped = nullptr;
+                if (!context_.host_scratch_->get_mapped(bytes, buffer, offset, mapped)) return false;
+                return context_.host_copy_(va, bytes, mapped);
+            };
         }
         if (context_.scratch_) {
             replay.copy_scratch = [this, &tracker_lock, &scratch_guard](VkDeviceSize bytes, VkBuffer& buffer,
@@ -2562,6 +2589,10 @@ private:
                 context_.scratch_->retire(progress_, 0);
                 scratch_guard.active = false;
             }
+            if (host_scratch_guard.active) {
+                context_.host_scratch_->retire(progress_, 0);
+                host_scratch_guard.active = false;
+            }
             if (bindless_commit) bindless_commit(submitted);
             tracker_lock.unlock();
             return ReplayResult::unsupported;
@@ -2705,6 +2736,10 @@ private:
         if (scratch_guard.active) {
             context_.scratch_->retire(progress_, submitted ? submitted_ : 0);
             scratch_guard.active = false;
+        }
+        if (host_scratch_guard.active) {
+            context_.host_scratch_->retire(progress_, submitted ? submitted_ : 0);
+            host_scratch_guard.active = false;
         }
         // Under tracker_mutex_, so no other flush comes between this submit and the set's note of whether it reached
         // the queue (it keeps a single upload obligation).

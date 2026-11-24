@@ -969,6 +969,8 @@ struct ReplayFunctions {
     // copies go through it, image to buffer to image. Without it such a copy is unsupported. The expanded indices of
     // an indexed quad list are written there too (prepare_quad_indices).
     std::function<bool(VkDeviceSize bytes, VkBuffer&, VkDeviceSize&)> copy_scratch;
+    // Stages committed title-memory vertex/index data into host-visible scratch when no D3D12 buffer covers `va`.
+    std::function<bool(std::uint64_t va, std::uint64_t bytes, VkBuffer&, VkDeviceSize&)> upload_host_buffer;
     // Returns the query heap with that ID, or nullptr; it stays valid while the lists that use it run.
     std::function<QueryPool*(QueryHeapId)> query_pool;
     bool separate_depth_stencil_layouts = false;  // must match the LayoutTracker, if one is used
@@ -2229,8 +2231,10 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
         }
         const VertexBufferView& view = draw.views->vertex_buffers[slot];
         std::uint64_t size = view.size;
-        if (!vk.buffer_at(view.va, size, p.vertex_buffers[slot], p.vertex_offsets[slot]))
+        if (!vk.buffer_at(view.va, size, p.vertex_buffers[slot], p.vertex_offsets[slot]) &&
+            (!vk.upload_host_buffer || !vk.upload_host_buffer(view.va, size, p.vertex_buffers[slot], p.vertex_offsets[slot]))) {
             return ReplayResult::unresolved_resource;
+        }
         p.vertex_sizes[slot] = size;
         p.vertex_strides[slot] = (pipeline->zero_step_slots & (1u << slot)) ? 0 : view.stride;
     }
@@ -2247,7 +2251,8 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
             p.index_offset = vk.zero_offset;
         } else {
             std::uint64_t size = draw.index.size;
-            if (!vk.buffer_at(draw.index.va, size, p.index_buffer, p.index_offset))
+            if (!vk.buffer_at(draw.index.va, size, p.index_buffer, p.index_offset) &&
+                (!vk.upload_host_buffer || !vk.upload_host_buffer(draw.index.va, size, p.index_buffer, p.index_offset)))
                 return ReplayResult::unresolved_resource;
             p.index_size = size;
         }
@@ -2703,7 +2708,11 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
         };
 
         if (const auto* transition = std::get_if<TransitionBarrier>(&command)) {
-            if (!bind(transition->resource)) return ReplayResult::unresolved_resource;
+            if (!bind(transition->resource)) {
+                std::fprintf(stderr, "[rt] d3d12: unresolved transition resource id=%llu\n",
+                             static_cast<unsigned long long>(transition->resource));
+                return ReplayResult::unresolved_resource;
+            }
             if (p.binding.image == VK_NULL_HANDLE) {
                 if (transition->subresource != 0 && transition->subresource != all_subresources)
                     return ReplayResult::invalid_subresource;
@@ -2713,10 +2722,18 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
         } else if (std::holds_alternative<GlobalBarrier>(command) || std::holds_alternative<BufferBarrier>(command)) {
             if (!vk.pipeline_barrier2) return ReplayResult::unsupported;
             if (const auto* buffer_barrier = std::get_if<BufferBarrier>(&command))
-                if (!bind(buffer_barrier->resource)) return ReplayResult::unresolved_resource;
+                if (!bind(buffer_barrier->resource)) {
+                    std::fprintf(stderr, "[rt] d3d12: unresolved buffer barrier resource id=%llu\n",
+                                 static_cast<unsigned long long>(buffer_barrier->resource));
+                    return ReplayResult::unresolved_resource;
+                }
         } else if (const auto* texture = std::get_if<TextureBarrier>(&command)) {
             if (!vk.pipeline_barrier2) return ReplayResult::unsupported;
-            if (!bind(texture->resource)) return ReplayResult::unresolved_resource;
+            if (!bind(texture->resource)) {
+                std::fprintf(stderr, "[rt] d3d12: unresolved texture barrier resource id=%llu\n",
+                             static_cast<unsigned long long>(texture->resource));
+                return ReplayResult::unresolved_resource;
+            }
             if (!p.binding.image || !barrier_range(p.binding, texture->range, p.range))
                 return ReplayResult::invalid_subresource;
         } else if (const auto* color_clear = std::get_if<ClearRenderTarget>(&command)) {

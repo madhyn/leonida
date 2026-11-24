@@ -43,6 +43,40 @@ public:
 
     bool loaded() const { return loaded_; }
 
+    // `bytes` of host-visible scratch for the next submission, returning its mapped pointer at a 256-byte offset.
+    bool get_mapped(std::uint64_t bytes, VkBuffer& buffer, VkDeviceSize& offset, void*& mapped) {
+        constexpr VkDeviceSize alignment = 256, minimum = 4u << 20;
+        if (!loaded_ || !bytes) return false;
+        for (auto& chunk : current_.chunks) {
+            const VkDeviceSize start = (chunk.used + alignment - 1) / alignment * alignment;
+            if (start <= chunk.size && bytes <= chunk.size - start && map_chunk(chunk)) {
+                chunk.used = start + bytes;
+                buffer = chunk.buffer;
+                offset = start;
+                mapped = static_cast<std::uint8_t*>(chunk.mapped) + start;
+                return true;
+            }
+        }
+        Chunk chunk;
+        for (std::size_t i = 0; i < spare_.size(); ++i)
+            if (spare_[i].size >= bytes) {
+                chunk = spare_[i];
+                spare_.erase(spare_.begin() + std::ptrdiff_t(i));
+                break;
+            }
+        if (!chunk.buffer && !make_chunk(std::max<std::uint64_t>(bytes, minimum), chunk)) return false;
+        if (!map_chunk(chunk)) {
+            destroy(chunk);
+            return false;
+        }
+        chunk.used = bytes;
+        buffer = chunk.buffer;
+        offset = 0;
+        mapped = chunk.mapped;
+        current_.chunks.push_back(chunk);
+        return true;
+    }
+
     // `bytes` of transfer scratch for the next submission, at a 256-byte aligned offset (more than any copy needs).
     bool get(std::uint64_t bytes, VkBuffer& buffer, VkDeviceSize& offset) {
         constexpr VkDeviceSize alignment = 256, minimum = 4u << 20;
@@ -120,6 +154,7 @@ private:
         VkBuffer buffer = VK_NULL_HANDLE;
         VkDeviceMemory memory = VK_NULL_HANDLE;
         VkDeviceSize size = 0, used = 0;
+        void* mapped = nullptr;
     };
     struct Batch {
         std::vector<Chunk> chunks;
@@ -130,7 +165,7 @@ private:
     struct Functions {
 #define LEONIDA_SCRATCH_FUNCTIONS(X)                                                                           \
     X(vkCreateBuffer) X(vkDestroyBuffer) X(vkGetBufferMemoryRequirements) X(vkBindBufferMemory) X(vkFreeMemory) \
-    X(vkGetSemaphoreCounterValue) X(vkDeviceWaitIdle)
+    X(vkMapMemory) X(vkGetSemaphoreCounterValue) X(vkDeviceWaitIdle)
 #define LEONIDA_SCRATCH_MEMBER(name) PFN_##name name = nullptr;
         LEONIDA_SCRATCH_FUNCTIONS(LEONIDA_SCRATCH_MEMBER)
 #undef LEONIDA_SCRATCH_MEMBER
@@ -161,6 +196,10 @@ private:
         }
         out.size = size;
         return true;
+    }
+    bool map_chunk(Chunk& chunk) {
+        if (chunk.mapped) return true;
+        return vk_.vkMapMemory(device_, chunk.memory, 0, chunk.size, 0, &chunk.mapped) == VK_SUCCESS && chunk.mapped;
     }
     void destroy(Chunk& chunk) {
         if (chunk.buffer) vk_.vkDestroyBuffer(device_, chunk.buffer, nullptr);
