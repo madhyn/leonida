@@ -270,6 +270,9 @@ struct MappedPage {
     uint64_t page;
     std::shared_ptr<Section> section;
     uint64_t offset;
+    uintptr_t view_base = 0;
+    uint64_t view_pages = 1;
+    DWORD view_protect = PAGE_READWRITE;
 };
 
 std::unordered_map<uintptr_t, MappedPage> g_mapped;
@@ -451,16 +454,70 @@ void* WINAPI XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type,
     return VirtualAlloc(address, size, host_type, host_prot);
 }
 
+// With g_phys_mutex held. Maps a contiguous run of `count` pages from `section` starting at `first_offset`.
+bool map_view_run(uintptr_t start, uint64_t count, const std::shared_ptr<Section>& section, uint64_t first_offset,
+                  const uint64_t* pages, DWORD protect) {
+    if (count == 0) return true;
+    void* const target = reinterpret_cast<void*>(start);
+    const SIZE_T total_size = static_cast<SIZE_T>(count) * kPhysicalPageSize;
+    if (!isolate_placeholder(target, total_size)) return false;
+    const FaultLockExclusive lock;
+    void* const view = placeholder_api().map_view3(section->handle, GetCurrentProcess(), target, first_offset,
+                                                   total_size, MEM_REPLACE_PLACEHOLDER, protect, nullptr, 0);
+    if (!view) return false;
+    g_mapped.reserve(g_mapped.size() + static_cast<std::size_t>(count));
+    for (uint64_t k = 0; k < count; ++k) {
+        g_mapped[start + k * kPhysicalPageSize] = MappedPage{
+            pages[k], section, first_offset + k * kPhysicalPageSize, start, count, protect};
+    }
+    return true;
+}
+
 // With g_phys_mutex held. Unmaps the page at `address` if one is mapped there; the address becomes a placeholder again.
 bool unmap_page(uintptr_t address) {
-    const FaultLockExclusive lock;
     const auto it = g_mapped.find(address);
     if (it == g_mapped.end()) return true;
-    if (!placeholder_api().unmap_view2(GetCurrentProcess(), reinterpret_cast<void*>(address),
-                                       MEM_PRESERVE_PLACEHOLDER)) {
+    const uintptr_t view_base = it->second.view_base ? it->second.view_base : address;
+    const uint64_t view_pages = it->second.view_pages ? it->second.view_pages : 1;
+    if (view_pages == 1) {
+        const FaultLockExclusive lock;
+        if (!placeholder_api().unmap_view2(GetCurrentProcess(), reinterpret_cast<void*>(view_base),
+                                           MEM_PRESERVE_PLACEHOLDER)) {
+            return false;
+        }
+        g_mapped.erase(it);
+        return true;
+    }
+    const auto section = it->second.section;
+    const DWORD protect = it->second.view_protect;
+    const uint64_t target_idx = (address - view_base) / kPhysicalPageSize;
+    const auto base_it = g_mapped.find(view_base);
+    const uint64_t base_offset = (base_it != g_mapped.end()) ? base_it->second.offset : 0;
+    std::vector<uint64_t> run_pages(static_cast<std::size_t>(view_pages));
+    for (uint64_t k = 0; k < view_pages; ++k) {
+        const auto p_it = g_mapped.find(view_base + k * kPhysicalPageSize);
+        run_pages[static_cast<std::size_t>(k)] = (p_it != g_mapped.end()) ? p_it->second.page : 0;
+    }
+    {
+        const FaultLockExclusive lock;
+        if (!placeholder_api().unmap_view2(GetCurrentProcess(), reinterpret_cast<void*>(view_base),
+                                           MEM_PRESERVE_PLACEHOLDER)) {
+            return false;
+        }
+        for (uint64_t k = 0; k < view_pages; ++k) {
+            g_mapped.erase(view_base + k * kPhysicalPageSize);
+        }
+    }
+    if (target_idx > 0 &&
+        !map_view_run(view_base, target_idx, section, base_offset, run_pages.data(), protect)) {
         return false;
     }
-    g_mapped.erase(it);
+    if (target_idx + 1 < view_pages &&
+        !map_view_run(address + kPhysicalPageSize, view_pages - target_idx - 1, section,
+                      base_offset + (target_idx + 1) * kPhysicalPageSize,
+                      run_pages.data() + target_idx + 1, protect)) {
+        return false;
+    }
     return true;
 }
 
@@ -474,15 +531,7 @@ bool map_page(uintptr_t address, uint64_t page, DWORD protect) {
         SetLastError(ERROR_INVALID_PARAMETER);
         return false;
     }
-    void* const target = reinterpret_cast<void*>(address);
-    if (!isolate_placeholder(target, kPhysicalPageSize)) return false;
-    const FaultLockExclusive lock;
-    void* const view = placeholder_api().map_view3(it->second.section->handle, GetCurrentProcess(), target,
-                                                   it->second.offset, kPhysicalPageSize, MEM_REPLACE_PLACEHOLDER,
-                                                   protect, nullptr, 0);
-    if (!view) return false;
-    g_mapped[address] = MappedPage{page, it->second.section, it->second.offset};
-    return true;
+    return map_view_run(address, 1, it->second.section, it->second.offset, &page, protect);
 }
 
 enum class PageCommit { not_ours, committed_before, committed_now, failed };
@@ -690,8 +739,38 @@ void* WINAPI XMemMapPhysicalPages(void* address, uint64_t page_count, const uint
         return nullptr;
     }
     const DWORD protect = view_protect(*window);
-    for (uint64_t i = 0; i < page_count; ++i) {
-        if (!map_page(start + i * kPhysicalPageSize, page_array[i], protect)) return nullptr;
+    for (uint64_t i = 0; i < page_count;) {
+        if (page_array[i] == 0) {
+            if (!unmap_page(start + i * kPhysicalPageSize)) return nullptr;
+            ++i;
+            continue;
+        }
+        const auto first_it = g_pages.find(page_array[i]);
+        if (first_it == g_pages.end()) {
+            SetLastError(ERROR_INVALID_PARAMETER);
+            return nullptr;
+        }
+        const auto& section = first_it->second.section;
+        const uint64_t first_offset = first_it->second.offset;
+        if (!unmap_page(start + i * kPhysicalPageSize)) return nullptr;
+        uint64_t run = 1;
+        while (i + run < page_count && page_array[i + run] != 0) {
+            const uintptr_t next_addr = start + (i + run) * kPhysicalPageSize;
+            const auto next_it = g_pages.find(page_array[i + run]);
+            if (next_it == g_pages.end() || next_it->second.section != section ||
+                next_it->second.offset != first_offset + run * kPhysicalPageSize) {
+                break;
+            }
+            if (!unmap_page(next_addr)) return nullptr;
+            ++run;
+        }
+        if (!map_view_run(start + i * kPhysicalPageSize, run, section, first_offset, page_array + i, protect)) {
+            if (run == 1) return nullptr;
+            for (uint64_t k = 0; k < run; ++k) {
+                if (!map_page(start + (i + k) * kPhysicalPageSize, page_array[i + k], protect)) return nullptr;
+            }
+        }
+        i += run;
     }
     return address;
 }

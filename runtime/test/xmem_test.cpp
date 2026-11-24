@@ -724,6 +724,34 @@ void test_write_combine_window(const PhysicalApi& api) {
     check(api.free_pages(1, &page) == TRUE, "free the write-combine window's page");
 }
 
+void test_coalesced_run_partial_unmap(const PhysicalApi& api) {
+    auto* const window = static_cast<uint8_t*>(
+        api.virtual_alloc(nullptr, 4 * kPage64k, MEM_RESERVE | kXmem64kPages, 0x27, PAGE_READWRITE));
+    check(window != nullptr, "XMemVirtualAlloc reserves a 4-page window for coalesced run test");
+    if (!window) return;
+
+    uint64_t pages[4]{};
+    uint64_t count = 4;
+    check(api.allocate(0x280, &count, pages) == TRUE && count == 4, "allocate 4 contiguous physical pages");
+    check(api.map(window, 4, pages) == window, "map 4 contiguous physical pages in one call");
+    for (uint32_t i = 0; i < 4; ++i) {
+        fill_page(window + static_cast<std::size_t>(i) * kPage64k, 0xA0000000u + (i << 16));
+    }
+    // Unmap only page 1 in the middle of the coalesced view.
+    uint64_t zero = 0;
+    check(api.map(window + kPage64k, 1, &zero) == window + kPage64k,
+          "unmap a middle page inside a coalesced run");
+    check(page_holds(window, 0xA0000000u), "prefix page 0 keeps its data after middle unmap");
+    check(page_holds(window + 2 * kPage64k, 0xA0020000u), "suffix page 2 keeps its data after middle unmap");
+    check(page_holds(window + 3 * kPage64k, 0xA0030000u), "suffix page 3 keeps its data after middle unmap");
+    // Remap page 1 back and verify its backing contents survived.
+    check(api.map(window + kPage64k, 1, &pages[1]) == window + kPage64k,
+          "remap the split middle page back");
+    check(page_holds(window + kPage64k, 0xA0010000u), "remapped middle page keeps its data");
+    check(api.map(window, 4, nullptr) == window, "unmap the 4-page coalesced run");
+    check(api.free_pages(4, pages) == TRUE, "free the 4 physical pages");
+}
+
 // gta6rt --trace: one "xmem_attributes" event per distinct raw attribute word and API, none with the trace off.
 void test_attribute_trace(XMemAllocFn alloc, XMemFreeFn free_mem, XMemVirtualAllocFn virtual_alloc) {
     wchar_t temp[MAX_PATH];
@@ -973,6 +1001,7 @@ int main() {
         test_first_touch_during_remap(physical);
         test_placeholders(physical);
         test_write_combine_window(physical);
+        test_coalesced_run_partial_unmap(physical);
     }
 
     print_result();
