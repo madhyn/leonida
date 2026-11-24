@@ -1800,7 +1800,9 @@ HRESULT proxy_create_descriptor_heap(DeviceProxy* self, const D3D12_DESCRIPTOR_H
         alloc_fn = g_heap_alloc;
         free_fn = g_heap_free;
     }
-    if (alloc_fn && desc && desc->NumDescriptors > 0) {
+    // A heap the console-extended handler made already sits at the address the title named: the hook-backed address
+    // is for a heap made from a plain PC description only.
+    if (!console_extended && alloc_fn && desc && desc->NumDescriptors > 0) {
         const UINT inc = self->real->GetDescriptorHandleIncrementSize(desc->Type);
         if (inc > 0 && desc->NumDescriptors <= (std::numeric_limits<SIZE_T>::max)() / inc) {
             const SIZE_T byte_size = static_cast<SIZE_T>(desc->NumDescriptors) * static_cast<SIZE_T>(inc);
