@@ -17168,25 +17168,44 @@ def restore_vcc_tuples(insns, blob, code_start, code_end):
     translator takes for these instructions. Every blob dword in the code range that no matched instruction covers
     is offered to it; the instruction is used only if its operands hold such a list, so no other undecodable word
     changes. Instructions printed inside the words of a restored one are dropped. The instructions already carry
-    their blob offsets in "pc"; returns the list sorted by it."""
+    their blob offsets in "pc"; returns the list sorted by it.
+
+    The junk can be longer than the second word it starts at, and then it also swallows the instruction after the
+    tuple, which no printed instruction covers once the junk is dropped. The words after a restored instruction are
+    therefore decoded the same way until the stream is back at an instruction llvm-mc printed there. A word that
+    llvm-mc itself rejected, inside no printed instruction, is not one of those and stays undecodable."""
     import rdna2_decode
-    covered = set()
+    printed, covered, starts = set(), set(), set()
+    unplaced = None    # the pc of the first junk since an instruction that matched the blob
     for ins in insns:
-        if not ins.get("normalized"):
-            covered.update(range(ins["pc"], ins["pc"] + len(ins["enc"]) // 2, 4))
+        if ins.get("normalized"):
+            # Its pc is a lower bound: the word llvm-mc rejected before it was not counted.
+            unplaced = ins["pc"] if unplaced is None else unplaced
+            continue
+        if unplaced is not None:
+            printed.update(range(unplaced, ins["pc"], 4))
+            unplaced = None
+        words = range(ins["pc"], ins["pc"] + len(ins["enc"]) // 2, 4)
+        printed.update(words)
+        starts.add(ins["pc"])
+        covered.update(words)
     stop = min(len(blob), code_end if code_end is not None else len(blob))
     restored, at = [], code_start
-    while at + 8 <= stop:
-        found = None if at in covered else rdna2_decode.decode_bytes(blob[at:min(at + 20, stop)])["insns"][:1]
-        if found and found[0]["pc"] == 0 and any(
-                a["k"] == "slist" and ("vcc_lo" in a["r"] or "vcc_hi" in a["r"]) for a in found[0]["args"]):
+    resync = False     # at follows a restored instruction and is inside junk llvm-mc printed, not at a start
+    while at + 4 <= stop:
+        found = None
+        if resync or at not in covered:
+            found = rdna2_decode.decode_bytes(blob[at:min(at + 20, stop)])["insns"][:1]
+        if found and found[0]["pc"] == 0 and at + len(found[0]["enc"]) // 2 <= stop and (resync or any(
+                a["k"] == "slist" and ("vcc_lo" in a["r"] or "vcc_hi" in a["r"]) for a in found[0]["args"])):
             ins = found[0]
-            nbytes = len(ins["enc"]) // 2
-            if at + nbytes <= stop:
-                ins["pc"] = at
-                restored.append(ins)
-                at += nbytes
-                continue
+            ins["pc"] = at
+            restored.append(ins)
+            at += len(ins["enc"]) // 2
+            # nothing runs on past these, so the words after them are not known to be code
+            resync = at in printed and at not in starts and base_op(ins["op"]) not in ("s_branch", "s_endpgm", "s_setpc_b64")
+            continue
+        resync = False
         at += 4
     if not restored:
         return insns

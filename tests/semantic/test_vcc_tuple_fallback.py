@@ -136,6 +136,37 @@ class VccTupleFallbackTest(unittest.TestCase):
             with self.subTest(printed_as=variant):
                 self.assertIn("OpFunctionCall %uint %desc_lookup_fn", translate(program, variant))
 
+    def test_junk_that_swallows_the_next_instructions(self):
+        # The junk at the tuple's second word is longer than that word, so it covers the s_mov_b32 after the tuple
+        # (and the first word of the 8-byte one after that, whose literal then prints as junk too). None of them is
+        # printed at its own place; all of them are decoded from the blob.
+        literal = ("s_mov_b32 s11, 0x12345678", "ff 03 8b be 78 56 34 12")
+        swallowed = ("s_mov_b32 s10, s4", "04 03 8a be")
+        tail = [WAIT, ("v_mov_b32_e32 v10, s100", "64 02 14 7e"), ("v_mov_b32_e32 v11, vcc_hi", "6b 02 16 7e"),
+                ("v_mov_b32_e32 v12, s10", "0a 02 18 7e"), ("v_mov_b32_e32 v13, s11", "0b 02 1a 7e")] + STORE_X4
+        program = SET_SGPR_V + [(None, LOAD_X8_VCC), swallowed, literal] + tail
+        hidden = bytes.fromhex(LOAD_X8_VCC)[4:] + bytes.fromhex(swallowed[1]) + bytes.fromhex(literal[1])
+        # an exp whose ignored bits are set is printed with other bytes than the blob holds
+        normalized = bytes.fromhex("60 0d 00 f8 00 00 00 00")
+        for name, junk in (("8 bytes", [hidden[:8]]), ("12 bytes, then 4", [hidden[:12], hidden[12:]]),
+                           ("8 bytes, normalized", [normalized])):
+            with self.subTest(junk=name):
+                data, blob = listing_and_blob(program)
+                lines = data.decode().splitlines()
+                first = next(i for i, line in enumerate(lines) if line == INVALID)
+                after = [] if sum(map(len, junk)) > 8 else lines[first + 3:first + 4]
+                lines[first:first + 4] = [INVALID] + [f"\ts_nop 0{'':<33}" + encoding(j.hex()) for j in junk] + after
+                spv = translate_listing(NAME, ("\n".join(lines) + "\n").encode(), fssm=blob)
+                mem = run(spv, {BASE + 4 * i: 0x11110000 + i for i in range(8)})
+                self.assertEqual([mem.get(OUT + 4 * i) for i in range(4)],
+                                 [0x11110000, 0x11110007, 0x1000, 0x12345678])
+
+    def test_rejected_word_after_a_tuple_is_still_refused(self):
+        # inside no printed instruction: llvm-mc rejected the word itself, so it is not taken for swallowed code
+        program = SET_SGPR_V + [(None, LOAD_X8_VCC), (None, "04 03 8a be 04 03 8a be"), WAIT] + STORE_X4
+        with self.assertRaisesRegex(rdna2spirv.Unsupported, "fall-through into undecodable words"):
+            translate(program)
+
     def test_other_undecodable_words_are_still_refused(self):
         # SHADER-813: a rejected word that is not a tuple into vcc (sdata 112, not a register) stays undecodable,
         # and the code that runs into it is refused
