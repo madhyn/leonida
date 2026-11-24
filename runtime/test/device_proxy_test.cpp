@@ -23,6 +23,7 @@
 #include <wrl/client.h>
 
 #include "d3d12_trace.h"
+#include "d3d12_xs_desc_clean.h"
 #include "d3d12_xs_device.h"
 #include "shims.h"
 

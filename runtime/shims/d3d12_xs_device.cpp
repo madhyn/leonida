@@ -2535,8 +2535,11 @@ void* WINAPI proxy_get_resource_allocation_info(std::uint64_t a0, std::uint64_t 
     }
     const UINT mask = static_cast<UINT>(visible_mask);
     D3D12_RESOURCE_ALLOCATION_INFO info = real->GetResourceAllocationInfo(mask, desc_count, descs);
-    apply_console_placement(descs, desc_count, info, nullptr,
-                            [&](UINT i) { return real->GetResourceAllocationInfo(mask, 1, &descs[i]); }, 25);
+    // The console tile sizes are the title's: a call in the console form gets them. A PC-form caller (the runtime's
+    // own code and tests, which compare with the PC device) gets the PC device's answer unchanged.
+    if (call.console_abi)
+        apply_console_placement(descs, desc_count, info, nullptr,
+                                [&](UINT i) { return real->GetResourceAllocationInfo(mask, 1, &descs[i]); }, 25);
     *static_cast<D3D12_RESOURCE_ALLOCATION_INFO*>(call.ret) = info;
     return call.ret;
 }
@@ -2557,7 +2560,7 @@ void* WINAPI proxy_get_resource_allocation_info1(std::uint64_t a0, std::uint64_t
     const UINT n = static_cast<UINT>(count);
     void* const returned = reinterpret_cast<Fn>(self->real_vtable[56])(
         self->real, call.ret, static_cast<UINT>(visible_mask), n, descs, each);
-    if (each) {
+    if (each && call.console_abi) {  // console sizes for the console form only, as slot 25
         auto& info = *static_cast<D3D12_RESOURCE_ALLOCATION_INFO*>(call.ret);
         apply_console_placement(descs, n, info, each, [&](UINT i) {
             return D3D12_RESOURCE_ALLOCATION_INFO{each[i].SizeInBytes, each[i].Alignment};

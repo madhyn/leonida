@@ -1321,10 +1321,11 @@ int check_render_target_sizes() {
     mips.MipLevels = 3;
     EXPECT(ask(&mips, 1).SizeInBytes == (135 + 40 + 12) * 65536ull);
 
-    // The PC form (this in RCX, the buffer in RDX) answers the same sizes.
+    // The PC form (this in RCX, the buffer in RDX) is not the title's call: it gets the PC device's own size, 127
+    // units of 64 KiB for the mock, so code that compares the proxy with the PC device still agrees.
     D3D12_RESOURCE_ALLOCATION_INFO pc{};
     EXPECT(raw(device, 25, word(&pc), 0, 1, word(&hd)) == word(&pc));
-    EXPECT(pc.SizeInBytes == 8847360);
+    EXPECT(pc.SizeInBytes == 8323072);
 
     EXPECT(release(device) == 0 && mock->refs == 0);
     std::printf("%s: device slot 25 pads render targets to whole console tiles and leaves the other sizes as the PC "
@@ -1442,7 +1443,7 @@ int check_render_target_layout() {
     EXPECT(info.SizeInBytes == 16777216 && info.Alignment == 4194304);
     EXPECT(ask(&msaa, 1).SizeInBytes == 4194304);  // multisampled targets are left as the PC device sizes them
 
-    // GetResourceAllocationInfo1: the offsets follow the padded sizes, in the console form and the PC form.
+    // GetResourceAllocationInfo1: the offsets follow the padded sizes, in the console form.
     const D3D12_RESOURCE_DESC two[] = {hd, hd};
     D3D12_RESOURCE_ALLOCATION_INFO1 each[2]{};
     D3D12_RESOURCE_ALLOCATION_INFO total{};
@@ -1452,7 +1453,7 @@ int check_render_target_layout() {
     EXPECT(each[1].Offset == 8847360 && each[1].SizeInBytes == 8847360 && each[1].Alignment == 65536);
     D3D12_RESOURCE_ALLOCATION_INFO1 mixed[2]{};
     D3D12_RESOURCE_ALLOCATION_INFO pc{};
-    EXPECT(raw(device, 56, word(&pc), 0, 2, word(msaa_first), word(mixed)) == word(&pc));
+    EXPECT(get_info1(&pc, device, 0, 2, msaa_first, mixed) == &pc);
     EXPECT(pc.SizeInBytes == 16777216 && pc.Alignment == 4194304);
     EXPECT(mixed[0].Offset == 0 && mixed[0].SizeInBytes == 4194304 && mixed[0].Alignment == 4194304);
     EXPECT(mixed[1].Offset == 4194304 && mixed[1].SizeInBytes == 8847360 && mixed[1].Alignment == 65536);
