@@ -11,6 +11,7 @@
 #pragma once
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -135,7 +136,8 @@ constexpr uint32_t kMaxD3d12Cost = 64;
 //     The graphics bind point uses Stage::Vertex; a mesh shader reads the same dwords through its translator-side
 //     window (docs/d3d12_vulkan.md section 3.5).
 // A parameter that does not fit goes to the console's spill array behind s[0:1] (compute, section 7) together with
-// every parameter after it; that array is not modelled, so such a signature is refused, never truncated.
+// every parameter after it. pack_stage refuses such a signature by default; Spill::block (graphics) lays the inline
+// part out and leaves the rest in that block, which no graphics shader reads.
 enum class Stage : uint32_t { Vertex = 0, Pixel = 1, Geometry = 2, Compute = 3, Mesh = 4 };
 
 [[nodiscard]] constexpr uint32_t stage_base(Stage stage) noexcept {
@@ -172,14 +174,23 @@ struct StagePackResult {
     std::string error;            // set when !ok; names the refusing parameter
     Stage stage = Stage::Compute;
     uint32_t base = 0;            // stage_base(stage)
-    std::vector<uint32_t> first_sgpr;  // per parameter: its first user SGPR (kNoSgpr when the signature is refused)
+    std::vector<uint32_t> first_sgpr;  // per parameter: its first user SGPR (kNoSgpr when the signature is refused,
+                                       // and for a parameter in the argument block under Spill::block)
     uint32_t end_sgpr = 0;        // one past the last SGPR used: the RSRC2 USER_SGPR count the layout implies
     uint32_t d3d12_cost = 0;      // cost against the 64-dword D3D12 limit
+    size_t first_spilled = SIZE_MAX;  // Spill::block: the first parameter in the argument block, if any
+    uint32_t spilled_dwords = 0;      // and the console-layout dwords from it on
 };
 
+// What a parameter that does not fit becomes. refuse: the signature is refused (the default; the compute block's
+// layout is ROOT-SIG-SPILL-MODEL's). block: it and every later parameter go to the argument block behind s[0:1], as
+// on the console, and take no SGPR (kNoSgpr); the ones before keep their inline SGPRs. For graphics no VS, PS or GS
+// reads s[0:1] as an address (tools/root_spill_census.py on 1.0.2.1), so nothing a draw reads is in that block.
+enum class Spill : uint32_t { refuse = 0, block = 1 };
+
 // Lays the parameters out for `stage` in the console layout. Fails like pack() on more than 64 parameters, a
-// constant parameter of 0 values or the 64-dword cost limit, and on any parameter that would spill.
-[[nodiscard]] StagePackResult pack_stage(const RootSignature& sig, Stage stage);
+// constant parameter of 0 values or the 64-dword cost limit, and, under Spill::refuse, on any parameter that spills.
+[[nodiscard]] StagePackResult pack_stage(const RootSignature& sig, Stage stage, Spill spill = Spill::refuse);
 
 // D3D12 cost of one parameter against the 64-dword limit.
 [[nodiscard]] constexpr uint32_t param_cost(ParamType type, uint32_t num_values) noexcept {

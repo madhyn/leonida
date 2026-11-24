@@ -458,11 +458,16 @@ int main() {
             list->RSSetViewports(1, &viewport);
             list6->DispatchMesh(1, 1, 1);
             EXPECT(list->Close() == E_INVALIDARG);
-
-            // Past every console window: still created, the graphics bind point keeping the PC layout from s0 until
-            // the argument block behind s[0:1] is modelled (refusing it stopped the retail title at start-up).
+            // Past every console window: still created (refusing it stopped the retail title at start-up), its 30
+            // constants in the argument block behind s[0:1], which no graphics shader reads. Setting them is valid
+            // and stores nothing; a mesh shader still may not use the signature.
             Ref<ID3D12RootSignature> huge;
             EXPECT(wide_root_signature(device.p, huge, 30));
+            EXPECT(SUCCEEDED(list->Reset(allocator.p, mesh_pso.p)));
+            list->SetGraphicsRootSignature(huge.p);
+            const std::array<std::uint32_t, 30> spilled_values{};
+            list->SetGraphicsRoot32BitConstants(0, 30, spilled_values.data(), 0);
+            EXPECT(SUCCEEDED(list->Close()));
             EXPECT(SUCCEEDED(list->Reset(allocator.p, mesh_pso.p)));
             list->SetGraphicsRootSignature(huge.p);
             list->RSSetViewports(1, &viewport);

@@ -1249,7 +1249,17 @@ private:
         if ((count && !data) || std::uint64_t(offset) + count > p->constant_count) return check(false);
         const auto* values = static_cast<const std::uint32_t*>(data);
         const std::uint32_t first = first_dword(state, *p);
+        if (first == rt::rootsig::kNoSgpr) return spilled();
         for (UINT i = 0; i < count; ++i) write(state, first + offset + i, values[i]);
+    }
+
+    // A parameter of the argument block behind s[0:1] (rt::rootsig::Spill::block, graphics): no shader reads it, so
+    // its value is not stored; kNoSgpr plus an offset must never reach write().
+    static void spilled() {
+        static std::atomic<bool> said{false};
+        if (!said.exchange(true))
+            std::fprintf(stderr, "[rt] d3d12: root arguments in the argument block behind s[0:1] are not stored (no "
+                                 "graphics shader reads them)\n");
     }
 
     void address(RootState& state, UINT index, std::uint64_t va, rt::rootsig::ParamType type) {
@@ -1261,10 +1271,11 @@ private:
         const RootArgumentLayout::Parameter* p = parameter(state, index, type);
         if (!p) return;
         const std::uint32_t first = first_dword(state, *p);
+        if (first == rt::rootsig::kNoSgpr) return spilled();
         write(state, first, std::uint32_t(va));
         // In the console layout of both bind points a descriptor table is one dword, the 32-bit VA of its first
-        // descriptor (the heaps live below 4 GiB); a root view keeps both halves (D3D-448). A graphics signature
-        // past the console window keeps pack()'s layout, where every address takes two dwords.
+        // descriptor (the heaps live below 4 GiB); a root view keeps both halves (D3D-448). Under
+        // LEONIDA_GRAPHICS_ROOT_LAYOUT=pc the graphics bind point keeps pack()'s layout, two dwords per address.
         const bool console = is_compute(state) || state.layout->graphics_console;
         if (!(console && type == rt::rootsig::ParamType::Table)) write(state, first + 1, std::uint32_t(va >> 32));
     }

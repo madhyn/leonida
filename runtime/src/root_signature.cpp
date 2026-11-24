@@ -48,7 +48,7 @@ PackResult pack(const RootSignature& sig) {
     return out;
 }
 
-StagePackResult pack_stage(const RootSignature& sig, Stage stage) {
+StagePackResult pack_stage(const RootSignature& sig, Stage stage, Spill spill) {
     StagePackResult out;
     out.stage = stage;
     out.base = stage_base(stage);
@@ -73,12 +73,22 @@ StagePackResult pack_stage(const RootSignature& sig, Stage stage) {
             return out;
         }
         const uint64_t dwords = stage_dwords(p.type, p.num_values);
+        if (out.first_spilled != SIZE_MAX) {  // already in the argument block: every later parameter follows
+            first.push_back(kNoSgpr);
+            out.spilled_dwords += static_cast<uint32_t>(dwords);
+            continue;
+        }
         if (next + dwords > kMaxUserSgprs) {
-            // The console moves this parameter and every later one to the spill array behind s[0:1]; that array's
-            // layout is not modelled here, so refuse rather than drop arguments.
-            out.error = "root parameter " + std::to_string(i) + " does not fit in the user SGPRs from s" +
-                        std::to_string(out.base) + " (spill array not modelled)";
-            return out;
+            // The console moves this parameter and every later one to the spill array behind s[0:1].
+            if (spill == Spill::refuse) {
+                out.error = "root parameter " + std::to_string(i) + " does not fit in the user SGPRs from s" +
+                            std::to_string(out.base) + " (spill array not modelled)";
+                return out;
+            }
+            out.first_spilled = i;
+            out.spilled_dwords = static_cast<uint32_t>(dwords);
+            first.push_back(kNoSgpr);
+            continue;
         }
         first.push_back(static_cast<uint32_t>(next));
         next += dwords;

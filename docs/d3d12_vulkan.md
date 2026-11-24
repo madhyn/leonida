@@ -1795,17 +1795,20 @@ argument in the same dword. A mesh shader's s8..s15 are below its base and read 
 for every stage. The index records the window as `"root_window": {"sgpr": 16, "dword": 8}`, and a mesh PSO whose
 mesh shader lacks it (translated before) is refused with a log line asking for the shaders stage again. The mesh
 window holds 16 dwords (s16..s31) where the others hold 24 (s8..s31): a signature that fits the graphics layout but
-not the mesh window is created with a log line, and `DispatchMesh` with it invalidates the list. A signature past
-the graphics window (more than 24 dwords from s8) goes, on the console, to the argument block behind `s[0:1]`, which
-is modelled for compute only (ROOT-SIG-SPILL-MODEL); until it is for graphics, such a signature keeps `pack()`'s
-layout at the graphics bind point (from s0, two dwords per table, `RootArgumentLayout::graphics_console` false) rather
-than being refused: the retail title creates one at start-up (29..32 dwords) and stops if it is refused. Since no VS
-or PS reads `s[0:1]` as an address (below), such a signature may instead fit each stage once a parameter takes SGPRs
-only in the stages it is visible to (visibility is not modelled yet): the layer logs its dwords per
-`D3D12_SHADER_VISIBILITY` and the per-stage sums that would give, counts that settle it on the retail title.
-`LEONIDA_GRAPHICS_ROOT_LAYOUT=pc` (diagnostic) gives every graphics signature that `pack()` layout, as before the
-console layout, so one build compares both on the retail title; `DispatchMesh` is then refused, compute is unchanged
-(`d3d12_mesh_test`). Live evidence for
+not the mesh window is created with a log line, and `DispatchMesh` with it invalidates the list. In a signature past
+the graphics window (more than 24 dwords from s8), the parameter that does not fit and every one after it go, on the
+console, to the argument block behind `s[0:1]` (as measured for compute, section 7), and the ones before stay inline.
+No VS, PS or GS reads `s[0:1]` as an address (below), so a draw reads nothing in that block: the graphics bind point
+lays the inline part out from s8 and stores nothing for the rest (`rt::rootsig::Spill::block`, logged once per
+signature; compute keeps refusing a spill until ROOT-SIG-SPILL-MODEL). The retail title creates two such signatures at
+start-up, 25 and 30 dwords with every parameter visible to every stage (#974 review, RTX 3060 Ti under Wine), and stops
+if they are refused. `LEONIDA_GRAPHICS_ROOT_LAYOUT=pc` (diagnostic) gives every graphics signature `pack()`'s layout
+instead (from s0, two dwords per table, `RootArgumentLayout::graphics_console` false), as before the console layout,
+so one build compares both on the retail title; `DispatchMesh` is then refused, compute is unchanged
+(`d3d12_mesh_test`). On that review's stack the console layout stops the title after 2 presents at the `int3` it
+raises for a removed device (issue #14, DesertGamer's fence finding), where the PC layout runs 130 s: the draws now
+read the title's own tables and one of them faults the GPU there. DadaCap's `boot-prototype`, which also lays graphics
+out from s8, runs 76..90 s on an RTX 5070 with and without this change. Live evidence for
 s8 and one dword per table: on the retail frame loop the VS of a textured draw reads table slots 0 and 2 through s8
 and its PS slot 1, which hold exactly the buffer, constants and texture the title bound (issue #14, comment
 7131556366, native Windows, RTX 5080). What mesh shaders read below s16 was counted on the 1.0.2.1 corpus

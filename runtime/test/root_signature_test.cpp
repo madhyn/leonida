@@ -449,6 +449,30 @@ int main() {
         check(!pack_stage(tables, Stage::Mesh).ok, "pack_stage: a 17th table spills on mesh");
     }
 
+    // Spill::block (graphics): the parameters that fit stay inline from s8; the first that does not, and every one
+    // after it even if it would fit, go to the argument block behind s[0:1] and take no SGPR, as on the console.
+    {
+        RootSignature sig;
+        sig.params = {table(), view(), consts(20), table(), consts(1)};  // s8, s9..s10, s11..s30, then s31 is free
+        const StagePackResult r = pack_stage(sig, Stage::Vertex, Spill::block);
+        check(r.ok && r.first_sgpr == std::vector<uint32_t>({8, 9, 11, 31, kNoSgpr}),
+              "pack_stage block: a table at s31 still fits, the constant after it spills");
+        check(r.first_spilled == 4 && r.spilled_dwords == 1 && r.end_sgpr == 32,
+              "pack_stage block: the first spilled parameter and its dwords");
+        RootSignature big;
+        big.params = {table(), consts(30), table()};  // the 30 constants cannot fit: they and the last table spill
+        const StagePackResult b = pack_stage(big, Stage::Vertex, Spill::block);
+        check(b.ok && b.first_sgpr == std::vector<uint32_t>({8, kNoSgpr, kNoSgpr}) && b.first_spilled == 1 &&
+                  b.spilled_dwords == 31 && b.end_sgpr == 9,
+              "pack_stage block: every parameter after the first spilled one spills, even one that would fit");
+        check(!pack_stage(big, Stage::Vertex).ok, "pack_stage: the default still refuses a spill");
+        RootSignature small;
+        small.params = {table(), consts(4)};
+        const StagePackResult fits = pack_stage(small, Stage::Vertex, Spill::block);
+        check(fits.ok && fits.first_spilled == SIZE_MAX && fits.spilled_dwords == 0,
+              "pack_stage block: nothing spills when everything fits");
+    }
+
     // The graphics root window (D3D-448 follow-up): the graphics bind point lays a signature out once with
     // Stage::Vertex, root dword k at push dword 8 + k. A vertex, pixel or geometry shader reads SGPR i from push
     // dword i, and a mesh shader its s16 + k from push dword 8 + k (tools/rdna2spirv.py, user_data_dword), so every
