@@ -184,5 +184,61 @@ class VccTupleFallbackTest(unittest.TestCase):
         self.assertEqual((restored[0]["pc"], len(restored[0]["enc"]) // 2), (0, 12))
 
 
+class ResyncTest(unittest.TestCase):
+    """restore_vcc_tuples on hand-built instruction lists: where the words after a restored tuple are decoded, and
+    where that stops."""
+    LITERAL = "ff 03 8b be 78 56 34 12"             # s_mov_b32 s11, 0x12345678
+    MOV = "04 03 8a be"                             # s_mov_b32 s10, s4
+    END = "00 00 81 bf"                             # s_endpgm
+    BAD = "ff ff ff ff"                             # no instruction
+
+    def restore(self, words, printed, code_start=0, normalized=()):
+        """printed, normalized: (pc, bytes) of the instructions llvm-mc listed; returns [(pc, size)] in order."""
+        blob = bytes.fromhex("".join(words))
+        insns = [{"pc": pc, "enc": blob[pc:pc + n].hex(), "op": "x", "args": []} for pc, n in printed]
+        insns += [{"pc": pc, "enc": "00" * n, "op": "x", "args": [], "normalized": True} for pc, n in normalized]
+        insns.sort(key=lambda i: i["pc"])
+        out = rdna2spirv.restore_vcc_tuples(insns, blob, code_start, len(blob))
+        return [(i["pc"], len(i["enc"]) // 2) for i in out]
+
+    def test_stops_at_a_printed_instruction(self):
+        # the tuple's junk covers words 1 and 2; the s_mov_b32 at 12 is printed, with its own operands, and stays
+        words = [LOAD_X8_VCC, self.MOV, self.MOV, self.END]
+        self.assertEqual(self.restore(words, [(4, 8), (12, 4), (16, 4)]), [(0, 8), (8, 4), (12, 4), (16, 4)])
+        blob = bytes.fromhex("".join(words))
+        insns = [{"pc": 4, "enc": blob[4:12].hex(), "op": "x", "args": []},
+                 {"pc": 12, "enc": blob[12:16].hex(), "op": "printed", "args": []}]
+        self.assertIn("printed", [i["op"] for i in rdna2spirv.restore_vcc_tuples(insns, blob, 0, len(blob))])
+
+    def test_crosses_a_start_that_is_a_literal_printed_on_its_own(self):
+        # The 8-byte instruction at 12 runs across a printed start (16): its own literal, which llvm-mc printed as an
+        # instruction because the junk before it ended there. So a resync may not stop at every printed start.
+        words = [LOAD_X8_VCC, self.MOV, self.LITERAL, self.END]
+        self.assertEqual(self.restore(words, [(4, 12), (16, 4), (20, 4)]), [(0, 8), (8, 4), (12, 8), (20, 4)])
+
+    def test_drops_out_when_a_decode_fails(self):
+        # a word no decoder takes inside the junk: the s_mov_b32 after it is not picked up again
+        words = [LOAD_X8_VCC, self.BAD, self.MOV, self.END]
+        self.assertEqual(self.restore(words, [(4, 12), (16, 4)]), [(0, 8), (16, 4)])
+
+    def test_two_junk_regions_are_separate(self):
+        # Two regions of normalized junk with matched instructions between them: the first ends at the match, so the
+        # rejected word at 20, between the regions, is in neither and is not decoded after the second tuple.
+        words = [LOAD_X8_VCC, self.MOV, LOAD_X8_VCC, self.MOV, self.MOV, self.END]
+        self.assertEqual(self.restore(words, [(8, 4), (28, 4)], normalized=[(4, 4), (24, 4)]),
+                         [(0, 8), (8, 4), (12, 8), (24, 4), (28, 4)])
+
+    def test_nothing_is_decoded_before_a_tuple(self):
+        # the first words are inside junk of something else: no tuple, so they stay as they are
+        words = [self.MOV, self.MOV, self.END]
+        self.assertEqual(self.restore(words, [], normalized=[(0, 8)]), [(0, 8)])
+
+    def test_resync_to_the_last_word(self):
+        self.assertEqual(self.restore([LOAD_X8_VCC, self.MOV, self.MOV], [(4, 12)]), [(0, 8), (8, 4), (12, 4)])
+
+    def test_a_tuple_at_the_very_end_of_the_code(self):
+        self.assertEqual(self.restore([self.MOV, LOAD_X8_VCC], [(0, 4)]), [(0, 4), (4, 8)])
+
+
 if __name__ == "__main__":
     unittest.main()
