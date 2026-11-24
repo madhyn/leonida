@@ -17,6 +17,7 @@
 #include "statistics_sum_spirv.h"
 #include "vulkan13_features.h"
 #include "vulkan_depth24.h"
+#include "vulkan_device_fault.h"
 #include "vulkan_indirect_dispatch_count.h"
 #include "vulkan_scratch.h"
 #include "vulkan_replay.h"
@@ -108,7 +109,7 @@ struct VulkanDeviceFunctions {
     X(vkCreateEvent) X(vkDestroyEvent) X(vkResetEvent) X(vkCmdSetEvent) X(vkCmdWaitEvents) X(vkCmdDrawMeshTasksEXT) \
     X(vkCmdDrawMeshTasksIndirectEXT)                                                                         \
     X(vkCreateRenderPass2) X(vkDestroyRenderPass) X(vkCreateFramebuffer) X(vkDestroyFramebuffer)               \
-    X(vkCmdBeginRenderPass) X(vkCmdEndRenderPass)
+    X(vkCmdBeginRenderPass) X(vkCmdEndRenderPass) X(vkGetDeviceFaultInfoEXT)
 #define LEONIDA_VK_MEMBER(name) PFN_##name name = nullptr;
     LEONIDA_VK_DEVICE_FUNCTIONS(LEONIDA_VK_MEMBER)
 #undef LEONIDA_VK_MEMBER
@@ -553,6 +554,22 @@ inline bool set_device_lost(std::atomic<bool>& flag, const char* where) noexcept
     return true;
 }
 
+// What the driver says about the loss, printed after the line above by the caller whose set_device_lost returned true,
+// so once per device. Only where VK_EXT_device_fault is enabled: the entry point is null otherwise and nothing is
+// printed (src/vulkan_device_fault.h). device_fault_reports counts the reports printed in this process (for tests).
+inline std::atomic<unsigned> device_fault_reports{0};
+inline void report_device_fault(const VulkanDeviceFunctions& vk, VkDevice device) noexcept {
+    if (!vk.vkGetDeviceFaultInfoEXT || !device) return;
+    try {
+        const auto lines = device_fault_lines([&](VkDeviceFaultCountsEXT* counts, VkDeviceFaultInfoEXT* info) {
+            return vk.vkGetDeviceFaultInfoEXT(device, counts, info);
+        });
+        for (const std::string& line : lines) std::fprintf(stderr, "[rt] vulkan: %s\n", line.c_str());
+        device_fault_reports.fetch_add(1, std::memory_order_relaxed);
+    } catch (...) {  // out of memory while the device is going down: the loss itself is already said
+    }
+}
+
 // Centralized single-thread fence dispatcher using Vulkan 1.2 vkWaitSemaphores(VK_SEMAPHORE_WAIT_ANY_BIT).
 // Eliminates per-fence OS threads and 10ms polling: a synthetic timeline semaphore (wakeup_sem_) at index 0
 // wakes vkWaitSemaphores immediately whenever a new wait, a released fence, or shutdown arrives while waiting_ == true.
@@ -825,7 +842,9 @@ private:
             epoch_cv_.notify_all();
 
             if (res == VK_ERROR_DEVICE_LOST || device_lost_.load(std::memory_order_acquire)) {
-                set_device_lost(device_lost_, "vkWaitSemaphores in the fence dispatcher returned VK_ERROR_DEVICE_LOST");
+                if (set_device_lost(device_lost_,
+                                    "vkWaitSemaphores in the fence dispatcher returned VK_ERROR_DEVICE_LOST"))
+                    report_device_fault(vk_, device_);
                 std::vector<Entry> drained = std::move(pending_);
                 pending_.clear();
                 dispatch_outside_lock(lock, drained, signal_event_);
@@ -855,8 +874,9 @@ private:
                 pending_.resize(write);
                 for (Entry& e : pending_) ready.push_back(std::move(e));
                 pending_.clear();
-                set_device_lost(device_lost_,
-                                "vkGetSemaphoreCounterValue in the fence dispatcher returned VK_ERROR_DEVICE_LOST");
+                if (set_device_lost(device_lost_,
+                                    "vkGetSemaphoreCounterValue in the fence dispatcher returned VK_ERROR_DEVICE_LOST"))
+                    report_device_fault(vk_, device_);
                 dispatch_outside_lock(lock, ready, signal_event_);
                 return;
             }
@@ -1556,7 +1576,7 @@ public:
     std::mutex& submit_mutex() { return submit_mutex_; }
 
     void mark_device_lost(const char* where = "a Vulkan call returned VK_ERROR_DEVICE_LOST") noexcept {
-        set_device_lost(device_lost_, where);
+        if (set_device_lost(device_lost_, where)) report_device_fault(vk, device_);
         if (fence_dispatcher_) {
             try {
                 fence_dispatcher_->notify_device_lost();

@@ -10316,6 +10316,23 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
         info.host_pointer_alignment = host_memory.minImportedHostPointerAlignment;
     }
 
+    // Optional: VK_EXT_device_fault lets the layer ask the driver why the device was lost and print its report after
+    // the "device was lost" line (src/vulkan_device_fault.h). The vendor binary is not used, so that feature stays off.
+    VkPhysicalDeviceFaultFeaturesEXT device_fault{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT};
+    bool has_device_fault = std::any_of(extensions.begin(), extensions.end(), [](const auto& e) {
+        return std::strcmp(e.extensionName, VK_EXT_DEVICE_FAULT_EXTENSION_NAME) == 0;
+    });
+    if (has_device_fault) {
+        VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &device_fault};
+        vkGetPhysicalDeviceFeatures2(info.physical, &query);
+        has_device_fault = device_fault.deviceFault == VK_TRUE;
+    }
+    if (has_device_fault) {
+        device_fault.deviceFaultVendorBinary = VK_FALSE;
+        device_fault.pNext = *v13.next();
+        *v13.next() = &device_fault;
+    }
+
     VkDeviceCreateInfo device_info{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &enable12};
     device_info.queueCreateInfoCount = std::uint32_t(queue_infos.size());
     device_info.pQueueCreateInfos = queue_infos.data();
@@ -10355,6 +10372,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     info.swapchain_colorspace = info.presentation && swapchain_colorspace_enabled;
     if (info.custom_border_color) device_extensions.push_back(custom_border_name);
     if (info.host_pointer_alignment) device_extensions.push_back(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
+    if (has_device_fault) device_extensions.push_back(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
     device_info.enabledExtensionCount = std::uint32_t(device_extensions.size());
     device_info.ppEnabledExtensionNames = device_extensions.empty() ? nullptr : device_extensions.data();
     if (vkCreateDevice(info.physical, &device_info, nullptr, &owned.device) != VK_SUCCESS)
