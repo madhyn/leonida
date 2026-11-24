@@ -735,6 +735,42 @@ int main() {
         EXPECT(uncap.target_interval_us == 0 && near(uncap.drift_us, 0.0) && uncap.p50_us == period);
     }
 
+    // Destroying a pacer with multiple blocked waiters (origin, vblank, flip) lets every waiter go.
+    {
+        ManualFrameClock clock;
+        std::future<Result> w0, w1, w2;
+        {
+            FramePacer pacer(clock);
+            EXPECT(setup(pacer, 1));
+            EXPECT(pacer.schedule_frame_event(frame_event_vblank, 0, 0) == pacer_hr::ok);
+            EXPECT(pacer.schedule_frame_event(frame_event_flip, 0, 0) == pacer_hr::ok);
+            w0 = wait_async(pacer, infinite_timeout_ms);
+            w1 = std::async(std::launch::async, [&] {
+                return Result{pacer.wait_frame_event(frame_event_vblank, infinite_timeout_ms, 0, nullptr), 0};
+            });
+            w2 = std::async(std::launch::async, [&] {
+                return Result{pacer.wait_frame_event(frame_event_flip, infinite_timeout_ms, 0, nullptr), 0};
+            });
+            EXPECT(blocked(w0) && blocked(w1) && blocked(w2));
+        }
+        EXPECT(w0.get().hr == pacer_hr::invalid_state);
+        EXPECT(w1.get().hr == pacer_hr::invalid_state);
+        EXPECT(w2.get().hr == pacer_hr::invalid_state);
+    }
+
+    // Switching to uncapped mode wakes a waiter already blocked on the vblank grid.
+    {
+        ManualFrameClock clock;
+        FramePacer pacer(clock);
+        EXPECT(setup(pacer, 1));
+        std::future<Result> waiter = wait_async(pacer, infinite_timeout_ms);
+        EXPECT(blocked(waiter));
+        pacer.set_uncapped(true);
+        EXPECT(waiter.wait_for(std::chrono::seconds(2)) == std::future_status::ready);
+        const Result r = waiter.get();
+        EXPECT(r.hr == pacer_hr::ok && r.token == 1);
+    }
+
     std::printf("frame_pacer_test: all cases pass\n");
     return 0;
 }
