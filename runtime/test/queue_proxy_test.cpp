@@ -277,6 +277,12 @@ int check_slots(const Backend& b) {
             const std::uint64_t before35 = qhits(35);
             EXPECT(raw_call(queue.p, 35, 1, reinterpret_cast<std::uint64_t>(lists)) == 0);
             EXPECT(qhits(35) == before35 + 1 && xs::queue_slot_first_call_seen(35));
+            // Console slot 32, PresentX. This test's build of the proxy has no presenter (the wiring is in gta6rt's,
+            // LEONIDA_VULKAN_DEVICE), so the slot answers S_OK and reaches no PC slot; it is counted like any other.
+            EXPECT(xs::queue_slot_overridden(32));
+            const std::uint64_t before32 = qhits(32);
+            EXPECT(static_cast<std::uint32_t>(raw_call(queue.p, 32, 0, 0, 0)) == static_cast<std::uint32_t>(S_OK));
+            EXPECT(qhits(32) == before32 + 1);
             EXPECT(SUCCEEDED(queue->Signal(fence.p, 7)));
             if (wait_for(label, fence.p, 7)) return 1;
             if (b.vulkan) {
