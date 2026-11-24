@@ -74,8 +74,8 @@ NO_DEST = ("s_cmp", "s_bitcmp", "v_cmpx", "exp", "buffer_store", "global_store",
            "s_icache", "s_dcache", "s_sleep", "s_code_end", "s_denorm_mode", "s_round_mode", "s_waitcnt_vscnt",
            "s_ttracedata", "v_nop", "s_set", "s_sethalt", "s_setkill", "s_wakeup", "s_version", "buffer_gl",
            "buffer_wbinvl", "ds_gws", "ds_nop")
-LOADS = ("buffer_load", "global_load", "flat_load", "scratch_load", "tbuffer_load", "image_load", "image_sample",
-         "image_gather", "image_get", "s_load", "s_buffer_load", "ds_read", "v_interp")
+LOADS = ("buffer_load", "global_load", "flat_load", "scratch_load", "tbuffer_load", "image_load", "image_msaa_load",
+         "image_sample", "image_gather", "image_get", "s_load", "s_buffer_load", "ds_read", "v_interp")
 SINKS = ("exp", "buffer_store", "global_store", "flat_store", "scratch_store", "tbuffer_store", "image_store",
          "ds_write", "ds_store")
 SCC_LESS = ("s_mov", "s_cmov", "s_cselect", "s_load", "s_buffer_load", "s_getpc", "s_setpc", "s_nop", "s_waitcnt",
@@ -186,7 +186,7 @@ def _preserves_dst(ins, op, mods):
             op.endswith(("_f16", "_u16", "_i16", "_b16"))
             or op.startswith(("v_cvt_f16_", "v_cvt_u16_", "v_cvt_i16_", "v_cvt_norm_i16_", "v_cvt_norm_u16_"))):
         return True
-    if op.startswith(("image_load", "image_sample")) and "d16" in mods:
+    if op.startswith(("image_load", "image_msaa_load", "image_sample")) and "d16" in mods:
         dmask = _mod_int(mods, "dmask", 0x1)
         return dmask is None or ((dmask & 0xF).bit_count() % 2 == 1)
     if op.startswith(("buffer_load_format", "tbuffer_load_format")) and "_d16" in op:
