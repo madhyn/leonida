@@ -6456,11 +6456,26 @@ public:
         if (!graphics_usable)
             std::fprintf(stderr, "[rt] d3d12: root signature usable for compute only: %s\n",
                          graphics.ok ? fallback.error.c_str() : graphics.error.c_str());
-        else if (!graphics.ok)
+        else if (!graphics.ok) {
             std::fprintf(stderr,
                          "[rt] d3d12: root signature past the console's graphics window (%s): graphics keeps the PC "
                          "layout from s0 until the argument block behind s[0:1] is modelled\n",
                          graphics.error.c_str());
+            // Counts for the open question behind it: no VS or PS reads s[0:1] as an address (root_spill_census), so
+            // such a signature may fit each stage once a parameter takes SGPRs only in the stages it is visible to.
+            // Console-layout dwords per D3D12_SHADER_VISIBILITY (constant: its values, root view 2, table 1).
+            std::uint32_t by_visibility[8] = {};
+            for (const auto& param : parsed.sig.params)
+                by_visibility[std::min<std::uint32_t>(static_cast<std::uint32_t>(param.visibility), 7u)] +=
+                    rt::rootsig::stage_dwords(param.type, param.num_values);
+            const std::uint32_t* v = by_visibility;
+            std::fprintf(stderr,
+                         "[rt] d3d12: root signature dwords by visibility: all %u, vertex %u, hull %u, domain %u, "
+                         "geometry %u, pixel %u, amplification %u, mesh %u; per stage with visibility: vertex %u, "
+                         "pixel %u, geometry %u, mesh %u (windows 24, 24, 24, 16)\n",
+                         v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[0] + v[1], v[0] + v[5], v[0] + v[4],
+                         v[0] + v[7]);
+        }
         else if (graphics_console && !mesh.ok)
             std::fprintf(stderr, "[rt] d3d12: root signature too large for a mesh shader's root window: %s\n",
                          mesh.error.c_str());

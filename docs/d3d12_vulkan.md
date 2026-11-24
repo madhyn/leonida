@@ -1799,7 +1799,10 @@ not the mesh window is created with a log line, and `DispatchMesh` with it inval
 the graphics window (more than 24 dwords from s8) goes, on the console, to the argument block behind `s[0:1]`, which
 is modelled for compute only (ROOT-SIG-SPILL-MODEL); until it is for graphics, such a signature keeps `pack()`'s
 layout at the graphics bind point (from s0, two dwords per table, `RootArgumentLayout::graphics_console` false) rather
-than being refused: the retail title creates one at start-up (29..32 dwords) and stops if it is refused.
+than being refused: the retail title creates one at start-up (29..32 dwords) and stops if it is refused. Since no VS
+or PS reads `s[0:1]` as an address (below), such a signature may instead fit each stage once a parameter takes SGPRs
+only in the stages it is visible to (visibility is not modelled yet): the layer logs its dwords per
+`D3D12_SHADER_VISIBILITY` and the per-stage sums that would give, counts that settle it on the retail title.
 `LEONIDA_GRAPHICS_ROOT_LAYOUT=pc` (diagnostic) gives every graphics signature that `pack()` layout, as before the
 console layout, so one build compares both on the retail title; `DispatchMesh` is then refused, compute is unchanged
 (`d3d12_mesh_test`). Live evidence for
