@@ -780,6 +780,7 @@ int main() {
             std::mutex gate_mutex;
             std::condition_variable gate_cv;
             bool in_wait = false;
+            bool woke_from_cv = false;
             bool release = false;
 
             std::uint64_t now_us() override {
@@ -797,6 +798,11 @@ int main() {
                 // waiters_ == 0 and a late waiter can enter wait_frame_event concurrently.
                 lock.unlock();
                 {
+                    std::lock_guard g(gate_mutex);
+                    woke_from_cv = true;
+                }
+                gate_cv.notify_all();
+                {
                     std::unique_lock g(gate_mutex);
                     gate_cv.wait(g, [this] { return release; });
                 }
@@ -813,7 +819,10 @@ int main() {
             clock.gate_cv.wait(g, [&] { return clock.in_wait; });
         }
         std::future<void> dtor = std::async(std::launch::async, [&] { pacer.reset(); });
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        {
+            std::unique_lock g(clock.gate_mutex);
+            clock.gate_cv.wait(g, [&] { return clock.woke_from_cv; });
+        }
         const int reads_before_late = clock.now_calls.load();
         std::future<Result> late = wait_async(*raw, infinite_timeout_ms);
         const bool late_ready = late.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
