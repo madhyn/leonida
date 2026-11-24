@@ -29,6 +29,12 @@
 #include "d3d12_xs_desc_clean.h"
 #include "../src/shader_library.h"  // leonida::fspx_payload_from_parts for slot 67
 
+#ifdef LEONIDA_VULKAN_DEVICE
+// PresentX wiring: the queue's console slot lands on the Xbox presentation core, which needs the Vulkan layer's
+// WindowPresenter. Other builds of this file (the mock and COM tests) have no presenter and answer S_OK.
+#include "xbox_present.h"
+#endif
+
 #include <windows.h>
 #include <dxgi1_4.h>
 #include <intrin.h>  // _ReturnAddress: slot 61 serves a console caller differently from a host one
@@ -83,7 +89,12 @@ struct DeviceProxy {
     std::atomic<std::uint32_t> frame_latency{1};
     std::atomic<bool> frame_event_scheduled{false};
     std::atomic<std::uint64_t> frame_next_token{1};
+    // The PresentX state (window, presenter, XboxPresentation) the first queue PresentX builds on this device,
+    // destroyed with the proxy. Opaque here: PresentState is defined with the queue proxy.
+    void* present_state = nullptr;
 };
+
+void destroy_present_state(void* present_state);
 
 constexpr unsigned kHeapSlots = 11;  // IUnknown + ID3D12Object + DeviceChild + Pageable + GetDesc + 2 handles
 
@@ -382,6 +393,7 @@ unsigned long proxy_release(DeviceProxy* self) {
     const unsigned long refs = self->refs.fetch_sub(1, std::memory_order_acq_rel) - 1;
     if (refs == 0) {
         ID3D12Device* real = self->real;
+        destroy_present_state(self->present_state);  // the presenter goes before the device it draws with
         delete self;
         if (real) real->Release();
     }
@@ -1337,6 +1349,85 @@ LONG CALLBACK table_overrun_handler(EXCEPTION_POINTERS* info) {
     return EXCEPTION_CONTINUE_SEARCH;  // diagnostics only: the fault goes on to the title's handlers or the crash
 }
 
+// ---- PresentX (console queue slot 32) ----
+//
+// The retail title presents through command-queue slot 32, past the PC queue's 19 slots: PresentX(plane count,
+// planes, parameters), the call the Xbox presentation core (xbox_present.h) implements. The first call on a device
+// builds a window and the Vulkan layer's presenter for it, once; a device that cannot present (no presenter, no
+// window) answers S_OK and shows nothing, so the title's frame loop keeps running either way.
+// ASSUMPTION: the window is one this layer creates. The title has a window of its own; presenting into that one is
+// a separate piece of work (old PR 8591).
+constexpr unsigned kQueuePresentX = 32;
+
+#ifdef LEONIDA_VULKAN_DEVICE
+
+struct PresentState {
+    ~PresentState() {
+        xbox.reset();
+        if (window) DestroyWindow(window);
+    }
+    HWND window = nullptr;
+    std::unique_ptr<rt::d3d12::XboxPresentation> xbox;
+};
+
+void destroy_present_state(void* present_state) { delete static_cast<PresentState*>(present_state); }
+
+LRESULT CALLBACK present_window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
+    return DefWindowProcW(window, message, wparam, lparam);
+}
+
+// Builds the window, presenter and XboxPresentation once per device. Returns the state even when `xbox` stays null:
+// the failure is logged once and not retried.
+PresentState* present_state_for(DeviceProxy* device) {
+    static std::mutex mutex;
+    const std::lock_guard lock(mutex);
+    if (auto* state = static_cast<PresentState*>(device->present_state)) return state;
+    auto* state = new (std::nothrow) PresentState;
+    if (!state) return nullptr;
+    device->present_state = state;
+    WNDCLASSW window_class{};
+    window_class.lpfnWndProc = present_window_proc;
+    window_class.hInstance = GetModuleHandleW(nullptr);
+    window_class.lpszClassName = L"LeonidaPresentX";
+    if (!RegisterClassW(&window_class) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+        std::fprintf(stderr, "[rt] d3d12_xs: PresentX window class failed (error %lu)\n", GetLastError());
+        return state;
+    }
+    state->window = CreateWindowExW(0, window_class.lpszClassName, L"Leonida", WS_OVERLAPPEDWINDOW, CW_USEDEFAULT,
+                                    CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, nullptr, nullptr,
+                                    window_class.hInstance, nullptr);
+    if (!state->window) {
+        std::fprintf(stderr, "[rt] d3d12_xs: PresentX window failed (error %lu)\n", GetLastError());
+        return state;
+    }
+    ShowWindow(state->window, SW_SHOWNOACTIVATE);
+    auto presenter = rt::d3d12::create_window_presenter(device->real, state->window);
+    if (!presenter) {
+        std::fprintf(stderr, "[rt] d3d12_xs: no window presenter on this device; PresentX shows nothing\n");
+        return state;
+    }
+    state->xbox = std::make_unique<rt::d3d12::XboxPresentation>(std::move(presenter));
+    std::fprintf(stderr, "[rt] d3d12_xs: PresentX ready (window %p)\n", static_cast<void*>(state->window));
+    return state;
+}
+
+std::uint64_t queue_present_x(ChildProxy* self, std::uint64_t plane_count, std::uint64_t planes,
+                              std::uint64_t params) {
+    PresentState* state = self->device ? present_state_for(self->device) : nullptr;
+    if (!state || !state->xbox) return hr_to_u64(S_OK);  // the title still runs with nothing presented
+    return hr_to_u64(state->xbox->PresentX(
+        static_cast<UINT>(plane_count), reinterpret_cast<const rt::d3d12::XboxPresentPlaneParameters*>(planes),
+        reinterpret_cast<const rt::d3d12::XboxPresentParameters*>(params)));
+}
+
+#else  // !LEONIDA_VULKAN_DEVICE: this translation unit stands alone (the mock and COM tests)
+
+void destroy_present_state(void*) {}
+
+std::uint64_t queue_present_x(ChildProxy*, std::uint64_t, std::uint64_t, std::uint64_t) { return hr_to_u64(S_OK); }
+
+#endif
+
 std::uint64_t queue_execute_command_lists(ChildProxy* self, std::uint64_t count_word, std::uint64_t lists_word) {
     // The array holds what the title got from the proxy: list proxies are replaced by the real lists in a copy, as
     // for every other array of objects the real device or queue reads.
@@ -1373,6 +1464,9 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
         if constexpr (K == ChildKind::queue && Slot == kQueueExecuteCommandListsX) {
             d3d12_trace::record(child_trace_name<K>(Slot));
             return queue_execute_command_lists(self, a1, a2);
+        }
+        if constexpr (K == ChildKind::queue && Slot == kQueuePresentX) {
+            return queue_present_x(self, a1, a2, a3);  // XboxPresentation::PresentX writes the trace line
         }
         if constexpr (K == ChildKind::allocator && Slot == 9) {
             // Console-only ID3D12CommandAllocator::SetAllocatorCallbackX(callback, context, ...), observed past the
@@ -3099,7 +3193,7 @@ unsigned fence_proxy_table_size() { return kFenceSlots; }
 
 bool queue_slot_overridden(unsigned slot) {
     return slot <= 2 || slot == 7 || slot == kQueueSignal || slot == kQueueWait ||
-           slot == kQueueExecuteCommandListsX;
+           slot == kQueueExecuteCommandListsX || slot == kQueuePresentX;
 }
 unsigned allocator_proxy_table_size() { return kAllocatorSlots; }
 unsigned allocator_proxy_slot_count(const void* allocator) {
