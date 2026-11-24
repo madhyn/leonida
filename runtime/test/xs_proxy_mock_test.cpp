@@ -1324,9 +1324,29 @@ int check_slot74() {
         std::uint32_t second[4] = {0x55555555, 0x66666666, 0x77777777, 0x88888888};
         const std::uint32_t first_before[4] = {first[0], first[1], first[2], first[3]};
         const std::uint32_t second_before[4] = {second[0], second[1], second[2], second[3]};
+        // The title's call (a caller the classifier takes for a guest image): the stand-in.
+        xs::set_console_caller([](std::uint64_t) { return true; });
         EXPECT(hr_of(raw(device, 74, word(first), 7, word(second))) == S_OK);
         EXPECT(mock->calls[74] == 0 && xs::device_slot_hits(74) == 1);
         EXPECT(std::memcmp(first, first_before, sizeof(first)) == 0 && std::memcmp(second, second_before, sizeof(second)) == 0);
+        // A host caller, under a classifier and with none installed: the PC slot 74 (ShaderCacheControl) with the
+        // same words where the PC device has it, and the refusal past its table where it does not (found on Windows
+        // in the review of this change: the stand-in used to take a host's ShaderCacheControl too).
+        for (const bool installed : {true, false}) {
+            if (installed)
+                xs::set_console_caller([](std::uint64_t) { return false; });
+            else
+                xs::set_console_caller(nullptr);
+            const std::uint64_t before = mock->calls[74];
+            const HRESULT hr = hr_of(raw(device, 74, 0x1, 0x2));
+            if (level >= 9) {
+                EXPECT(hr == S_OK && mock->calls[74] == before + 1);
+                EXPECT(mock->args[74][0] == 0x1 && mock->args[74][1] == 0x2);
+            } else {
+                EXPECT(hr == E_NOTIMPL && mock->calls[74] == before);
+            }
+        }
+        xs::set_console_caller(nullptr);
         EXPECT(release(device) == 0 && mock->refs == 0);
     }
     return 0;
