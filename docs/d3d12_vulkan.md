@@ -1802,8 +1802,10 @@ layout at the graphics bind point (from s0, two dwords per table, `RootArgumentL
 than being refused: the retail title creates one at start-up (29..32 dwords) and stops if it is refused. Live evidence for
 s8 and one dword per table: on the retail frame loop the VS of a textured draw reads table slots 0 and 2 through s8
 and its PS slot 1, which hold exactly the buffer, constants and texture the title bound (issue #14, comment
-7131556366, native Windows, RTX 5080). What a mesh shader reads in s8..s15 is not measured:
-`user_sgpr_census.py --base ms=16` on a corpus lists any read below s16. A root signature carries both layouts;
+7131556366, native Windows, RTX 5080). What mesh shaders read below s16 was counted on the 1.0.2.1 corpus
+(`user_sgpr_census.py --base ms=16`, issue #14 comment 7138532347): of 9,282 mesh shaders, 9,279 read nothing
+below s16; three read one 32-bit constant there (`s13` in one, `s15` in two), never a pointer, and they read it
+as 0 now. Its meaning is not established. A root signature carries both layouts;
 one that only one of them can place is created, and binding it at the other bind point invalidates the command list
 (`Close` returns `E_INVALIDARG`).
 `s0..s3` of a compute dispatch are the driver's block; the layer leaves them zero (109 CS read `s1` as a constant,
