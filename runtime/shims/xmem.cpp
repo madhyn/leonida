@@ -838,6 +838,48 @@ BOOL WINAPI XMemMapPhysicalPagesScatter(void* const* addresses, uint32_t page_co
     return TRUE;
 }
 
+// rt::xmem::copy_page_mappings_fn (xmem.h), for the console queue's CopyPageMappingsBatchX: each destination page gets
+// a view of the physical page mapped at its source page, so both addresses are one memory, as two XMemMapPhysicalPages
+// calls with the same page make them. Every source page is looked up before any destination page changes, so a source
+// range that overlaps the destination maps what was there before the call.
+bool copy_page_mappings(void* destination, const void* source, uint64_t pages, bool repeat_first) {
+    const uintptr_t to = reinterpret_cast<uintptr_t>(destination);
+    const uintptr_t from = reinterpret_cast<uintptr_t>(source);
+    constexpr uintptr_t kMax = (std::numeric_limits<uintptr_t>::max)();
+    if (!aligned_page_address(to) || !aligned_page_address(from) || pages > kMax / kPhysicalPageSize ||
+        to > kMax - pages * kPhysicalPageSize || (!repeat_first && from > kMax - pages * kPhysicalPageSize)) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return false;
+    }
+    if (!placeholder_api().available()) {
+        SetLastError(ERROR_NOT_SUPPORTED);
+        return false;
+    }
+    const std::lock_guard lock(g_phys_mutex);
+    if (!source) {
+        for (uint64_t i = 0; i < pages; ++i) {
+            if (!unmap_page(to + i * kPhysicalPageSize)) return false;
+        }
+        return true;
+    }
+    const Window* const window = find_window(to, pages * kPhysicalPageSize);
+    if (!window) {
+        SetLastError(ERROR_INVALID_ADDRESS);
+        return false;
+    }
+    std::vector<uint64_t> found(static_cast<size_t>(pages), 0);
+    for (uint64_t i = 0; i < pages; ++i) {
+        const auto it = g_mapped.find(from + (repeat_first ? 0 : i) * kPhysicalPageSize);
+        if (it != g_mapped.end()) found[static_cast<size_t>(i)] = it->second.page;
+    }
+    const DWORD protect = view_protect(*window);
+    for (uint64_t i = 0; i < pages; ++i) {
+        if (!map_page(to + i * kPhysicalPageSize, found[static_cast<size_t>(i)], protect)) return false;
+    }
+    return true;
+}
+[[maybe_unused]] const bool g_copy_page_mappings_set =(rt::xmem::copy_page_mappings_fn = &copy_page_mappings, true);
+
 UINT WINAPI XMemGetWriteWatch(DWORD flags, void* base_address, SIZE_T region_size, void** addresses, ULONG_PTR* count,
                               ULONG* granularity) {
     return GetWriteWatch(flags, base_address, region_size, addresses, count, granularity);

@@ -14,6 +14,7 @@
 //     patching this executable's own import table before the first proxy table is built (one process each).
 // Every device, queue, fence and resource here is a mock that records the calls it gets. No game data, no Xbox DLLs.
 #include "../shims/d3d12_xs_device.h"
+#include "../shims/xmem.h"
 
 #include <d3d12.h>
 #include <windows.h>
@@ -2261,6 +2262,88 @@ int check_committed_resource_leases() {
     return 0;
 }
 
+// ---- 9b. Queue slot 31: CopyPageMappingsBatchX(count, batches, pool, pool pages, flags) ----
+//
+// The batches as the retail title fills them (game_scarlett_master.exe+0xf2ca74): a 24-byte batch {destination, range
+// count, ranges}, 12-byte ranges {kind, start, count}. Each range reaches xmem's hook once; xmem is not linked here, so
+// a recording stand-in takes its place.
+
+struct PageRange31 {
+    std::uint32_t kind, start, count;
+};
+struct PageBatch31 {
+    std::uint64_t destination;
+    std::uint32_t count;
+    const PageRange31* ranges;
+};
+static_assert(sizeof(PageRange31) == 12 && sizeof(PageBatch31) == 24, "the title's batch layout");
+
+struct CopyCall {
+    std::uint64_t destination, source, pages;
+    bool repeat;
+};
+CopyCall g_copy_calls[8];
+unsigned g_copy_count = 0;
+bool g_copy_result = true;
+
+bool record_copy(void* destination, const void* source, std::uint64_t pages, bool repeat_first) {
+    if (g_copy_count < std::size(g_copy_calls))
+        g_copy_calls[g_copy_count] = {word(destination), word(source), pages, repeat_first};
+    ++g_copy_count;
+    return g_copy_result;
+}
+
+int check_queue_copy_page_mappings() {
+    Mock* mock = nullptr;
+    void* device = make_device(mock, 9, true);
+    EXPECT(device);
+    void* queue = make_queue(device);
+    EXPECT(queue);
+    Mock* const queue_mock = reinterpret_cast<Mock*>(xs::queue_proxy_real_queue(queue));
+    constexpr std::uint64_t kPage = 0x10000, kPool = 0x7000000000, kHeap = 0x9000000000;
+    const PageRange31 first[3] = {{0, 4, 2}, {3, 0, 5}, {1, 7, 3}};  // a run, left as is, one page repeated
+    const PageRange31 second[1] = {{2, 0, 6}};                        // unmapped
+    const PageBatch31 batches[3] = {{kHeap, 3, first}, {kHeap + 0x100 * kPage, 1, second}, {kHeap, 0, nullptr}};
+
+    // Without xmem the slot stays refused, as before.
+    rt::xmem::copy_page_mappings_fn = nullptr;
+    EXPECT(hr_of(raw(queue, 31, 3, word(batches), kPool, 16, 0)) == E_NOTIMPL);
+
+    rt::xmem::copy_page_mappings_fn = &record_copy;
+    g_copy_count = 0;
+    EXPECT(hr_of(raw(queue, 31, 3, word(batches), kPool, 16, 0)) == S_OK && g_copy_count == 3);
+    EXPECT(g_copy_calls[0].destination == kHeap && g_copy_calls[0].source == kPool + 4 * kPage &&
+           g_copy_calls[0].pages == 2 && !g_copy_calls[0].repeat);
+    EXPECT(g_copy_calls[1].destination == kHeap + 7 * kPage && g_copy_calls[1].source == kPool + 7 * kPage &&
+           g_copy_calls[1].pages == 3 && g_copy_calls[1].repeat);
+    // Kind 3 maps nothing but still moves the destination on (5 pages, so the repeat lands at page 7); kind 2 unmaps.
+    EXPECT(g_copy_calls[2].destination == kHeap + 0x100 * kPage && g_copy_calls[2].source == 0 &&
+           g_copy_calls[2].pages == 6);
+    EXPECT(queue_mock->calls[31] == 0);  // never forwarded to the PC queue
+
+    // A range past the pool, or of an unknown kind, is refused on its own; the others still map.
+    const PageRange31 bad[3] = {{0, 15, 2}, {7, 0, 1}, {1, 15, 4}};  // 15 + 2 > 16 pages; kind 7; page 15 is inside
+    const PageBatch31 bad_batch[1] = {{kHeap, 3, bad}};
+    g_copy_count = 0;
+    EXPECT(hr_of(raw(queue, 31, 1, word(bad_batch), kPool, 16, 0)) == E_INVALIDARG && g_copy_count == 1);
+    EXPECT(g_copy_calls[0].destination == kHeap + 3 * kPage && g_copy_calls[0].source == kPool + 15 * kPage &&
+           g_copy_calls[0].repeat);
+
+    // xmem refusing a range (no window there) makes the call fail too; no batches at all is fine.
+    g_copy_result = false;
+    EXPECT(hr_of(raw(queue, 31, 1, word(batches), kPool, 16, 0)) == E_INVALIDARG);
+    g_copy_result = true;
+    EXPECT(hr_of(raw(queue, 31, 0, 0, kPool, 16, 0)) == S_OK);
+    EXPECT(hr_of(raw(queue, 31, 2, 0, kPool, 16, 0)) == E_INVALIDARG);
+
+    rt::xmem::copy_page_mappings_fn = nullptr;
+    EXPECT(release(queue) == 0 && release(device) == 0 && mock->refs == 0);
+    std::printf("xs_proxy_mock: queue slot 31 (CopyPageMappingsBatchX) sends each range to xmem's hook (a run, one page "
+                "repeated, unmapped, left as is), refuses a range past the pool or of an unknown kind, and stays refused "
+                "without xmem\n");
+    return 0;
+}
+
 // ---- Guard-region setup failures: this executable's import table, patched before the first proxy table ----
 
 std::atomic<int> g_injected{0};
@@ -2677,7 +2760,8 @@ int main(int argc, char** argv) {
         check_render_target_layout() ||
         check_committed_resource_leases() ||
         check_slot74() ||
-        check_xbox_queue_slots())
+        check_xbox_queue_slots() ||
+        check_queue_copy_page_mappings())
         return 1;
     std::printf("xs_proxy_mock_test: PASS (%d allocations refused on purpose)\n", g_failed_news);
     return 0;
