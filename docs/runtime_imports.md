@@ -165,13 +165,19 @@ policy "other" (none is counted as returning an `HRESULT`), and they come from s
 
 The game executable imports two functions from `xg_xs.dll`, the console's texture layout library:
 `XGSuggestSwizzleMode` (2 call sites, in the helper that fills a texture description) and `XGCreateTextureComputer`
-(4 call sites, which use slots 1, 2, 8 and 10 of the returned object's vtable). The runtime has no model of the console
-resource layout, so `runtime/shims/xg_xs.cpp` computes none: both return `E_NOTIMPL` and write no layout. Two of the
-four `XGCreateTextureComputer` callers ignore the HRESULT and call through the object at once, so the shim still stores
-a static object in the out pointer; its slot 1 (read as `Release`) does nothing, and every other slot up to 31 logs its
-index and caller once and returns `E_NOTIMPL` without writing its arguments. The call shapes and the reasoning are at
-the top of the file; `xg_xs_test` covers them. Textures whose layout the game asks for are therefore not laid out yet.
-The table above was measured before this shim and still lists these two as unimplemented; they are served now.
+(4 call sites, which use slots 1, 2, 8 and 10 of the returned object's vtable). `runtime/shims/xg_xs.cpp` answers them
+from a model of the console's texture layouts, `runtime/src/console_texture_layout.h` (AMD addrlib's GFX10 rules for
+the linear, 256 B, 4 KiB and 64 KiB modes: block shapes, mip tails, the micro tile patterns, a separate stencil plane),
+ported with the computer's method table and layout structure from Marvisak/VIctory (GPL-3.0, `xg.rs` and `texture.rs`
+at `d2a4bae1f`). `XGSuggestSwizzleMode` writes `0x100 | mode` (linear for 1D, `64KB_Z_X` for depth, `64KB_R_X` for
+render targets, else `4KB_S`); the computer fills the layout (slot 2), gives an element's offset (slot 6), copies a
+subresource into (slot 8) and out of (slot 9) tiled memory, and reports the 64 KiB tiling (slot 10). Not modelled:
+compression metadata planes, and addressing or copies for the pipe/bank XOR modes and MSAA (`E_NOTIMPL`). A description
+it cannot lay out still gets a computer in the out pointer with `E_INVALIDARG`, because two of the four callers ignore
+the HRESULT and call through the object at once; that object answers every slot with `E_NOTIMPL` and writes nothing.
+`xg_xs_test` covers the model (hand-checked addresses, mip tails, a bijection and round trip over every element) and the
+shim's slots. The table above was measured before this shim and still lists these two as unimplemented; they are served
+now.
 
 Only two of these DLLs have a shim in the repository (`xmem.dll` and `d3d12_xs.dll`), and they are not complete:
 they hold 8 of the 30 unimplemented imports. The other 22 are in five DLLs (`xg_xs.dll`, `XCRDAPI.dll`, `chad.dll`,
