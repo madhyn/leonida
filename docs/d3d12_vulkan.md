@@ -1795,7 +1795,11 @@ argument in the same dword. A mesh shader's s8..s15 are below its base and read 
 for every stage. The index records the window as `"root_window": {"sgpr": 16, "dword": 8}`, and a mesh PSO whose
 mesh shader lacks it (translated before) is refused with a log line asking for the shaders stage again. The mesh
 window holds 16 dwords (s16..s31) where the others hold 24 (s8..s31): a signature that fits the graphics layout but
-not the mesh window is created with a log line, and `DispatchMesh` with it invalidates the list. Live evidence for
+not the mesh window is created with a log line, and `DispatchMesh` with it invalidates the list. A signature past
+the graphics window (more than 24 dwords from s8) goes, on the console, to the argument block behind `s[0:1]`, which
+is modelled for compute only (ROOT-SIG-SPILL-MODEL); until it is for graphics, such a signature keeps `pack()`'s
+layout at the graphics bind point (from s0, two dwords per table, `RootArgumentLayout::graphics_console` false) rather
+than being refused: the retail title creates one at start-up (29..32 dwords) and stops if it is refused. Live evidence for
 s8 and one dword per table: on the retail frame loop the VS of a textured draw reads table slots 0 and 2 through s8
 and its PS slot 1, which hold exactly the buffer, constants and texture the title bound (issue #14, comment
 7131556366, native Windows, RTX 5080). What a mesh shader reads in s8..s15 is not measured:

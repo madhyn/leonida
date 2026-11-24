@@ -1263,8 +1263,10 @@ private:
         const std::uint32_t first = first_dword(state, *p);
         write(state, first, std::uint32_t(va));
         // In the console layout of both bind points a descriptor table is one dword, the 32-bit VA of its first
-        // descriptor (the heaps live below 4 GiB); a root view keeps both halves (D3D-448).
-        if (type != rt::rootsig::ParamType::Table) write(state, first + 1, std::uint32_t(va >> 32));
+        // descriptor (the heaps live below 4 GiB); a root view keeps both halves (D3D-448). A graphics signature
+        // past the console window keeps pack()'s layout, where every address takes two dwords.
+        const bool console = is_compute(state) || state.layout->graphics_console;
+        if (!(console && type == rt::rootsig::ParamType::Table)) write(state, first + 1, std::uint32_t(va >> 32));
     }
 
     D3D12_COMMAND_LIST_TYPE type_;

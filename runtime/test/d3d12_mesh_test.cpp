@@ -175,11 +175,12 @@ int main() {
         return !blob.empty() &&
                SUCCEEDED(device->CreateRootSignature(0, blob.data(), blob.size(), IID_PPV_ARGS(&root.p)));
     };
-    // Twenty constants: s8..s27 for a pixel shader, but past a mesh shader's 16-dword window (s16..s31).
-    const auto wide_root_signature = [&](ID3D12Device* device, Ref<ID3D12RootSignature>& root) {
+    // Twenty constants: s8..s27 for a pixel shader, but past a mesh shader's 16-dword window (s16..s31). Thirty:
+    // past the graphics window (24 from s8) and the compute one (28 from s4) too, as a retail start-up signature is.
+    const auto wide_root_signature = [&](ID3D12Device* device, Ref<ID3D12RootSignature>& root, UINT values = 20) {
         D3D12_ROOT_PARAMETER param{};
         param.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-        param.Constants = {0, 0, 20};
+        param.Constants = {0, 0, values};
         D3D12_VERSIONED_ROOT_SIGNATURE_DESC root_desc{};
         root_desc.Version = D3D_ROOT_SIGNATURE_VERSION_1_0;
         root_desc.Desc_1_0 = {1, &param, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
@@ -447,9 +448,6 @@ int main() {
         list->RSSetViewports(1, &viewport);
         list6->DispatchMesh(4096, 1025, 1);
         EXPECT(list->Close() == E_INVALIDARG);
-            list->ExecuteIndirect(sig.p, 1, upload.p, 0, nullptr, 0);
-            EXPECT(list->Close() == S_OK);
-        }
         // A root signature the graphics bind point places (s8..s27) but a mesh shader's window cannot (s16..s31): a
         // vertex draw may use it, DispatchMesh may not.
         {
@@ -460,27 +458,17 @@ int main() {
             list->RSSetViewports(1, &viewport);
             list6->DispatchMesh(1, 1, 1);
             EXPECT(list->Close() == E_INVALIDARG);
-            const D3D12_COMMAND_SIGNATURE_DESC mesh_sig{12, 1, &mesh_arg, 0};
-            const D3D12_COMMAND_SIGNATURE_DESC short_sig{8, 1, &mesh_arg, 0};
-            Ref<ID3D12CommandSignature> sig, short_one;
-            EXPECT(SUCCEEDED(device->CreateCommandSignature(&mesh_sig, nullptr, IID_PPV_ARGS(&sig.p))) && sig.p);
-            EXPECT(device->CreateCommandSignature(&short_sig, nullptr, IID_PPV_ARGS(&short_one.p)) == E_INVALIDARG);
+
+            // Past every console window: still created, the graphics bind point keeping the PC layout from s0 until
+            // the argument block behind s[0:1] is modelled (refusing it stopped the retail title at start-up).
+            Ref<ID3D12RootSignature> huge;
+            EXPECT(wide_root_signature(device.p, huge, 30));
             EXPECT(SUCCEEDED(list->Reset(allocator.p, mesh_pso.p)));
-            list->SetGraphicsRootSignature(root.p);
-            list->ExecuteIndirect(sig.p, 1, upload.p, 0, nullptr, 0);
-            EXPECT(list->Close() == S_OK);
-=======
-        // A root signature the graphics bind point places (s8..s27) but a mesh shader's window cannot (s16..s31): a
-        // vertex draw may use it, DispatchMesh may not.
-        {
-            Ref<ID3D12RootSignature> wide;
-            EXPECT(wide_root_signature(device.p, wide));
-            EXPECT(SUCCEEDED(list->Reset(allocator.p, mesh_pso.p)));
-            list->SetGraphicsRootSignature(wide.p);
+            list->SetGraphicsRootSignature(huge.p);
             list->RSSetViewports(1, &viewport);
             list6->DispatchMesh(1, 1, 1);
-            EXPECT(list->Close() == E_INVALIDARG);
->>>>>>> 5fdd6abbc (D3D-448-GRAPHICS: graphics root arguments in the console layout, mesh shaders through a window)
+            EXPECT(list->Close() == E_INVALIDARG);  // a mesh shader still cannot read it
+>>>>>>> 74e55acfb (D3D-448-GRAPHICS: a graphics signature past the console window keeps the PC layout instead of being refused)
         }
         EXPECT(SUCCEEDED(queue->Signal(fence.p, 2)) && SUCCEEDED(fence->SetEventOnCompletion(2, nullptr)));
 

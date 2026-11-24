@@ -399,6 +399,9 @@ struct RootArgumentLayout {
     std::vector<Parameter> parameters;
     std::uint32_t flags = 0;  // D3D12_ROOT_SIGNATURE_FLAGS from the serialized blob
     bool graphics_ok = true;
+    // The graphics layout is the console's (pack_stage, one dword per table). False for a signature past its 24-dword
+    // window, which keeps pack()'s layout (from s0, two dwords per table) until the argument block is modelled.
+    bool graphics_console = true;
     bool mesh_ok = true;  // the graphics layout also fits a mesh shader's 16-dword window
     bool compute_ok = true;
 };

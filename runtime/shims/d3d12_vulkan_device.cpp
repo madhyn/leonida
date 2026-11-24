@@ -6423,18 +6423,30 @@ public:
         }
         // One layout per bind point (RootArgumentLayout), both the console's (D3D-448): graphics from s8, where a
         // vertex, pixel or geometry shader reads SGPR i from push dword i, and compute from s4. A mesh shader reads
-        // the same graphics window from its s16, so its 16-dword window only needs checking. The signature is
-        // refused only when neither bind point can place it.
+        // the same graphics window from its s16, so its 16-dword window only needs checking.
+        //
+        // A signature past the console's inline graphics window (24 dwords from s8) goes, on the console, to the
+        // argument block behind s[0:1], which is not modelled for graphics yet (ROOT-SIG-SPILL-MODEL does compute).
+        // Such a signature keeps pack()'s layout at the graphics bind point (from s0, two dwords per table), what
+        // the layer used before the console layout: refusing it instead stops the retail title at start-up (#974
+        // review, a 29..32-dword startup signature). The signature is refused only when no layout can place it.
         const rt::rootsig::StagePackResult graphics = rt::rootsig::pack_stage(parsed.sig, rt::rootsig::Stage::Vertex);
         const rt::rootsig::StagePackResult mesh = rt::rootsig::pack_stage(parsed.sig, rt::rootsig::Stage::Mesh);
         const rt::rootsig::StagePackResult compute = rt::rootsig::pack_stage(parsed.sig, rt::rootsig::Stage::Compute);
-        if (!graphics.ok && !compute.ok) {
+        const rt::rootsig::PackResult fallback = graphics.ok ? rt::rootsig::PackResult{} : rt::rootsig::pack(parsed.sig);
+        const bool graphics_usable = graphics.ok || fallback.ok;
+        if (!graphics_usable && !compute.ok) {
             std::fprintf(stderr, "[rt] d3d12: root signature refused: %s (compute: %s)\n", graphics.error.c_str(),
                          compute.error.c_str());
             return E_INVALIDARG;
         }
-        if (!graphics.ok)
+        if (!graphics_usable)
             std::fprintf(stderr, "[rt] d3d12: root signature usable for compute only: %s\n", graphics.error.c_str());
+        else if (!graphics.ok)
+            std::fprintf(stderr,
+                         "[rt] d3d12: root signature past the console's graphics window (%s): graphics keeps the PC "
+                         "layout from s0 until the argument block behind s[0:1] is modelled\n",
+                         graphics.error.c_str());
         else if (!mesh.ok)
             std::fprintf(stderr, "[rt] d3d12: root signature too large for a mesh shader's root window: %s\n",
                          mesh.error.c_str());
@@ -6442,14 +6454,24 @@ public:
             std::fprintf(stderr, "[rt] d3d12: root signature usable for graphics only: %s\n", compute.error.c_str());
         RootArgumentLayout layout;
         layout.flags = parsed.sig.flags;
-        layout.graphics_ok = graphics.ok;
+        layout.graphics_ok = graphics_usable;
+        layout.graphics_console = graphics.ok;
         layout.mesh_ok = graphics.ok && mesh.ok;
         layout.compute_ok = compute.ok;
-        for (std::size_t i = 0; i < parsed.sig.params.size(); ++i)
-            layout.parameters.push_back({parsed.sig.params[i].type,
-                                         graphics.ok ? graphics.first_sgpr[i] : rt::rootsig::kNoSgpr,
-                                         parsed.sig.params[i].num_values,
+        for (std::size_t i = 0; i < parsed.sig.params.size(); ++i) {
+            std::uint32_t first = rt::rootsig::kNoSgpr;
+            if (graphics.ok) {
+                first = graphics.first_sgpr[i];
+            } else if (fallback.ok) {
+                for (std::uint32_t d = 0; d < fallback.dword_count; ++d)
+                    if (fallback.provenance[d].param_index == i) {
+                        first = d;
+                        break;
+                    }
+            }
+            layout.parameters.push_back({parsed.sig.params[i].type, first, parsed.sig.params[i].num_values,
                                          compute.ok ? compute.first_sgpr[i] : rt::rootsig::kNoSgpr});
+        }
         register_static_samplers(parsed.sig);
         auto* signature = new RootSignature(
             std::move(layout), leonida::sha256_hex({static_cast<const std::uint8_t*>(blob), size}));
