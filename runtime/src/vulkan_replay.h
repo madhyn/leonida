@@ -782,7 +782,10 @@ struct GraphicsPipeline {
     // unbound (D3D12 allows it; dynamic rendering needs the formats to agree). Bit i: colour slot i, bit 8: depth
     // and stencil. Null when it cannot be built.
     static constexpr std::uint32_t unbound_depth = 1u << 8;
-    std::function<VkPipeline(std::uint32_t unbound)> variant;
+    static constexpr std::uint32_t rectangle_stage = 1u << 9;
+    // IA topology requiring a fourth-corner geometry stage. Zero when the PSO already contains the stage.
+    std::uint32_t rectangle_variant_topology = 0;
+    std::function<VkPipeline(std::uint32_t flags)> variant;
     std::uint32_t samples = 1;  // rasterizationSamples; every bound attachment must have this count
 };
 
@@ -2196,6 +2199,8 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
     // Slots the pipeline has a format for but the draw leaves unbound take a variant whose format there is
     // VK_FORMAT_UNDEFINED: D3D12 discards those writes, Vulkan wants the formats to match the attachments.
     std::uint32_t unbound = 0;
+    if (pipeline->rectangle_variant_topology && draw.topology == pipeline->rectangle_variant_topology)
+        unbound |= GraphicsPipeline::rectangle_stage;
     for (std::size_t slot = 0; slot < p.colors.size(); ++slot)
         if (pipeline->color_formats[slot] != VK_FORMAT_UNDEFINED && !p.colors[slot].id) unbound |= 1u << slot;
     if (pipeline->depth_format != VK_FORMAT_UNDEFINED && !p.depth.id) unbound |= GraphicsPipeline::unbound_depth;

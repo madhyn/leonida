@@ -856,6 +856,10 @@ The compute path, end to end:
     `d3d12_state_sweep_test` checks the mapping against the host on the same adapter: 482 full-screen draws over
     every blend factor pair, blend operation, write mask, comparison function and stencil operation, with the stencil
     plane read back, are byte-identical on an RTX 5080 and a Radeon iGPU.
+  - A triangle-family PSO can draw Xbox rectangle lists. When the input assembler selects topology 17, replay
+    selects a geometry-stage variant that emits the fourth corner after vertex shading. It requires
+    `geometryShader` and a vertex pipeline without an application geometry stage. A later triangle draw uses the
+    original PSO. The translated-draw GPU test switches between both primitives on one PSO and checks every pixel.
   - **Logic ops** come from `RenderTarget[0]`, as in D3D12, and apply to every target (Vulkan has one per
     pipeline; it skips float formats). **`DepthClipEnable = FALSE`** is depth clamping: D3D12 clamps output depth
     to the viewport's range anyway.

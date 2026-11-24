@@ -840,6 +840,23 @@ struct DeviceState {
         return shader_library.loaded() ? &shader_library : nullptr;
     }
 
+    // PSOs that differ only in fixed state can share the linked vertex program. The pixel entry distinguishes
+    // f16 interface variants. Compare the actual words as well, and let the last PSO release its snapshot.
+    using VertexWords = std::vector<std::uint32_t>;
+    std::mutex rectangle_vertices_mutex;
+    std::map<std::pair<const leonida::ShaderEntry*, const leonida::ShaderEntry*>,
+             std::weak_ptr<const VertexWords>> rectangle_vertices;
+
+    std::shared_ptr<const VertexWords> retain_rectangle_vertex(const leonida::ShaderEntry* vs,
+                                                               const leonida::ShaderEntry* linked_ps, const VertexWords& words) {
+        std::lock_guard lock(rectangle_vertices_mutex);
+        auto& weak = rectangle_vertices[{vs, linked_ps}];
+        if (auto shared = weak.lock(); shared && *shared == words) return shared;
+        auto shared = std::make_shared<const VertexWords>(words);
+        weak = shared;
+        return shared;
+    }
+
     bool depth_usable(VkFormat format) const {
         VkFormatProperties properties{};
         format_properties(info.physical, format, &properties);
@@ -3702,6 +3719,15 @@ public:
                          pixel ? "fragmentStoresAndAtomics" : "vertexPipelineStoresAndAtomics");
             return E_NOTIMPL;
         }
+        const auto topology_bits = std::bit_cast<std::uint32_t>(desc.PrimitiveTopologyType);
+        if (!mesh && topology_bits != leonida::topology_type_rect_list)
+            graphics_.rectangle_variant_topology = leonida::topology_rect_list;
+        if (!mesh && !geometry && device_.info.features.geometryShader &&
+            topology_bits == D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE) {
+            const bool linked =
+                ps_stage.entry && (!ps_stage.entry->f16_halves.empty() || !vs_stage.entry->f16_halves.empty());
+            rectangle_vertex_ = device_.retain_rectangle_vertex(vs_stage.entry, linked ? ps_stage.entry : nullptr, vs_stage.words);
+        }
         for (Stage& stage : stages) {
             if (!stage.entry) continue;
             // After the f16 link above, which can also edit the pixel shader's words.
@@ -4401,6 +4427,17 @@ private:
         info.pColorBlendState = &blend;
         info.pDynamicState = &dynamic;
         info.layout = graphics_.layout;
+        std::vector<VkPipelineShaderStageCreateInfo> rectangle_stages;
+        if (unbound & leonida::GraphicsPipeline::rectangle_stage) {
+            rectangle_stages.assign(info.pStages, info.pStages + info.stageCount);
+            VkPipelineShaderStageCreateInfo geometry{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+            geometry.stage = VK_SHADER_STAGE_GEOMETRY_BIT;
+            geometry.module = rectangle_module_;
+            geometry.pName = "main";
+            rectangle_stages.push_back(geometry);
+            info.stageCount = static_cast<std::uint32_t>(rectangle_stages.size());
+            info.pStages = rectangle_stages.data();
+        }
         VkPipeline pipeline = VK_NULL_HANDLE;
         if (device_.context->vk.vkCreateGraphicsPipelines(device_.info.device, device_.pipeline_cache(), 1,
                                                           &info, nullptr, &pipeline) != VK_SUCCESS)
@@ -4408,10 +4445,37 @@ private:
         return pipeline;
     }
 
+    // Called under variants_mutex_. Attachment combinations reuse the same geometry module.
+    VkShaderModule rectangle_module() {
+        if (rectangle_module_ || !rectangle_vertex_) return rectangle_module_;
+        std::string why;
+        const auto words = leonida::rect_list_geometry(*rectangle_vertex_, why);
+        if (words.empty()) {
+            std::fprintf(stderr, "[rt] d3d12: cannot draw rectangle list: %s\n", why.c_str());
+            rectangle_vertex_.reset();
+            return VK_NULL_HANDLE;
+        }
+        VkShaderModuleCreateInfo module{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        module.codeSize = words.size() * sizeof(words.front());
+        module.pCode = words.data();
+        VkShaderModule handle = VK_NULL_HANDLE;
+        if (device_.context->vk.vkCreateShaderModule(device_.info.device, &module, nullptr, &handle) != VK_SUCCESS)
+            return VK_NULL_HANDLE;
+        modules_.push_back(handle);
+        rectangle_module_ = handle;
+        rectangle_vertex_.reset();
+        return handle;
+    }
+
     // Built on first use and kept until the PSO is released (replay may call this from any queue).
     VkPipeline variant(std::uint32_t unbound) {
         std::lock_guard lock(variants_mutex_);
         if (const auto it = variants_.find(unbound); it != variants_.end()) return it->second;
+        if ((unbound & leonida::GraphicsPipeline::rectangle_stage) && !rectangle_module()) {
+            log_once("a rectangle-list draw needs a compatible vertex pipeline and geometryShader; topology",
+                     leonida::topology_rect_list);
+            return VK_NULL_HANDLE;
+        }
         const VkPipeline pipeline = build(unbound);
         if (!pipeline) {
             log_once("a pipeline variant for unbound attachment slots could not be built; slots", int(unbound));
@@ -4433,6 +4497,8 @@ private:
     leonida::SubgroupRequest compute_subgroup_{};  // decided at creation, applied by compile_compute
     VkShaderModule module_ = VK_NULL_HANDLE;
     std::vector<VkShaderModule> modules_;
+    std::shared_ptr<const DeviceState::VertexWords> rectangle_vertex_;
+    VkShaderModule rectangle_module_ = VK_NULL_HANDLE;
     VkDeviceSize code_base_ = 0;
     VkDeviceSize code_bytes_ = 0;
     bool registered_ = false;

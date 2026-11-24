@@ -175,6 +175,7 @@ int main() {
         info.queue = d.queue;
         info.queue_family = d.family;
         info.buffer_device_address = true;
+        info.features = d.enabled;
         info.shader_dir = (root_dir / "spirv").string();
         ID3D12Device* inner = nullptr;
         EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&inner))));
@@ -293,7 +294,8 @@ int main() {
         list->ResourceBarrier(2, barriers);
         // The first command list already contains the vertex upload. Reuse it for subsequent frames
         // after the preceding submission's fence has completed and its readback is available.
-        const auto render_frame = [&](UINT64 frame, float x_offset, float bias) -> int {
+        const auto render_frame = [&](UINT64 frame, float x_offset, float bias,
+                                      D3D_PRIMITIVE_TOPOLOGY last_topology = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST) -> int {
             if (frame > 1) {
                 EXPECT(SUCCEEDED(allocator->Reset()));
                 EXPECT(SUCCEEDED(list->Reset(allocator.p, pso.p)));
@@ -323,6 +325,7 @@ int main() {
                                    {0, {1, -1, 0.125f + bias, 0}, 6},  // bottom right: same V#, other constants
                                    {1, {0, 0, 0.25f + bias, 0}, 3}};   // bottom left: the second V#
             for (const Draw& draw : draws) {
+                if (draw.slot == 1) list->IASetPrimitiveTopology(last_topology);
                 list->SetGraphicsRootDescriptorTable(0, D3D12_GPU_DESCRIPTOR_HANDLE{gpu + std::uint64_t(draw.slot) * step});
                 list->SetGraphicsRoot32BitConstants(1, 4, draw.constants, 0);
                 list->DrawInstanced(draw.vertices, 1, 0, 0);
@@ -370,6 +373,31 @@ int main() {
         }
 #endif
         EXPECT(render_frame(1, 0.0f, 0.0f) == 0);
+#ifndef LEONIDA_M15_GUEST
+        if (d.enabled.geometryShader) {
+            // The last draw covers half the lower-left quadrant as a triangle. The Xbox rectangle primitive
+            // fills the quadrant through the same PSO. The other three quadrants keep their original values.
+            const auto triangles = pixels;
+            constexpr auto rectangles = static_cast<D3D_PRIMITIVE_TOPOLOGY>(17);
+            const Pixel lower_left = {0.75f, 0.25f, 0.75f, 1.0f};
+            for (UINT64 frame : {2u, 4u}) {
+                EXPECT(render_frame(frame, 0.0f, 0.0f, rectangles) == 0);
+                for (UINT y = 0; y < target_extent; ++y) {
+                    for (UINT x = 0; x < target_extent; ++x) {
+                        const auto i = y * target_extent + x;
+                        const auto& want = y >= target_extent / 2 && x < target_extent / 2 ? lower_left : triangles[i];
+                        if (pixels[i] != want) {
+                            std::fprintf(stderr, "rectangle draw mismatch at (%u, %u) in frame %llu\n", x, y,
+                                         static_cast<unsigned long long>(frame));
+                            return 1;
+                        }
+                    }
+                }
+                EXPECT(render_frame(frame + 1, 0.0f, 0.0f) == 0);
+                EXPECT(pixels == triangles);
+            }
+        }
+#endif
         for (auto* r : {&vertex_buffer, &upload, &readback, &target}) r->reset();
         pso.reset();
         root.reset();
