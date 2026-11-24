@@ -6789,6 +6789,16 @@ public:
 
     // A constant-buffer view is a 16-byte GFX10 raw buffer V# in the first half of the slot (zeros in the rest).
     // A null description, zero address, or zero size leaves the whole slot zeroed (null V#: reads return 0).
+    // Translates an external/title host VA into an arena-relative offset so a shader adding
+    // heap_base (arena.address) lands on the Vulkan-imported BDA.
+    std::uint64_t resolve_shader_va(std::uint64_t va) const {
+        if (!va || va < state_.arena.size || !state_.context || !state_.arena.address) return va;
+        const auto bda = state_.context->resolve_title_bda(va);
+        if (!bda || *bda < state_.arena.address) return va;
+        const std::uint64_t rel = *bda - state_.arena.address;
+        return (rel >> 48) == 0 ? rel : va;
+    }
+
     void STDMETHODCALLTYPE CreateConstantBufferView(const D3D12_CONSTANT_BUFFER_VIEW_DESC* desc,
                                                     D3D12_CPU_DESCRIPTOR_HANDLE destination) override {
         d3d12_trace::record("ID3D12Device::CreateConstantBufferView");
@@ -6796,7 +6806,7 @@ public:
         std::memset(reinterpret_cast<void*>(destination.ptr), 0, kDescriptorSize);
         if (!desc || !desc->BufferLocation || !desc->SizeInBytes) return;
         leonida::gfx10::Buffer buffer{};
-        buffer.address = desc->BufferLocation;
+        buffer.address = resolve_shader_va(desc->BufferLocation);
         buffer.stride = 0;
         buffer.num_records = desc->SizeInBytes;
         buffer.format = leonida::gfx10::format_from_vulkan(VK_FORMAT_R32_UINT);
@@ -6833,7 +6843,7 @@ public:
                 log_once("shader-resource view dimension not supported for buffer:", desc->ViewDimension);
                 return;
             }
-            const UINT64 base_va = const_cast<Resource*>(r)->GetGPUVirtualAddress();
+            const UINT64 base_va = resolve_shader_va(const_cast<Resource*>(r)->GetGPUVirtualAddress());
             const UINT64 width = r->desc().Width;
             if (!base_va || !desc->Buffer.NumElements || (desc->Buffer.Flags & ~D3D12_BUFFER_SRV_FLAG_RAW)) return;
             leonida::gfx10::Buffer buffer{};
@@ -7038,8 +7048,8 @@ public:
                 return;
             }
         }
-        const UINT64 va = resource->GetGPUVirtualAddress();
-        const UINT64 counter_va = counter ? counter->GetGPUVirtualAddress() : 0;
+        const UINT64 va = resolve_shader_va(resource->GetGPUVirtualAddress());
+        const UINT64 counter_va = counter ? resolve_shader_va(counter->GetGPUVirtualAddress()) : 0;
         if (!va || (counter && !counter_va)) return;
         g::Buffer buffer{};
         buffer.address = va + view.FirstElement * unit;
