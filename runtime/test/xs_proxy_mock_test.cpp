@@ -2230,6 +2230,7 @@ int check_console_command_list() {
     EXPECT(xs::console_to_pc_list_slot(60) == 58);   // EndEvent
     EXPECT(xs::console_to_pc_list_slot(61) == 59);   // ExecuteIndirect
     EXPECT(xs::console_to_pc_list_slot(85) == 16);   // CopyTextureRegion
+    EXPECT(xs::console_to_pc_list_slot(139) == 10);  // Reset, as the retail title calls it
     EXPECT(xs::console_to_pc_list_slot(146) == 80);  // GCL7 Barrier
     EXPECT(xs::console_to_pc_list_slot(148) == xs::kListNotForwarded); // AllocateUploadMemory
 
@@ -2332,6 +2333,15 @@ int check_console_command_list() {
     EXPECT(hr_of(raw(list_proxy, 10, word(allocator), 0, 0, 0)) == S_OK);
     EXPECT(real_list->calls[10] == 1);
     EXPECT(real_list->args[10][0] == word(real_allocator));
+    std::memcpy(&c18, reinterpret_cast<const void*>(base + 0x18), sizeof(c18));
+    EXPECT(c18 == expected_limit);
+
+    // Console slot 139 is Reset as the retail title calls it: the same PC slot 10, allocator unwrapped, cursor
+    // re-pinned, and the list's own slot 139 never reached.
+    std::memcpy(reinterpret_cast<void*>(base + 0x18), &zero, sizeof(zero));
+    EXPECT(hr_of(raw(list_proxy, 139, word(allocator), 0, 0, 0)) == S_OK);
+    EXPECT(real_list->calls[10] == 2 && real_list->calls[139] == 0);
+    EXPECT(real_list->args[10][0] == word(real_allocator) && real_list->args[10][1] == 0);
     std::memcpy(&c18, reinterpret_cast<const void*>(base + 0x18), sizeof(c18));
     EXPECT(c18 == expected_limit);
 

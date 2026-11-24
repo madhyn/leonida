@@ -1232,8 +1232,11 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
                                                      std::uint64_t, std::uint64_t);
             auto** const real_vtable = *reinterpret_cast<void***>(self->real);
             UnwrappedArray heaps;
-            if constexpr (Slot == 10) {
+            if constexpr (pc == 10) {
+                // Reset(allocator, pso): console slot 10, and slot 139 as the retail title calls it. The title hands
+                // its allocator proxy; the real list takes the real one (and a wrapped pipeline state the same way).
                 a1 = unwrap_object(a1);
+                a2 = unwrap_object(a2);
                 self->pin_cursor_at_limit();
             } else if constexpr (Slot == kConsoleExecuteBundle) {
                 a1 = unwrap_object(a1);
