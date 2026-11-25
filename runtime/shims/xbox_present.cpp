@@ -80,6 +80,29 @@ XboxPresentation::~XboxPresentation() {
     presenter_->set_abort(nullptr);
 }
 
+void XboxPresentation::note_present_fps() noexcept {
+    static const bool enabled = [] {
+        const char* v = std::getenv("LEONIDA_FPS_LOG");
+        return v && std::strcmp(v, "1") == 0;
+    }();
+    const auto total = presents_.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (!enabled) return;
+    static std::mutex m;
+    static auto last = std::chrono::steady_clock::now();
+    static std::uint64_t last_total = 0;
+    const std::lock_guard lock(m);
+    const auto now = std::chrono::steady_clock::now();
+    const double secs = std::chrono::duration<double>(now - last).count();
+    if (secs >= 5.0) {
+        const auto frames = total - last_total;
+        std::fprintf(stderr, "[rt] fps: %.1f (frames=%llu in %.2fs, total=%llu)\n",
+                     double(frames) / secs, static_cast<unsigned long long>(frames), secs,
+                     static_cast<unsigned long long>(total));
+        last = now;
+        last_total = total;
+    }
+}
+
 void XboxPresentation::log_pacing_summary() const {
     const leonida::FramePacingSummary s = pacer_.pacing_summary();
     std::fprintf(stderr,
@@ -192,7 +215,7 @@ HRESULT XboxPresentation::present_x(UINT plane_count, const XboxPresentPlanePara
         const HRESULT result = presenter_->present_blank(sync_interval);
         if (SUCCEEDED(result)) {
             pacer_.note_untokened_present();
-            ++presents_;
+            note_present_fps();
         }
         return present_diag(__LINE__, result);
     }
@@ -323,7 +346,7 @@ HRESULT XboxPresentation::present_x(UINT plane_count, const XboxPresentPlanePara
         pacer_.commit_present_token(token, plane_count,
                                     tear && presenter_->last_present_tore() ? leonida::PresentSync::immediate
                                                                             : leonida::PresentSync::vblank);
-        ++presents_;
+        note_present_fps();
         return S_OK;
     }
 
@@ -354,7 +377,7 @@ HRESULT XboxPresentation::present_x(UINT plane_count, const XboxPresentPlanePara
     pacer_.commit_present_token(token, plane_count,
                                 tear && presenter_->last_present_tore() ? leonida::PresentSync::immediate
                                                                         : leonida::PresentSync::vblank);
-    ++presents_;
+    note_present_fps();
     return S_OK;
 }
 

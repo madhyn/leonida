@@ -398,6 +398,7 @@ int wmain(int argc, wchar_t** argv) {
                                                    : "error: cannot create the trace file\n");
         return 2;
     }
+    rt::startup_trace::install_skip_int3();
     // The console's Zen 2 instructions this CPU may lack (docs/cpu_features.md): emulated on #UD. Installed after the
     // trace's handler so it runs first, and an emulated instruction is not recorded as an exception.
     if (const auto host = rt::cpu_emulation::detect_host(); !host.sse4a || !host.clzero || !host.monitorx || !host.clwb)
