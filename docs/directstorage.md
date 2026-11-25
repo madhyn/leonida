@@ -187,7 +187,17 @@ The first boot with the executable settles most of this: the dry-run report show
 - `runtime/src/bcpack.cpp` ports the interleaved rANS and strict block rebuilders from `tools/bcpack.py` for
   BC1, BC3, BC4, BC5, BC6H and BC7. The predictor window holds 256 blocks. The build generates the lookup
   tables from the existing codec modules. Damaged streams and missing predictors or inconsistent blocks
-  exceeding the reference tolerance give `E_DSTORAGE_DECOMPRESSION_ERROR`. BC2 has no reference decoder.
+  exceeding the tolerance give `E_DSTORAGE_DECOMPRESSION_ERROR`. BC2 has no reference decoder.
+  In fitted mode with a profile, a BC6H/BC7 request may have up to `max(2, blocks / 32)` **lost** blocks:
+  blocks whose endpoint or index predictor chain starts at a history entry the profile does not know. They
+  are rebuilt from the bits the profile has, so their colours can be wrong, and each such request is logged
+  (`[rt] dstorage: BC7 request approximated N of M blocks ...`; the first eight, then at powers of two).
+  `LEONIDA_DSTORAGE_LOST_DIVISOR=N` sets the divisor; 1024 is the reference decoder's limit
+  (`_loose_limit` in `tools/bcpack.py`), which refused such requests outright and left the whole destination
+  untouched. On the 1.0.2.1 package two BC7 requests in `data/ttdb/props/octa_imposters.ttpf` failed at every
+  boot this way (one unknown endpoint entry each, 5 of 1,536 and 15 of 768 blocks lost with a locally built
+  profile); with the default they are published. Inconsistent blocks (anchor or p-bit) keep the 1-in-1,024
+  limit, and strict mode (`LEONIDA_DSTORAGE_FITTED=0`) refuses any lost block as before.
   The runtime accepts the reference's fitted BC1/3/4/5 predictors for streamed art.
   `LEONIDA_DSTORAGE_FITTED=0` requires confirmed entries. Fitted blocks can differ from console output.
   The runtime stage of `make_game.py` generates `<work>/shaders/bcpack/history.bcph` locally.
