@@ -98,6 +98,42 @@ void pump() {
     }
 }
 
+namespace srgb_surface_test {
+PFN_vkGetInstanceProcAddr real_instance = nullptr;
+PFN_vkGetPhysicalDeviceSurfaceFormatsKHR real_formats = nullptr;
+bool unorm_only = false;
+
+VKAPI_ATTR VkResult VKAPI_CALL formats(VkPhysicalDevice gpu, VkSurfaceKHR surface, std::uint32_t* count,
+                                       VkSurfaceFormatKHR* out) {
+    if (!unorm_only) return real_formats(gpu, surface, count, out);
+    std::vector<VkSurfaceFormatKHR> supported;
+    const auto result = vktest::enumerate_all(supported, [&](std::uint32_t* n, VkSurfaceFormatKHR* data) {
+        return real_formats(gpu, surface, n, data);
+    });
+    if (result != VK_SUCCESS) return result;
+    // Expose only formats the driver really supports. All image operations
+    // and presentation still go to Vulkan.
+    std::erase_if(supported, [](const VkSurfaceFormatKHR& f) {
+        return f.colorSpace != VK_COLOR_SPACE_SRGB_NONLINEAR_KHR ||
+               (f.format != VK_FORMAT_B8G8R8A8_UNORM && f.format != VK_FORMAT_R8G8B8A8_UNORM);
+    });
+    const auto total = static_cast<std::uint32_t>(supported.size());
+    if (!out) {
+        *count = total;
+        return VK_SUCCESS;
+    }
+    *count = std::min(*count, total);
+    std::copy_n(supported.begin(), *count, out);
+    return *count == total ? VK_SUCCESS : VK_INCOMPLETE;
+}
+
+VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL get_instance(VkInstance instance, const char* name) {
+    if (std::strcmp(name, "vkGetPhysicalDeviceSurfaceFormatsKHR") == 0)
+        return reinterpret_cast<PFN_vkVoidFunction>(formats);
+    return real_instance(instance, name);
+}
+}  // namespace srgb_surface_test
+
 struct Px {
     int r, g, b;
 };
@@ -356,7 +392,11 @@ int main() {
 
     {
         rt::d3d12::VulkanDeviceInfo info{};
-        info.get_instance_proc = d.instance_proc;
+        srgb_surface_test::real_instance = d.instance_proc;
+        srgb_surface_test::real_formats =
+            d.instance_fn<PFN_vkGetPhysicalDeviceSurfaceFormatsKHR>("vkGetPhysicalDeviceSurfaceFormatsKHR");
+        EXPECT(srgb_surface_test::real_formats);
+        info.get_instance_proc = srgb_surface_test::get_instance;
         info.instance = d.instance;
         info.physical = d.physical;
         info.device = d.device;
@@ -620,6 +660,40 @@ int main() {
         EXPECT(!frame.srgb());
         EXPECT(region_is(frame, 0, 0, width, height, {51, 153, 230}));
         std::printf("1 plane, sRGB source (swapchain follows): ok\n");
+
+        // Some surfaces expose no sRGB swapchain format. Restrict the real format list and reach the fallback by
+        // switching from the SDR UNORM frame above to an sRGB source. Linear 0.25/0.5/0.75 must arrive encoded, with
+        // the channels in the right order, even for cropped and scaled presents.
+        if (frame.format == VK_FORMAT_B8G8R8A8_UNORM || frame.format == VK_FORMAT_R8G8B8A8_UNORM) {
+            srgb_surface_test::unorm_only = true;
+            const FLOAT midtones[4] = {0.25f, 0.5f, 0.75f, 1.0f};
+            const auto check_srgb_fallback = [&](Source& s, const D3D12_RECT* rect = nullptr) {
+                if (!next_token(token)) return false;
+                auto p = plane_of(s, token, rect);
+                return xbox.PresentX(1, &p, nullptr) == S_OK && grab(frame) && !frame.srgb() &&
+                       region_is(frame, 0, 0, width, height, {137, 188, 225}, 1);
+            };
+            EXPECT(fill(srgb, midtones));
+            EXPECT(check_srgb_fallback(srgb));
+            Source bgra_srgb;
+            EXPECT(make_source(DXGI_FORMAT_B8G8R8A8_UNORM_SRGB, bgra_srgb));
+            EXPECT(fill(bgra_srgb, midtones));
+            EXPECT(check_srgb_fallback(bgra_srgb));
+            const D3D12_RECT crop{10, 12, LONG(width) - 10, LONG(height) - 12};
+            EXPECT(check_srgb_fallback(srgb, &crop));
+            EXPECT(check_srgb_fallback(bgra_srgb, &crop));
+
+            srgb_surface_test::unorm_only = false;
+            EXPECT(next_token(token));
+            plane = plane_of(rgba, token);
+            EXPECT(xbox.PresentX(1, &plane, nullptr) == S_OK);
+            EXPECT(grab(frame));
+            EXPECT(region_is(frame, 0, 0, width, height, {51, 153, 230}));
+            EXPECT(fill(srgb, grey));  // the later composition checks use this source
+            std::printf("1 plane, sRGB source on an SDR UNORM swapchain: 1:1, crop/scale, RGBA and BGRA ok\n");
+        } else {
+            std::printf("SDR UNORM swapchain not available: sRGB fallback case skipped\n");
+        }
 
         // 2 planes sharing a token, both SDR: plane 1 is an overlay (section 4.5), and an opaque one covers plane 0.
         // (The plane composition has its own checks further down.)
