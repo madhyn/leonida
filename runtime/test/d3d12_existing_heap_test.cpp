@@ -1236,7 +1236,7 @@ int check_placed_target_backing(ID3D12Device* device) {
 
 // Two sampled BC placements have distinct T#s. A CPU write to the first and a GPU copy into
 // the second must each promote only their destination and keep previously copied descriptors usable.
-int check_shared_bc_placements(ID3D12Device* device) {
+int check_shared_bc_placements(ID3D12Device* device, bool must_share = false) {
     const char* who = "shared slot-133 BC images";
     if (!rt::d3d12::bindless_set_layout(device)) return 0;
     constexpr UINT width = 32, height = 32, pitch = width / 4 * 8;
@@ -1259,6 +1259,8 @@ int check_shared_bc_placements(ID3D12Device* device) {
     const auto second = rt::d3d12::bindless_hash_lookup(device, bv);
     EXPECT(first && second && first != second);
     const bool shared = !rt::d3d12::vulkan_memory_flags(a.p);
+    const char* defer = std::getenv("LEONIDA_PLACED_IMAGE_DEFER");
+    EXPECT(shared || !must_share || (defer && !std::strcmp(defer, "0")));
     EXPECT(bool(rt::d3d12::vulkan_memory_flags(b.p)) == !shared);
     std::array<std::uint8_t, pitch * height / 4> pattern{}, result{};
     for (std::size_t i = 0; i < pattern.size(); ++i) pattern[i] = std::uint8_t(i * 13 + 71);
@@ -2099,6 +2101,7 @@ int main(int argc, char** argv) {
             no_host_copy.host_image_copy = false;
             Ref<ID3D12Device> staged;
             if (FAILED(rt::d3d12::create_vulkan_device(no_host_copy, IID_PPV_ARGS(&staged.p)))) return 1;
+            failures += check_shared_bc_placements(staged.p, true);
             failures += check_mapped_plane(staged.p);
             failures += check_mapped_bc_array(staged.p);
         }

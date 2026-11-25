@@ -3059,7 +3059,8 @@ The console has two list topologies Vulkan lacks: rectangle list (`IASetPrimitiv
   the driver's), as on D3D12.
 - GPU-writable slot-133 images on a default heap bind memory when replay, presentation or creation of a shader
   view first needs their Vulkan image. D3D12 placement and logical attachment views can precede that bind.
-  A CPU-fillable, typed BC texture can initially sample an immutable zero image of the same format, extent,
+  A CPU-fillable, typed BC texture (filled by host copies or the staged upload) can initially sample
+  an immutable zero image of the same format, extent,
   layer count and mip count. A CPU upload or explicit GPU command gives the placement private backing and
   republishes its existing descriptor keys. The cache holds at most 256 MiB. `LEONIDA_PLACED_IMAGE_DEFER=0`
   restores eager binding.

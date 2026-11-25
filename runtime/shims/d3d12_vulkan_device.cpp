@@ -8293,9 +8293,17 @@ public:
             const char* value = std::getenv("LEONIDA_PLACED_IMAGE_DEFER");
             return !value || std::strcmp(value, "0");
         }();
+        // A device without host copies has no other way to fill a title image: a refresh before a submission may not
+        // use a staged copy through the queue (host_copy_now). Its linear movie planes are staged too.
+        const bool no_host_copy = !device_.copy_memory_to_image && cpu_visible() && samples == 1 &&
+                                  !format.d24_as_float && !format.rgb96;
         // Private BC copies start with the exact same zero blocks as the shared image. The host
         // transition and clear complete before a private view is published, including during command prepare.
-        if (defer_placed && origin == TitleImageOrigin::placed && host_transfer_ && device_.bindless &&
+        // Without host copies the staged upload fills the private image, and the first shader submission clears what
+        // it has not filled.
+        const bool can_fill = host_transfer_ || (no_host_copy && stage_title && allow_staged_title &&
+                                                 device_.image_requirements);
+        if (defer_placed && origin == TitleImageOrigin::placed && can_fill && device_.bindless &&
             desc_.Flags == D3D12_RESOURCE_FLAG_NONE && desc_.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
             desc_.SampleDesc.Count == 1 && asked_castable.empty() && !format.typeless &&
             leonida::block_format(format.format, format.aspects).block > 1) {
@@ -8304,11 +8312,7 @@ public:
                 shared_zero_ = device_.zero_sampled_image(desc_, format, footprint.size);
         }
         std::uint32_t plain_bits = 0;
-        // A device without host copies has no other way to fill a title image: a refresh before a submission may not
-        // use a staged copy through the queue (host_copy_now). Its linear movie planes are staged too.
-        const bool no_host_copy = !device_.copy_memory_to_image && cpu_visible() && samples == 1 &&
-                                  !format.d24_as_float && !format.rgb96;
-        if (stage_title && !shared_zero_ && allow_staged_title && origin != TitleImageOrigin::ordinary &&
+        if (stage_title && (!shared_zero_ || no_host_copy) && allow_staged_title && origin != TitleImageOrigin::ordinary &&
             (no_host_copy || (!linear_placement && host_transfer_)) && format.aspects == VK_IMAGE_ASPECT_COLOR_BIT &&
             device_.image_requirements) {
             for (std::uint32_t i = 0; i < device_.memory.memoryTypeCount; ++i) {
@@ -8334,6 +8338,7 @@ public:
             image_ = VK_NULL_HANDLE;
             memory_ = VK_NULL_HANDLE;
             staged_title_ = false;
+            shared_zero_ = VK_NULL_HANDLE;
             log_once("no room for a staged title image; retrying host-copyable backing, format", int(info.format));
             return create_texture(format, asked_castable, origin, false);
         };
@@ -8560,6 +8565,7 @@ private:
         }
         if (shared_zero_) {
             if (host_transfer_ && !host_initialize()) return false;
+            if (!host_transfer_) device_.context->note_shader_image(id());  // zeros until something fills it
             publish_streamed_texture();
         }
         return true;
@@ -9309,10 +9315,11 @@ private:
     std::shared_ptr<const leonida::TileHeapAllocation> heap_range_;
 };
 
-// One immutable, host-zeroed BC image per exact view shape. It has the right sampled format, extent,
+// One immutable, zeroed BC image per exact view shape (zeroed on the host, or by the first shader submission). It has
+// the right sampled format, extent,
 // mip count and zero-block decoding even before the title first supplies data or copies into the placement.
 VkImage DeviceState::zero_sampled_image(const D3D12_RESOURCE_DESC& d, const Format& format, VkDeviceSize bytes) {
-    if (!host_transfer_format(format.format)) return VK_NULL_HANDLE;
+    if (copy_memory_to_image && !host_transfer_format(format.format)) return VK_NULL_HANDLE;
     const ZeroShape key{d.Format, d.Width, d.Height, d.DepthOrArraySize, d.MipLevels};
     std::lock_guard lock(zero_image_mutex);
     if (auto it = zero_images.find(key); it != zero_images.end()) return it->second ? it->second->image() : VK_NULL_HANDLE;
@@ -9321,12 +9328,13 @@ VkImage DeviceState::zero_sampled_image(const D3D12_RESOURCE_DESC& d, const Form
     if (used >= limit || bytes > limit - used) return VK_NULL_HANDLE;
     const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_CUSTOM, D3D12_CPU_PAGE_PROPERTY_WRITE_BACK, D3D12_MEMORY_POOL_L0, 1, 1};
     auto* zero = new Resource(*this, d, heap, D3D12_HEAP_FLAG_NONE);
-    if (FAILED(zero->create_texture(format)) || !zero->host_initialized_image() ||
+    if (FAILED(zero->create_texture(format)) || (copy_memory_to_image && !zero->host_initialized_image()) ||
         zero->image_backing_bytes() > limit - used) {
         zero->Release();
         zero_images.emplace(key, nullptr);
         return VK_NULL_HANDLE;
     }
+    if (!zero->host_initialized_image()) context->note_shader_image(zero->id());  // cleared before a shader reads it
     zero_images.emplace(key, zero);
     zero_image_bytes.fetch_add(zero->image_backing_bytes(), std::memory_order_relaxed);
     return zero->image();
