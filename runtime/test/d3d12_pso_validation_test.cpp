@@ -388,6 +388,30 @@ int main() {
         }));
     }
 
+    // 3b. An integer target bypasses its blender. The console's native state keeps blending enabled for every
+    // target (CB_BLENDn is format-agnostic) and D3D12Xbox ignores it on integer surfaces; PC D3D12 rejects such a
+    // state at creation, and Vulkan requires blendEnable = VK_FALSE, so this is layer-only rather than parity. The
+    // target's write mask must survive. Adapted from DexNom/VIctory ddb7332 (GPL-3.0-or-later).
+    {
+        auto desc = make_gfx(layer_root.p, layer_vs_fs, layer_ps_uint);
+        desc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UINT;
+        desc.BlendState.RenderTarget[0].BlendEnable = TRUE;
+        desc.BlendState.RenderTarget[0].SrcBlend = D3D12_BLEND_SRC_ALPHA;
+        desc.BlendState.RenderTarget[0].DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
+        desc.BlendState.RenderTarget[0].BlendOp = D3D12_BLEND_OP_ADD;
+        desc.BlendState.RenderTarget[0].SrcBlendAlpha = D3D12_BLEND_ONE;
+        desc.BlendState.RenderTarget[0].DestBlendAlpha = D3D12_BLEND_ZERO;
+        desc.BlendState.RenderTarget[0].BlendOpAlpha = D3D12_BLEND_OP_ADD;
+        desc.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_RED;
+        const HRESULT hr = create_graphics(layer_dev.p, desc);
+        if (hr != S_OK) {
+            std::fprintf(stderr, "FAIL [gfx: integer target bypasses blending]: layer returned 0x%08lx\n",
+                         static_cast<unsigned long>(hr));
+            return 1;
+        }
+        ++checked;
+    }
+
     // 4. RTVFormats validation.
     EXPECT(check_gfx_parity("gfx: RTVFormats[1]!=UNKNOWN with N=1", E_INVALIDARG, false, false,
                             [](auto& d) { d.RTVFormats[1] = DXGI_FORMAT_R8G8B8A8_UNORM; }));
