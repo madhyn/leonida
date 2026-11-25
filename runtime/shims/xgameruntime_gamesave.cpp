@@ -11,8 +11,8 @@
 //   <root>\local-user\<container>\<blob>      root = LEONIDA_SAVE_DIR, else %LOCALAPPDATA%\Leonida\saves
 // Container and blob names are %-encoded: [A-Za-z0-9_-] and '.' (except as the first character) stay, every other
 // UTF-8 byte becomes %XX. A container's display name is kept in "<container>\.display", which no encoded blob name
-// can collide with (an encoded name never starts with '.'). Names ending in '~' are temporary files of an update in
-// progress; an encoded name never ends in '~' either.
+// can collide with (an encoded name never starts with '.'). The hidden update journal sits beside the containers.
+// Old-format scratch names end in '~', which encoded names never do.
 //
 // An update buffers its writes and deletes; SubmitUpdate writes every new blob to "<blob>~", then renames each over
 // its blob and removes the deleted ones, so a failed write leaves the container as it was.
@@ -324,6 +324,8 @@ struct BlobRead {
     std::vector<uint8_t> data;
 };
 
+bool recover_update(const fs::path& user_dir);
+
 size_t align8(size_t n) { return (n + 7) & ~size_t{7}; }
 
 size_t packed_size(const std::vector<BlobRead>& blobs) {
@@ -352,6 +354,7 @@ void pack(const std::vector<BlobRead>& blobs, void* buffer) {
 // Reads the named blobs (every blob when names is null) of a live container.
 HRESULT read_blobs(const XGameSaveContainer* c, const char* const* names, uint32_t count, std::vector<BlobRead>& out) {
     out.clear();
+    if (!recover_update(c->user_dir)) return E_GS_OUT_OF_LOCAL_STORAGE;
     const fs::path dir = c->dir();
     std::vector<std::string> wanted;
     if (names) {
@@ -372,63 +375,132 @@ HRESULT read_blobs(const XGameSaveContainer* c, const char* const* names, uint32
 
 // ---- Committing an update ----
 //
-// Every write goes to "<blob>~" first. Then each op, in name order, applies its change: the blob's file is copied to
-// its backup "<blob>~b~", then a write renames its temporary over the blob or a delete removes the blob. A blob never
-// leaves its name, so a process that dies midway leaves each blob under its name, old or new, as before. When an op
-// fails, the ops already applied are undone newest first (a blob that existed is copied back from its backup, one
-// that did not is removed), the scratch files are deleted and the update fails with E_GS_OUT_OF_LOCAL_STORAGE. A
-// backup whose restore failed is kept, so the old contents survive. Every scratch name ends in '~', which encode_name
-// never produces and decode_name rejects, so enumeration and the quota never count one. A commit first deletes the
-// temporaries of a commit that died midway. It leaves backups alone: one may be the only copy of a blob's old
-// contents. The next successful update of that blob replaces and then removes its backup.
+// Under g_mutex, one journal next to the containers records a whole update. Live names only change after
+// publishing its manifest. Retiring the manifest commits the update. A manifest still active after process
+// interruption calls for undo, even when recovery itself was interrupted. Encoded blob and container names are
+// unchanged. The journal is local to one runtime process and does not provide power-loss durability.
 
 struct CommitStep {
-    fs::path final_path, temp, backup;
-    bool write = false;
-    bool existed = false;      // the blob had a file before the update; the backup is a copy of it
-    bool backed_up = false;    // this update wrote the backup
-    bool applied = false;      // the op took effect
-    bool keep_backup = false;  // its undo failed: the backup holds the only copy of the old contents
+    std::string filename;
+    bool write;
+    bool existed;
 };
+
+constexpr wchar_t kJournal[] = L".save-update~";
+constexpr wchar_t kManifest[] = L"active";
+constexpr char kManifestVersion[] = "leonida-save-update-1";
+
+#ifdef LEONIDA_GAMESAVE_TEST
+unsigned g_checkpoints_before_exit = 0;
+#endif
+
+void update_checkpoint() {
+#ifdef LEONIDA_GAMESAVE_TEST
+    if (g_checkpoints_before_exit != 0 && --g_checkpoints_before_exit == 0) ExitProcess(83);
+#endif
+}
+
+fs::path scratch(const fs::path& journal, size_t index, wchar_t kind) {
+    return journal / (std::wstring(1, kind) + std::to_wstring(index));
+}
+
+bool move_file(const fs::path& from, const fs::path& to) {
+    return MoveFileExW(from.c_str(), to.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+}
 
 bool copy_blob(const fs::path& from, const fs::path& to) {
     std::error_code ec;
+    const auto modified = fs::last_write_time(from, ec);
+    if (ec) return false;
     fs::copy_file(from, to, fs::copy_options::overwrite_existing, ec);
+    if (ec) return false;
+    fs::last_write_time(to, modified, ec);
     return !ec;
 }
 
-// Undoes the applied steps among steps[0, upto), newest first. A step whose restore fails keeps its backup.
-void undo_steps(std::vector<CommitStep>& steps, size_t upto) {
-    for (size_t i = upto; i-- > 0;) {
-        CommitStep& s = steps[i];
-        if (!s.applied) continue;
+// Replacing a blob consumes its staged file; deletion moves its original into the journal. The same renames
+// tell recovery which operations ran, so it need not try to replace an unchanged, possibly locked file.
+bool undo_update(const fs::path& journal, const fs::path& dir, bool dir_existed, const std::vector<CommitStep>& steps) {
+    for (size_t i = steps.size(); i-- > 0;) {
+        const CommitStep& s = steps[i];
+        const fs::path backup = scratch(journal, i, L'b');
         std::error_code ec;
+        const bool marker_exists = fs::exists(s.write ? scratch(journal, i, L'w') : backup, ec);
+        if (ec) return false;
+        if (s.write ? marker_exists : !marker_exists) continue;
+        const fs::path final_path = dir / widen(s.filename);
         if (s.existed) {
-            if (copy_blob(s.backup, s.final_path)) {
-                s.applied = false;
-            } else {
-                s.keep_backup = true;
-            }
+            // Keep the original intact if this process dies during recovery too.
+            const fs::path restore = journal / L"restore";
+            if (!copy_blob(backup, restore) || !move_file(restore, final_path)) return false;
         } else {
-            fs::remove(s.final_path, ec);
-            if (!ec) s.applied = false;
+            fs::remove(final_path, ec);
+            if (ec) return false;
         }
+        update_checkpoint();
     }
+    if (!dir_existed) {
+        std::error_code ec;
+        fs::remove(dir, ec);
+        if (ec) return false;
+        update_checkpoint();
+    }
+    return true;
 }
 
-// Deletes what the update left behind: the temporaries, and the backups it wrote itself that are not the only copy of
-// a blob's old contents.
-void remove_scratch(const std::vector<CommitStep>& steps) {
-    for (const CommitStep& s : steps) {
-        std::error_code ec;
-        fs::remove(s.temp, ec);
-        if (s.backed_up && !s.keep_backup) fs::remove(s.backup, ec);
+// The version, complete record list, and final names are validated before any restore starts.
+bool read_manifest(const fs::path& journal, std::string& container, bool& dir_existed, std::vector<CommitStep>& steps) {
+    std::ifstream f(journal / kManifest, std::ios::binary);
+    std::string line, decoded;
+    if (!std::getline(f, line) || line != kManifestVersion || !std::getline(f, container) ||
+        !decode_name(container, decoded) || !valid_container_name(decoded.c_str()) ||
+        decoded.size() != std::strlen(decoded.c_str()) || !std::getline(f, line) || (line != "0" && line != "1"))
+        return false;
+    dir_existed = line == "1";
+    while (std::getline(f, line)) {
+        if (line == "end") return !std::getline(f, line) && f.eof() && !f.bad();
+        if (line.size() < 3 || (line[0] != 'w' && line[0] != 'd') || (line[1] != '0' && line[1] != '1'))
+            return false;
+        const bool write = line[0] == 'w';
+        std::string filename = line.substr(2);
+        if (!(write && filename == ".display") &&
+            (!decode_name(filename, decoded) || !valid_blob_name(decoded.c_str()) ||
+             decoded.size() != std::strlen(decoded.c_str())))
+            return false;
+        steps.push_back({std::move(filename), write, line[1] == '1'});
     }
+    return false;
+}
+
+bool retire_update(const fs::path& journal) {
+    if (!move_file(journal / kManifest, journal / L"retired")) return false;
+    update_checkpoint();
+    std::error_code ec;
+    fs::remove_all(journal, ec);
+    return true;
+}
+
+bool recover_update(const fs::path& user_dir) {
+    const fs::path journal = user_dir / kJournal;
+    std::error_code ec;
+    if (!fs::exists(journal, ec)) return !ec;
+    if (!fs::exists(journal / kManifest, ec)) {
+        if (ec) return false;
+        // An unpublished or retired journal cannot need undo. Cleanup can be retried at the next commit.
+        fs::remove_all(journal, ec);
+        return true;
+    }
+    std::string container;
+    bool dir_existed = false;
+    std::vector<CommitStep> steps;
+    return read_manifest(journal, container, dir_existed, steps) &&
+           undo_update(journal, user_dir / widen(container), dir_existed, steps) && retire_update(journal);
 }
 
 HRESULT commit(XGameSaveUpdate* u) {
     XGameSaveContainer* c = u->container;
     const fs::path dir = c->dir();
+    if (!recover_update(c->user_dir)) return E_GS_OUT_OF_LOCAL_STORAGE;
     // The quota: what the container holds after the update, plus every other container.
     uint64_t after = used_bytes(c->user_dir);
     for (const auto& [name, op] : u->ops) {
@@ -440,57 +512,70 @@ HRESULT commit(XGameSaveUpdate* u) {
     if (after > kQuotaBytes) return E_GS_QUOTA_EXCEEDED;
 
     std::error_code ec;
-    fs::create_directories(dir, ec);
-    if (ec) return E_GS_OUT_OF_LOCAL_STORAGE;
-    // Temporaries of a commit that died midway: never blobs, and nothing else uses these names. Backups are kept.
-    for (const auto& e : fs::directory_iterator(dir, ec)) {
-        std::error_code entry_ec;
-        const std::wstring n = e.path().filename().wstring();
-        if (n.ends_with(L"~") && !n.ends_with(L"~b~") && e.is_regular_file(entry_ec)) fs::remove(e.path(), entry_ec);
+    const bool dir_existed = fs::exists(dir, ec);
+    if (ec || (dir_existed && !fs::is_directory(dir, ec))) return E_GS_OUT_OF_LOCAL_STORAGE;
+    if (dir_existed) {
+        // Clean up old-format temporaries. A legacy backup may hold the only copy of an old blob.
+        for (const auto& e : fs::directory_iterator(dir, ec)) {
+            std::error_code entry_ec;
+            const std::wstring n = e.path().filename().wstring();
+            if (n.ends_with(L"~") && !n.ends_with(L"~b~") && e.is_regular_file(entry_ec)) fs::remove(e.path(), entry_ec);
+        }
+        if (ec) return E_GS_OUT_OF_LOCAL_STORAGE;
     }
+
+    const fs::path journal = c->user_dir / kJournal;
+    // Only this update owns a newly created journal. If leftover scratch is locked, do not reuse it.
+    if (!fs::create_directory(journal, ec) || ec) return E_GS_OUT_OF_LOCAL_STORAGE;
+    const auto discard = [&] {
+        std::error_code rm_ec;
+        fs::remove_all(journal, rm_ec);
+        return E_GS_OUT_OF_LOCAL_STORAGE;
+    };
 
     std::vector<CommitStep> steps;
-    steps.reserve(u->ops.size());
-    for (const auto& [name, op] : u->ops) {
-        CommitStep s;
-        s.final_path = dir / widen(encode_name(name));
-        s.temp = s.final_path;
-        s.temp += L"~";
-        s.backup = s.final_path;
-        s.backup += L"~b~";
-        s.write = op.write;
-        std::error_code exists_ec;
-        s.existed = fs::is_regular_file(s.final_path, exists_ec);
-        if (op.write && !write_file(s.temp, op.data.data(), op.data.size())) {
-            std::error_code rm_ec;
-            for (const CommitStep& done : steps) fs::remove(done.temp, rm_ec);
-            fs::remove(s.temp, rm_ec);
-            return E_GS_OUT_OF_LOCAL_STORAGE;
-        }
-        steps.push_back(std::move(s));
-    }
+    steps.reserve(u->ops.size() + u->has_display_name);
+    std::string manifest = std::string(kManifestVersion) + '\n' + encode_name(c->name) + '\n' + (dir_existed ? "1\n" : "0\n");
+    const auto stage = [&](std::string filename, bool write, const void* data, size_t size) {
+        const fs::path final_path = dir / widen(filename);
+        const bool existed = fs::exists(final_path, ec);
+        if (ec || (existed && !fs::is_regular_file(final_path, ec))) return false;
+        const size_t i = steps.size();
+        if (write && (!write_file(scratch(journal, i, L'w'), data, size) ||
+                      (existed && !copy_blob(final_path, scratch(journal, i, L'b')))))
+            return false;
+        manifest += write ? 'w' : 'd';
+        manifest += existed ? '1' : '0';
+        manifest += filename + '\n';
+        steps.push_back({std::move(filename), write, existed});
+        return true;
+    };
+    for (const auto& [name, op] : u->ops)
+        if (!stage(encode_name(name), op.write, op.data.data(), op.data.size())) return discard();
+    if (u->has_display_name && !stage(".display", true, u->display_name.data(), u->display_name.size())) return discard();
+    manifest += "end\n";
+    if (!write_file(journal / L"prepare", manifest.data(), manifest.size())) return discard();
+    update_checkpoint();
+    if (!move_file(journal / L"prepare", journal / kManifest)) return discard();
+    update_checkpoint();
 
+    const auto rollback = [&] {
+        if (undo_update(journal, dir, dir_existed, steps)) retire_update(journal);
+        return E_GS_OUT_OF_LOCAL_STORAGE;
+    };
+    fs::create_directories(dir, ec);
+    if (ec) return rollback();
     for (size_t i = 0; i < steps.size(); ++i) {
-        CommitStep& s = steps[i];
-        bool ok = true;
-        if (s.existed) ok = s.backed_up = copy_blob(s.final_path, s.backup);
-        if (ok && s.write) {
-            ok = MoveFileExW(s.temp.c_str(), s.final_path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
-        } else if (ok && s.existed) {   // a delete
-            std::error_code rm_ec;
-            fs::remove(s.final_path, rm_ec);   // already gone is a delete that has nothing left to do
-            ok = !rm_ec;
+        const CommitStep& s = steps[i];
+        const fs::path final_path = dir / widen(s.filename);
+        if (s.write) {
+            if (!move_file(scratch(journal, i, L'w'), final_path)) return rollback();
+        } else if (s.existed && !move_file(final_path, scratch(journal, i, L'b'))) {
+            if (GetLastError() != ERROR_FILE_NOT_FOUND) return rollback();
         }
-        if (!ok) {
-            undo_steps(steps, i);   // the failed op changed nothing: only the ops before it were applied
-            remove_scratch(steps);
-            return E_GS_OUT_OF_LOCAL_STORAGE;
-        }
-        s.applied = true;
+        update_checkpoint();
     }
-    remove_scratch(steps);
-    if (u->has_display_name) write_file(dir / L".display", u->display_name.data(), u->display_name.size());
-    return S_OK;
+    return retire_update(journal) ? S_OK : rollback();
 }
 
 
@@ -503,11 +588,11 @@ HRESULT open_provider(XUserHandle user, const char* config_id, XGameSaveProvider
     const fs::path root = save_root();
     if (root.empty()) return E_GS_OUT_OF_LOCAL_STORAGE;
     const fs::path user_dir = root / L"local-user";
+    std::lock_guard<std::recursive_mutex> lock(g_mutex);
     std::error_code ec;
     fs::create_directories(user_dir, ec);
-    if (ec) return E_GS_OUT_OF_LOCAL_STORAGE;
+    if (ec || !recover_update(user_dir)) return E_GS_OUT_OF_LOCAL_STORAGE;
     auto* p = new XGameSaveProvider{user_dir, config_id};
-    std::lock_guard<std::recursive_mutex> lock(g_mutex);
     p->serial = g_next_serial++;
     g_providers.insert(p);
     *out = p;
@@ -521,6 +606,7 @@ HRESULT remaining_quota(XGameSaveProviderHandle p, int64_t* remaining) {
     if (!remaining) return E_POINTER;
     std::lock_guard<std::recursive_mutex> lock(g_mutex);
     if (!live(g_providers, p)) return E_GS_HANDLE_EXPIRED;
+    if (!recover_update(p->user_dir)) return E_GS_OUT_OF_LOCAL_STORAGE;
     const uint64_t used = used_bytes(p->user_dir);
     *remaining = used >= kQuotaBytes ? 0 : static_cast<int64_t>(kQuotaBytes - used);
     return S_OK;
@@ -530,6 +616,7 @@ HRESULT delete_container(XGameSaveProviderHandle p, const char* name) {
     std::lock_guard<std::recursive_mutex> lock(g_mutex);
     if (!live(g_providers, p)) return E_GS_HANDLE_EXPIRED;
     if (!valid_container_name(name)) return E_GS_INVALID_CONTAINER_NAME;
+    if (!recover_update(p->user_dir)) return E_GS_OUT_OF_LOCAL_STORAGE;
     std::error_code ec;
     fs::remove_all(p->user_dir / widen(encode_name(name)), ec);
     return ec ? E_FAIL : S_OK;
@@ -569,11 +656,15 @@ HRESULT do_work(Job& job, size_t& size) {
     size = 0;
     if (job.identity == &kInitIdentity) {
         // The handle is made when the title collects the result, so an uncollected result leaks nothing; here only
-        // the folder is checked.
+        // the folder is checked and recovered.
         if (!job.user) return E_INVALIDARG;
         const fs::path root = save_root();
+        if (root.empty()) return E_GS_OUT_OF_LOCAL_STORAGE;
+        const fs::path user_dir = root / L"local-user";
+        std::lock_guard<std::recursive_mutex> lock(g_mutex);
         std::error_code ec;
-        if (root.empty() || (fs::create_directories(root / L"local-user", ec), ec)) return E_GS_OUT_OF_LOCAL_STORAGE;
+        fs::create_directories(user_dir, ec);
+        if (ec || !recover_update(user_dir)) return E_GS_OUT_OF_LOCAL_STORAGE;
         size = sizeof(XGameSaveProviderHandle);
         return S_OK;
     }
@@ -750,6 +841,7 @@ HRESULT STDMETHODCALLTYPE save_container_info(void*, XGameSaveProviderHandle p, 
     std::lock_guard<std::recursive_mutex> lock(g_mutex);
     if (!live(g_providers, p)) return E_GS_HANDLE_EXPIRED;
     if (!valid_container_name(name)) return E_GS_INVALID_CONTAINER_NAME;
+    if (!recover_update(p->user_dir)) return E_GS_OUT_OF_LOCAL_STORAGE;
     const fs::path dir = p->user_dir / widen(encode_name(name));
     std::error_code ec;
     if (!fs::is_directory(dir, ec)) return S_OK;
@@ -765,6 +857,7 @@ HRESULT STDMETHODCALLTYPE save_enum_containers(void*, XGameSaveProviderHandle p,
     if (!cb) return E_INVALIDARG;
     std::lock_guard<std::recursive_mutex> lock(g_mutex);
     if (!live(g_providers, p)) return E_GS_HANDLE_EXPIRED;
+    if (!recover_update(p->user_dir)) return E_GS_OUT_OF_LOCAL_STORAGE;
     enumerate_containers(p->user_dir, {}, context, cb);
     return S_OK;
 }
@@ -776,6 +869,7 @@ HRESULT STDMETHODCALLTYPE save_enum_containers_by_name(void*, XGameSaveProviderH
     if (!cb) return E_INVALIDARG;
     std::lock_guard<std::recursive_mutex> lock(g_mutex);
     if (!live(g_providers, p)) return E_GS_HANDLE_EXPIRED;
+    if (!recover_update(p->user_dir)) return E_GS_OUT_OF_LOCAL_STORAGE;
     enumerate_containers(p->user_dir, prefix ? std::string_view(prefix) : std::string_view{}, context, cb);
     return S_OK;
 }
@@ -809,6 +903,7 @@ HRESULT enumerate_blobs(XGameSaveContainerHandle c, std::string_view prefix, voi
     if (!cb) return E_INVALIDARG;
     std::lock_guard<std::recursive_mutex> lock(g_mutex);
     if (!live(g_containers, c)) return E_GS_HANDLE_EXPIRED;
+    if (!recover_update(c->user_dir)) return E_GS_OUT_OF_LOCAL_STORAGE;
     for (const BlobFile& b : list_blobs(c->dir())) {
         if (b.name.compare(0, prefix.size(), prefix) != 0) continue;
         const XGameSaveBlobInfo info{b.name.c_str(), static_cast<uint32_t>(b.size)};
@@ -1067,5 +1162,11 @@ long xgameruntime_gamesave_open_handles() {
     std::lock_guard<std::recursive_mutex> lock(g_mutex);
     return static_cast<long>(g_providers.size() + g_containers.size() + g_updates.size());
 }
+
+#ifdef LEONIDA_GAMESAVE_TEST
+void xgameruntime_gamesave_test_interrupt_after(unsigned checkpoints) {
+    g_checkpoints_before_exit = checkpoints;
+}
+#endif
 
 }  // namespace rt::shims

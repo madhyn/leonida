@@ -4,14 +4,18 @@
 // game data, nothing online.
 #include <windows.h>
 
+#include <array>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <cwchar>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include <XAsync.h>
@@ -22,6 +26,7 @@
 
 namespace rt::shims {
 long xgameruntime_gamesave_open_handles();
+void xgameruntime_gamesave_test_interrupt_after(unsigned checkpoints);
 }
 
 namespace {
@@ -54,6 +59,7 @@ struct Blob {
 };
 
 constexpr HRESULT E_GS_INVALID_CONTAINER_NAME = static_cast<HRESULT>(0x80830001);
+constexpr HRESULT E_GS_OUT_OF_LOCAL_STORAGE = static_cast<HRESULT>(0x80830003);
 constexpr HRESULT E_GS_UPDATE_TOO_BIG = static_cast<HRESULT>(0x80830005);
 constexpr HRESULT E_GS_PROVIDED_BUFFER_TOO_SMALL = static_cast<HRESULT>(0x80830007);
 constexpr HRESULT E_GS_BLOB_NOT_FOUND = static_cast<HRESULT>(0x80830008);
@@ -101,6 +107,7 @@ struct Seen {
     std::vector<std::string> names, displays;
     std::vector<uint32_t> counts;
     std::vector<uint64_t> sizes;
+    std::vector<time_t> modified;
     int stop_after = 1000;
 };
 bool CALLBACK on_container(const ContainerInfo* info, void* context) {
@@ -109,6 +116,7 @@ bool CALLBACK on_container(const ContainerInfo* info, void* context) {
     seen->displays.emplace_back(info->displayName ? info->displayName : "");
     seen->counts.push_back(info->blobCount);
     seen->sizes.push_back(info->totalSize);
+    seen->modified.push_back(info->lastModifiedTime);
     return static_cast<int>(seen->names.size()) < seen->stop_after;
 }
 bool CALLBACK on_blob(const BlobInfo* info, void* context) {
@@ -118,9 +126,238 @@ bool CALLBACK on_blob(const BlobInfo* info, void* context) {
     return true;
 }
 
+namespace fs = std::filesystem;
+
+struct SaveSession {
+    void* save;
+    Handle provider = nullptr;
+    Handle container = nullptr;
+
+    HRESULT open(const fs::path& root) {
+        if (!SetEnvironmentVariableW(L"LEONIDA_SAVE_DIR", root.c_str())) return E_FAIL;
+        HRESULT hr = at<Init>(save, 3)(save, reinterpret_cast<Handle>(0x1000), "SCID", false, &provider);
+        if (SUCCEEDED(hr)) hr = at<Create>(save, 16)(save, provider, "story", &container);
+        return hr;
+    }
+
+    ~SaveSession() {
+        if (container) at<Close>(save, 17)(save, container);
+        if (provider) at<Close>(save, 6)(save, provider);
+    }
+};
+
+struct Edit {
+    const char* name;
+    const char* data;   // nullptr deletes
+};
+
+HRESULT submit_edits(void* save, Handle container, const char* display, const std::vector<Edit>& edits) {
+    Handle update = nullptr;
+    HRESULT hr = at<Create>(save, 23)(save, container, display, &update);
+    for (const Edit& e : edits) {
+        if (FAILED(hr)) break;
+        hr = e.data ? at<Write>(save, 25)(save, update, e.name, reinterpret_cast<const uint8_t*>(e.data),
+                                        std::strlen(e.data))
+                    : at<ByName>(save, 26)(save, update, e.name);
+    }
+    if (SUCCEEDED(hr)) hr = at<Submit>(save, 27)(save, update);
+    if (update) at<Close>(save, 24)(save, update);
+    return hr;
+}
+
+HRESULT write_next(SaveSession& session, const char* display = "New story") {
+    return submit_edits(session.save, session.container, display, {{"a", "NEW_A_LONG"}, {"b", nullptr}, {"c", "NEW_C"}});
+}
+
+bool interrupt_child(const fs::path& root, bool during_recovery, unsigned checkpoint) {
+    std::wstring exe(32768, L'\0');
+    const DWORD length = GetModuleFileNameW(nullptr, exe.data(), static_cast<DWORD>(exe.size()));
+    if (!length || length == exe.size()) return false;
+    exe.resize(length);
+    std::wstring command = L"\"" + exe + L"\" " + (during_recovery ? L"--interrupt-recovery" : L"--interrupt-update") +
+                           L" \"" + root.wstring() + L"\" " + std::to_wstring(checkpoint);
+    STARTUPINFOW startup{};
+    startup.cb = sizeof(startup);
+    PROCESS_INFORMATION process{};
+    if (!CreateProcessW(exe.c_str(), command.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr,
+                        &startup, &process))
+        return false;
+    CloseHandle(process.hThread);
+    DWORD exit_code = 0;
+    const bool stopped = WaitForSingleObject(process.hProcess, 15000) == WAIT_OBJECT_0;
+    const bool interrupted = stopped && GetExitCodeProcess(process.hProcess, &exit_code) && exit_code == 83;
+    if (!stopped) {
+        TerminateProcess(process.hProcess, 84);
+        WaitForSingleObject(process.hProcess, 5000);
+    }
+    CloseHandle(process.hProcess);
+    return interrupted;
+}
+
+bool matches(const Blob* blobs, uint32_t count, bool next) {
+    const std::string_view a = next ? "NEW_A_LONG" : "OLD_A";
+    const std::string_view second = next ? "NEW_C" : "OLD_B";
+    return count == 2 && std::strcmp(blobs[0].info.name, "a") == 0 &&
+           std::strcmp(blobs[1].info.name, next ? "c" : "b") == 0 && blobs[0].info.size == a.size() &&
+           blobs[1].info.size == second.size() && std::memcmp(blobs[0].data, a.data(), a.size()) == 0 &&
+           std::memcmp(blobs[1].data, second.data(), second.size()) == 0;
+}
+
+void expect_generation(const SaveSession& session, bool next, const char* display, time_t old_modified = 0) {
+    std::array<uint64_t, 128> buffer{};
+    auto* blobs = reinterpret_cast<Blob*>(buffer.data());
+    const size_t size = sizeof(buffer);
+    uint32_t count = 0;
+    check(at<Read>(session.save, 20)(session.save, session.container, nullptr, &count, size, blobs) == S_OK &&
+              matches(blobs, count, next),
+          "public ReadBlobData returns the complete expected generation");
+
+    XAsyncBlock async{};
+    const bool started = at<ReadAsync>(session.save, 21)(session.save, session.container, nullptr, 0, &async) == S_OK;
+    count = 0;
+    check(started && finished(&async) &&
+              at<ReadResult>(session.save, 22)(session.save, &async, size, blobs, &count) == S_OK &&
+              matches(blobs, count, next),
+          "the async read path returns the same generation");
+
+    const uint64_t size_on_disk = next ? 15 : 10;
+    Seen seen;
+    check(at<EnumContainers>(session.save, 14)(session.save, session.provider, &seen, on_container) == S_OK &&
+              seen.names == std::vector<std::string>{"story"} && seen.displays == std::vector<std::string>{display} &&
+              seen.counts == std::vector<uint32_t>{2} && seen.sizes == std::vector<uint64_t>{size_on_disk} &&
+              (!old_modified || seen.modified == std::vector<time_t>{old_modified}),
+          "container enumeration and display metadata describe the same generation");
+    int64_t remaining = 0;
+    check(at<Quota>(session.save, 7)(session.save, session.provider, &remaining) == S_OK &&
+              remaining == (int64_t{1} << 30) - static_cast<int64_t>(size_on_disk),
+          "quota excludes journal scratch and counts the recovered blobs");
+}
+
+bool seed_generation(SaveSession& session, const fs::path& dir, time_t& modified) {
+    if (submit_edits(session.save, session.container, "Old story", {{"a", "OLD_A"}, {"b", "OLD_B"}}) != S_OK) return false;
+    std::error_code ec;
+    const auto past = fs::file_time_type::clock::now() - std::chrono::hours(24);
+    for (const wchar_t* name : {L"a", L"b"}) {
+        fs::last_write_time(dir / name, past, ec);
+        if (ec) return false;
+    }
+    Seen seen;
+    if (at<GetInfo>(session.save, 13)(session.save, session.provider, "story", &seen, on_container) != S_OK ||
+        seen.modified.size() != 1 || !seen.modified.front())
+        return false;
+    modified = seen.modified.front();
+    return true;
+}
+
+void test_interruption(void* save, const fs::path& root) {
+    // Points are staging, publication, replacing a, deleting b, creating c, updating .display, and retirement.
+    for (unsigned point = 1; point <= 7; ++point) {
+        std::printf("Interrupted save checkpoint %u\n", point);
+        const fs::path testcase = root / std::to_wstring(point);
+        const fs::path user_dir = testcase / L"local-user";
+        time_t modified = 0;
+        {
+            SaveSession seed{save};
+            const bool seeded = seed.open(testcase) == S_OK && seed_generation(seed, user_dir / L"story", modified);
+            check(seeded, "seed a complete original update with metadata");
+            if (!seeded) continue;
+        }
+        const bool interrupted = interrupt_child(testcase, false, point);
+        check(interrupted, "the child process exited at the requested save checkpoint");
+        if (!interrupted) continue;
+        if (point == 3) {
+            std::ifstream a(user_dir / L"story" / L"a", std::ios::binary);
+            std::ifstream b(user_dir / L"story" / L"b", std::ios::binary);
+            const auto bytes = [](std::ifstream& f) {
+                return std::string(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+            };
+            check(bytes(a) == "NEW_A_LONG" && bytes(b) == "OLD_B", "the process stopped after the first live replacement");
+        }
+        if (point == 6) {
+            check(interrupt_child(testcase, true, 2), "a second child exited after restoring metadata and removing c");
+        }
+        SaveSession reopened{save};
+        const bool recovered = reopened.open(testcase) == S_OK;
+        check(recovered, "a fresh provider opens the interrupted save");
+        if (recovered) {
+            const bool next = point == 7;
+            expect_generation(reopened, next, next ? "New story" : "Old story", next ? 0 : modified);
+            check(!fs::exists(user_dir / L".save-update~"), "successful recovery and committed cleanup remove scratch");
+        }
+    }
+
+    const fs::path first = root / L"first";
+    const fs::path first_container = first / L"local-user" / L"story";
+    check(interrupt_child(first, false, 3) && fs::exists(first_container / L"a"),
+          "a child interrupted during its first save left a live blob");
+    check(interrupt_child(first, true, 2) && !fs::exists(first_container),
+          "a second interruption occurs after recovery removes the new directory");
+    SaveSession first_reopen{save};
+    check(first_reopen.open(first) == S_OK && !fs::exists(first_container),
+          "recovering an interrupted first save removes the newly created container");
+}
+
+void test_locked_recovery(void* save, const fs::path& root) {
+    const fs::path dir = root / L"local-user" / L"story";
+    SaveSession session{save};
+    time_t modified = 0;
+    const bool seeded = session.open(root) == S_OK && seed_generation(session, dir, modified);
+    check(seeded, "seed the sharing-failure recovery fixture");
+    if (!seeded) return;
+
+    // The child is the only writer, and it has already exited when the parent's live handle attempts recovery.
+    const bool interrupted = interrupt_child(root, false, 3);
+    check(interrupted, "child interrupted after replacing a in the sharing-failure fixture");
+    if (!interrupted) return;
+    const auto hold = [](const fs::path& path) {
+        return CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0,
+                           nullptr);
+    };
+    HANDLE blocked = hold(dir / L"a");
+    check(blocked != INVALID_HANDLE_VALUE, "hold the changed blob without FILE_SHARE_DELETE");
+    std::array<uint64_t, 128> buffer{};
+    uint32_t count = 0;
+    int64_t quota = 0;
+    Seen seen;
+    check(at<Read>(save, 20)(save, session.container, nullptr, &count, sizeof(buffer),
+                           reinterpret_cast<Blob*>(buffer.data())) == E_GS_OUT_OF_LOCAL_STORAGE &&
+              at<Quota>(save, 7)(save, session.provider, &quota) == E_GS_OUT_OF_LOCAL_STORAGE &&
+              at<EnumContainers>(save, 14)(save, session.provider, &seen, on_container) == E_GS_OUT_OF_LOCAL_STORAGE &&
+              seen.names.empty() && fs::exists(dir.parent_path() / L".save-update~" / L"active"),
+          "blocked recovery retains the journal and reports storage failure to existing handles");
+    if (blocked != INVALID_HANDLE_VALUE) CloseHandle(blocked);
+    expect_generation(session, false, "Old story", modified);
+
+    blocked = hold(dir / L".display");
+    check(blocked != INVALID_HANDLE_VALUE && write_next(session) == E_GS_OUT_OF_LOCAL_STORAGE,
+          "locking display metadata fails the whole update");
+    check(!fs::exists(dir.parent_path() / L".save-update~"), "ordinary rollback retires the journal before returning");
+    if (blocked != INVALID_HANDLE_VALUE) CloseHandle(blocked);
+    expect_generation(session, false, "Old story", modified);
+    check(write_next(session, "") == S_OK && fs::file_size(dir / L".display") == 0,
+          "the same update succeeds with an explicit empty display name once unlocked");
+    expect_generation(session, true, "");
+}
+
 }  // namespace
 
-int main() {
+int wmain(int argc, wchar_t** argv) {
+    if (argc == 4) {
+        const std::wstring_view mode(argv[1]);
+        if (mode != L"--interrupt-update" && mode != L"--interrupt-recovery") return 2;
+        auto query = reinterpret_cast<Query>(rt::shims::find("xgameruntime.dll", "QueryApiImpl"));
+        void* save = nullptr;
+        if (!query || FAILED(query(&kSaveClass, kSaveClass, &save)) || !save) return 2;
+        SaveSession session{save};
+        const auto checkpoint = static_cast<unsigned>(std::wcstoul(argv[3], nullptr, 10));
+        if (mode == L"--interrupt-recovery") {
+            rt::shims::xgameruntime_gamesave_test_interrupt_after(checkpoint);
+            return session.open(argv[2]) == S_OK ? 0 : 3;
+        }
+        if (FAILED(session.open(argv[2]))) return 3;
+        rt::shims::xgameruntime_gamesave_test_interrupt_after(checkpoint);
+        return write_next(session) == S_OK ? 0 : 4;
+    }
     std::setvbuf(stdout, nullptr, _IONBF, 0);   // a crash still shows the checks before it
     std::printf("xgameruntime_gamesave_test: XGameSaveImpl through QueryApiImpl\n");
     const std::filesystem::path root = std::filesystem::temp_directory_path() / L"leonida_gamesave_test";
@@ -368,23 +605,9 @@ int main() {
     // update, after "a" was already replaced. The update must fail, undo what it already did, and leave no temporary
     // or backup files. Closing the handle makes the same update succeed.
     {
-        const HRESULT out_of_local = static_cast<HRESULT>(0x80830003);   // E_GS_OUT_OF_LOCAL_STORAGE
-        struct Edit {
-            const char* name;
-            const char* data;   // nullptr: delete
-        };
-        auto submit = [&](Handle container, std::vector<Edit> edits) -> HRESULT {
-            Handle u = nullptr;
-            HRESULT hr = at<Create>(save, 23)(save, container, nullptr, &u);
-            for (const Edit& e : edits) {
-                if (FAILED(hr)) break;
-                hr = e.data ? at<Write>(save, 25)(save, u, e.name, reinterpret_cast<const uint8_t*>(e.data),
-                                              std::strlen(e.data))
-                            : at<ByName>(save, 26)(save, u, e.name);
-            }
-            if (SUCCEEDED(hr)) hr = at<Submit>(save, 27)(save, u);
-            at<Close>(save, 24)(save, u);
-            return hr;
+        const HRESULT out_of_local = E_GS_OUT_OF_LOCAL_STORAGE;
+        auto submit = [&](Handle container, const std::vector<Edit>& edits) {
+            return submit_edits(save, container, nullptr, edits);
         };
         auto read_blob = [&](const std::filesystem::path& dir, const wchar_t* file) {
             std::ifstream f(dir / file, std::ios::binary);
@@ -455,6 +678,8 @@ int main() {
     at<Close>(save, 6)(save, provider2);
     at<Close>(save, 6)(save, provider);   // twice: ignored
     check(at<Quota>(save, 7)(save, provider, &quota) == E_GS_HANDLE_EXPIRED, "a closed provider is refused");
+    test_interruption(save, root / L"interruption");
+    test_locked_recovery(save, root / L"locked-recovery");
     check(rt::shims::xgameruntime_gamesave_open_handles() == 0, "every handle the test opened is closed");
 
     std::filesystem::remove_all(root, ec);
