@@ -3278,6 +3278,7 @@ struct DeviceState {
                 empty = true;
             }
         } else {
+            bool fix_second_half = false;
             leonida::gfx10::ImageWords words;
             std::memcpy(words.data(), w, sizeof(words));
             if (leonida::gfx10::is_image(words)) {
@@ -3287,10 +3288,23 @@ struct DeviceState {
                     note_refused_tsharp(heap, slot * kDescriptorSize, words, why);
                 ++heap.images[unsigned(result)];
                 settled = result != TitleImage::unknown && result != TitleImage::refused;
-                if (result == TitleImage::not_tsharp) std::memset(w, 0, 16);
+                if (result == TitleImage::not_tsharp) {
+                    std::memset(w, 0, 16);
+                    fix_second_half = true;
+                }
             } else {
                 ++heap.images[unsigned(TitleImage::not_tsharp)];
                 std::memset(w, 0, 16);
+                fix_second_half = true;
+            }
+            if (fix_second_half && !(w[7] >> 30) && w[6]) {
+                const auto path = heap.scratch ? VsharpPath::scratch : VsharpPath::shadow;
+                const auto counter = fix_vsharp(w + 4, path);
+                if (counter == VsharpResult::rebased) ++heap.vsharps;
+                if (counter == VsharpResult::empty) {
+                    ++heap.unbacked;
+                    empty = true;
+                }
             }
         }
         if (empty) heap.empty_slots.insert(std::uint32_t(slot));
@@ -6308,18 +6322,7 @@ public:
                     info.usage = staged.usage;
                 }
             } else if (!host_transfer_ && !device_.info.host_image_copy) {
-                for (std::uint32_t i = 0; i < device_.memory.memoryTypeCount; ++i) {
-                    const auto flags = device_.memory.memoryTypes[i].propertyFlags;
-                    if ((flags & (VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) ==
-                        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) plain_bits |= 1u << i;
-                }
-                if (plain_bits && device_.image_requirements) {
-                    VkMemoryRequirements staged_req{};
-                    if (!device_.memory_requirements(info, staged_req) || !(staged_req.memoryTypeBits & plain_bits))
-                        plain_bits = 0;
-                } else {
-                    plain_bits = 0;
-                }
+                plain_bits = UINT32_MAX;
                 staged_title_ = true;
             }
         }
@@ -10908,7 +10911,11 @@ public:
             bool full = true;
             if (per_frame) {
                 const std::uint64_t serial = phases::totals().present_serial.load(std::memory_order_relaxed);
-                full = refreshed_present_.exchange(serial, std::memory_order_relaxed) != serial;
+                const std::int64_t now_ns = std::chrono::steady_clock::now().time_since_epoch().count();
+                const std::int64_t prev_ns = last_full_refresh_ns_.load(std::memory_order_relaxed);
+                full = refreshed_present_.exchange(serial, std::memory_order_relaxed) != serial ||
+                       (now_ns - prev_ns >= 33000000ll);
+                if (full) last_full_refresh_ns_.store(now_ns, std::memory_order_relaxed);
             }
             state_.refresh_shadows(full || per_frame < 2, full);
             // LEONIDA_GEOMETRY_ASYNC=1 (for runs that only need the title to go on): the geometry copies are brought
@@ -12085,10 +12092,30 @@ public:
         const auto every_start = clock::now();
         stats.written_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(every_start - now).count();
         for (const auto& entry : entries)
-            if (entry.second->mapped || entry.second->stale) {
+            if (entry.second->mapped) {
                 ++stats.every_pass_visits;
                 visit(*entry.second);
             }
+        if (!entries.empty()) {
+            const std::int64_t stale_budget_ns =
+                std::int64_t(fill_budget_ns ? fill_budget_ns : 3000000ull);
+            const std::size_t n = entries.size();
+            std::size_t cursor = title_stale_cursor_ % n;
+            for (std::size_t step = 0; step < n; ++step) {
+                const auto& entry = entries[cursor];
+                cursor = (cursor + 1) % n;
+                if (!entry.second->stale || entry.second->mapped) continue;
+                const auto elapsed_ns =
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now() - every_start).count();
+                if ((filled && filled >= fill_budget) || (fill_budget_ns && fill_pass_ns >= fill_budget_ns) ||
+                    elapsed_ns >= stale_budget_ns) {
+                    break;
+                }
+                ++stats.every_pass_visits;
+                visit(*entry.second);
+            }
+            title_stale_cursor_ = cursor;
+        }
         stats.every_pass_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now() - every_start).count();
         // The budget is the round robin's: mapped and stale textures above are checked every pass whatever it is.
         const auto first_bytes = checked, first_hash_ns = stats.hash_ns;
@@ -12151,6 +12178,7 @@ private:
     bool title_pass_ = false;                                      // in refresh_title_textures, likewise
     std::atomic<std::int64_t> title_refreshed_{0};                 // steady_clock ticks of the last pass
     std::atomic<std::uint64_t> refreshed_present_{~std::uint64_t(0)};  // LEONIDA_REFRESH_PER_FRAME: present of the last full refresh
+    std::atomic<std::int64_t> last_full_refresh_ns_{0};
 
     // LEONIDA_TITLE_FILL_ASYNC=1 (for runs that only need the title to go on): slot-70 views no longer fill or hash
     // the texture they name on the title's thread (speed-26/27: a title thread 68-88 % inside slot 70, in hashing,
@@ -12352,6 +12380,7 @@ private:
         geometry_refresher_->wake.notify_one();
     }
     std::uint64_t title_refresh_cursor_ = 0;                       // under title_texture_mutex
+    std::size_t title_stale_cursor_ = 0;                           // likewise
     std::uint64_t title_map_generation_ = 0;                       // likewise: the map changes the passes have seen
     std::chrono::steady_clock::time_point title_retry_all_{};      // likewise
     leonida::TitleWriteRanges title_map_changes_;                  // likewise, scratch
