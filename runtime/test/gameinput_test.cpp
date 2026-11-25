@@ -235,6 +235,11 @@ bool fake_cursor(int* x, int* y) {
     *y = g_cursor_y;
     return true;
 }
+bool fake_cursor_with_offset(int* x, int* y) {
+    *x = g_cursor_x + 4096;
+    *y = g_cursor_y;
+    return true;
+}
 
 GameInputGamepadState pad_state(IGameInput* input, IGameInputDevice* dev, uint32_t* ui = nullptr) {
     GameInputGamepadState st{};
@@ -827,6 +832,19 @@ void test_keyboard_pad_sticks(IGameInput* input, IGameInputDevice* kb) {
     g_focus = true;
     rt::gameinput::poll();
     check(sticks_at_rest(pad_state(input, kb)), "keyboard pad: no mouse jump when focus returns");
+
+    rt::gameinput::set_cursor_source(fake_cursor_with_offset);
+    rt::gameinput::poll();
+    check(sticks_at_rest(pad_state(input, kb)), "keyboard pad: a new cursor source sets a baseline");
+    g_cursor_x += 4;
+    rt::gameinput::poll();
+    check(approx(pad_state(input, kb).rightThumbstickX, 4096 / 32767.0f),
+          "keyboard pad: motion from the new cursor source reaches the stick");
+    rt::gameinput::set_cursor_source(fake_cursor);
+    rt::gameinput::poll();
+    check(approx(pad_state(input, kb).rightThumbstickX, 3584 / 32767.0f),
+          "keyboard pad: changing cursor source lets previous motion decay without a jump");
+    settle();
 }
 
 // Runs with no other pad connected and the device callback from main still registered.
