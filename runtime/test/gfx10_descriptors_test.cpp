@@ -6,7 +6,9 @@
 #endif
 #include "../src/gfx10_descriptors.h"
 
+#include <cmath>
 #include <cstdio>
+#include <limits>
 #include <set>
 
 #define CHECK(condition) do {                                    \
@@ -396,6 +398,27 @@ int main() {
     CHECK(info.magFilter == VK_FILTER_NEAREST && info.mipmapMode == VK_SAMPLER_MIPMAP_MODE_NEAREST);
     CHECK(info.addressModeV == VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE && info.mipLodBias == -0.75f);
     CHECK(info.minLod == 0.5f && info.maxLod == 4.25f);
+    // VUID-VkSamplerCreateInfo-maxLod-01973: maxLod must be >= minLod even when an S# carries MIN_LOD > MAX_LOD.
+    const Sampler inverted_lod = decode(encode({.mip_filter = MipFilter::point, .min_lod = 3.5f, .max_lod = 1.0f}));
+    CHECK(inverted_lod.min_lod == 3.5f && inverted_lod.max_lod == 1.0f);
+    info = vulkan_sampler(inverted_lod);
+    CHECK(info.minLod == 3.5f && info.maxLod == 3.5f);
+    info = vulkan_sampler({.mip_filter = MipFilter::linear, .min_lod = 2.0f, .max_lod = 0.0f});
+    CHECK(info.minLod == 2.0f && info.maxLod == 2.0f);
+    // Non-finite LODs or LOD bias and negative/NaN bias limits stay finite and in range (VUID ...-01069).
+    const float qnan = std::numeric_limits<float>::quiet_NaN();
+    info = vulkan_sampler({.mip_filter = MipFilter::point, .min_lod = qnan, .max_lod = 4.0f});
+    CHECK(info.minLod == 0.0f && info.maxLod == 4.0f);
+    info = vulkan_sampler({.mip_filter = MipFilter::point, .min_lod = 2.5f, .max_lod = qnan});
+    CHECK(info.minLod == 2.5f && info.maxLod == 2.5f);
+    info = vulkan_sampler({.mip_filter = MipFilter::point, .min_lod = qnan, .max_lod = qnan});
+    CHECK(info.minLod == 0.0f && info.maxLod == 0.0f);
+    info = vulkan_sampler({.lod_bias = qnan}, 15.0f);
+    CHECK(!std::isnan(info.mipLodBias) && info.mipLodBias == 0.0f);
+    info = vulkan_sampler({.lod_bias = 2.25f}, -4.0f);
+    CHECK(info.mipLodBias == 0.0f);
+    info = vulkan_sampler({.lod_bias = 2.25f}, qnan);
+    CHECK(info.mipLodBias == 0.0f);
     info = vulkan_sampler({.mag_filter = Filter::aniso_point, .mip_filter = MipFilter::linear, .max_anisotropy = 8,
                            .compare = CompareFunction::greater, .min_lod = 1.5f, .max_lod = 9.0f,
                            .lod_bias = 2.5f, .unnormalized = true});
@@ -433,6 +456,15 @@ int main() {
     CHECK((encode({.border_color = BorderColor::table, .border_color_index = 5, .integer_border = true}) ==
            SamplerWords{0, 0, 0, (3u << 30) | 5}));
     CHECK(!decode(SamplerWords{0, 0, 0, (3u << 30) | kIntegerBorderPtr}).integer_border);
+    // DERIV_ADJUST_EN (WORD2 bit 31) repurposes WORD3, so kIntegerBorderPtr there is not the layer's integer mark.
+    for (const auto [type, want] : {std::pair{BorderColor::transparent_black, VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK},
+                                    std::pair{BorderColor::opaque_black, VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK},
+                                    std::pair{BorderColor::opaque_white, VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE}}) {
+        const Sampler decoded_deriv =
+            decode(SamplerWords{0, 0, 1u << 31, (std::uint32_t(type) << 30) | kIntegerBorderPtr});
+        CHECK(!decoded_deriv.integer_border && decoded_deriv.border_color_index == kIntegerBorderPtr);
+        CHECK(vulkan_sampler(decoded_deriv).borderColor == want);
+    }
     CHECK(vulkan_reduction_mode(FilterMode::blend) == VK_SAMPLER_REDUCTION_MODE_WEIGHTED_AVERAGE);
     CHECK(vulkan_reduction_mode(FilterMode::minimum) == VK_SAMPLER_REDUCTION_MODE_MIN);
     CHECK(vulkan_reduction_mode(FilterMode::maximum) == VK_SAMPLER_REDUCTION_MODE_MAX);

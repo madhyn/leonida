@@ -31,6 +31,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cmath>
 #include <cstdint>
 
 namespace leonida::gfx10 {
@@ -601,7 +602,8 @@ inline Sampler decode(const SamplerWords& words) {
     sampler.mip_filter = MipFilter(get(words[2], 26, 2));
     sampler.border_color_index = get(words[3], 0, 12);
     sampler.border_color = BorderColor(get(words[3], 30, 2));
-    if (sampler.border_color != BorderColor::table && sampler.border_color_index == kIntegerBorderPtr) {
+    if (!deriv_adjust && sampler.border_color != BorderColor::table &&
+        sampler.border_color_index == kIntegerBorderPtr) {
         sampler.integer_border = true;
         sampler.border_color_index = 0;
     }
@@ -658,13 +660,20 @@ inline VkSamplerCreateInfo vulkan_sampler(const Sampler& sampler, float max_lod_
     info.addressModeU = vulkan_address_mode(sampler.address_u);
     info.addressModeV = vulkan_address_mode(sampler.address_v);
     info.addressModeW = vulkan_address_mode(sampler.address_w);
-    info.mipLodBias = std::clamp(sampler.lod_bias, -max_lod_bias, max_lod_bias);
+    // VUID-VkSamplerCreateInfo-mipLodBias-01069: |mipLodBias| <= maxSamplerLodBias; keep non-finite inputs and
+    // non-positive limits finite without tripping std::clamp's precondition.
+    const float lod_bias_limit = max_lod_bias > 0.0f ? max_lod_bias : 0.0f;
+    const float lod_bias = std::isnan(sampler.lod_bias) ? 0.0f : sampler.lod_bias;
+    info.mipLodBias = lod_bias_limit == 0.0f ? 0.0f : detail::clamped(lod_bias, -lod_bias_limit, lod_bias_limit);
     info.anisotropyEnable = sampler.max_anisotropy > 1 ? VK_TRUE : VK_FALSE;
     info.maxAnisotropy = float(std::max(sampler.max_anisotropy, 1u));
     info.compareEnable = (sampler.compare_never || sampler.compare != CompareFunction::never) ? VK_TRUE : VK_FALSE;
     info.compareOp = VkCompareOp(sampler.compare);
-    info.minLod = sampler.min_lod;
-    info.maxLod = sampler.max_lod;
+    // VUID-VkSamplerCreateInfo-maxLod-01973: maxLod must be >= minLod. An S# (or D3D12_SAMPLER_DESC) can carry
+    // MIN_LOD > MAX_LOD (or NaN); raise maxLod to minLod so vkCreateSampler never sees an inverted or NaN range.
+    info.minLod = std::isnan(sampler.min_lod) ? 0.0f : sampler.min_lod;
+    info.maxLod = std::isnan(sampler.max_lod) ? info.minLod : sampler.max_lod;
+    if (info.maxLod < info.minLod) info.maxLod = info.minLod;
     if (sampler.mip_filter == MipFilter::none) {
         info.minLod = 0.0f;
         info.maxLod = 0.25f;
