@@ -961,7 +961,8 @@ The compute path, end to end:
     primitive overestimation no greater than `0.5 - 1/512` pixels, leaving half a minimum grid step within the
     Tier 1 uncertainty bound. `ConservativeRaster=ON` uses overestimate mode with zero extra overestimation,
     including unbound-attachment variants. OFF keeps the ordinary pipeline. Missing support, unknown modes,
-    wireframe and non-triangle PSOs are refused; conservative TIR (`ForcedSampleCount != 0`) remains `E_NOTIMPL`.
+    wireframe and non-triangle PSOs are refused (a mesh PSO needs no topology type: its module has to output
+    triangles, `conservative_raster::mesh_outputs_triangles`); conservative TIR (`ForcedSampleCount != 0`) remains `E_NOTIMPL`.
     Tier 2 additionally requires `degenerateTrianglesRasterized` and primitive overestimation plus half a
     device subpixel step no greater than 1/256 pixel. Other eligible devices retain Tier 1. The standalone
     device does not expose Tier 3: the Xbox `SV_InnerCoverage` input mapping has not been confirmed. See

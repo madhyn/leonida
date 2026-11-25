@@ -11224,8 +11224,11 @@ public:
                 log_once("conservative rasterization needs enabled VK_EXT_conservative_rasterization and Tier 1 precision", 1);
                 return E_INVALIDARG;
             }
-            if (r.FillMode != D3D12_FILL_MODE_SOLID ||
-                topology_type != D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE) return E_INVALIDARG;
+            // A mesh pipeline has no input assembler, so its stream need not set the topology type: what is rasterized
+            // is the module's output, and it has to be triangles as well.
+            if (r.FillMode != D3D12_FILL_MODE_SOLID) return E_INVALIDARG;
+            if (mesh ? !leonida::conservative_raster::mesh_outputs_triangles(stages[0].words)
+                     : topology_type != D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE) return E_INVALIDARG;
             // Target-independent rasterization is a separate pipeline path; do not silently ignore its count.
             if (r.ForcedSampleCount)
                 return stream_unsupported("target-independent rasterization; forced sample count", int(r.ForcedSampleCount));
