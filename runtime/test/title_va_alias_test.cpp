@@ -123,6 +123,42 @@ int main() {
     EXPECT(!a.shader_side(arena) && a.shader_side(0xA0000ff) && !a.shader_side(0xA000100));
     a.remove(title + 0x100, 0xA000000);
     EXPECT(a.size() == 0 && !a.shader_side(0xA000000));
+
+    constexpr std::uint64_t twin = title + 0x10000000;
+    EXPECT(a.add(twin + size, size, arena));
+    std::uint64_t pool_cursor = 0;
+    EXPECT(a.changed_ranges(pool_cursor, past));
+    const auto pool_generation = a.generation();
+    EXPECT(!a.add_twin(title, twin, size * 2, 0x5000000));
+    EXPECT(a.generation() == pool_generation && !a.shader_side(0x5000000));
+    EXPECT(a.size() == 1 && a.shader_va(title) == title && a.shader_va(twin) == twin);
+    EXPECT(a.shader_va(twin + size) == arena);
+    EXPECT(a.add_twin(title, twin, size, 0x5000000));
+    EXPECT(a.generation() != pool_generation && a.shader_side(0x5000000));
+    leonida::DescriptorRanges paired_changes;
+    EXPECT(a.changed_ranges(pool_cursor, paired_changes));
+    paired_changes.merge();
+    EXPECT(paired_changes.overlaps(title, size) && paired_changes.overlaps(twin, size));
+    EXPECT(a.size() == 3 && a.shader_va(title) == 0x5000000 && a.shader_va(twin) == 0x5000000);
+    EXPECT(a.shader_va(twin + size) == arena);
+
+    a.remove(title, 0x5000000);
+    EXPECT(a.add(title + size / 2, size, 0x7000000));
+    EXPECT(a.reuse_pool_mapping(title, twin, size, to) && to == 0x5000000);
+    EXPECT(a.range_of(title, to, room) && room == size / 2);
+    EXPECT(a.shader_va(title + size / 2) == 0x7000000);
+    EXPECT(a.reuse_pool_mapping(title + size / 2, twin + size / 2, size, to) && to == 0x7000000);
+    EXPECT(!a.add_twin(title + 4 * size, title + 5 * size, size * 2, arena));
+    EXPECT(a.add(title + 4 * size, size, 0x8000000));
+    EXPECT(a.add(twin + 5 * size - 16, 16, 0x9000000));
+    EXPECT(a.reuse_pool_mapping(twin + 4 * size + 16, title + 4 * size + 16, size, to) && to == 0x8000010);
+    a.remove(title + 4 * size, 0x8000000);
+    EXPECT(a.shader_side(0x8000010));
+    a.forget_copy(twin + 4 * size, size, 0x8000000);
+    EXPECT(!a.shader_side(0x8000010));
+    EXPECT(a.shader_va(twin + 4 * size + 16) == twin + 4 * size + 16);
+    EXPECT(a.shader_va(twin + 5 * size - 16) == 0x9000000);
+
     std::printf("title_va_alias: translation inside a title-placed range, identity outside it and after release\n");
     return 0;
 }
