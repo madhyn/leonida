@@ -198,12 +198,9 @@ public:
     }
     ~FramePacer() {
         clock_.set_wake({});
-        {
-            std::lock_guard guard(mutex_);
-            shutdown_ = true;
-        }
-        cv_.notify_all();
         std::unique_lock lock(mutex_);  // waiters leave before the members go
+        shutdown_ = true;
+        cv_.notify_all();
         cv_.wait(lock, [this] { return waiters_ == 0; });
     }
     FramePacer(const FramePacer&) = delete;
@@ -256,12 +253,19 @@ public:
         if (event >= frame_event_count) return pacer_hr::invalid_arg;
         if (event == frame_event_origin && !token) return pacer_hr::invalid_arg;
         std::unique_lock lock(mutex_);
+        if (shutdown_) return pacer_hr::invalid_state;
         if (current_origin_poll_ && event == frame_event_origin && timeout_ms == 0 && (flags & wait_flag_current_token))
             return current_token_locked(token);
         ++waiters_;
-        const std::int32_t result = wait_locked(lock, event, timeout_ms, flags, token);
-        if (--waiters_ == 0) cv_.notify_all();
-        return result;
+        // Decrement before `lock` unlocks so an exception from an injected clock does not strand `~FramePacer`.
+        struct WaiterRegistration {
+            std::uint32_t& count;
+            std::condition_variable& cv;
+            ~WaiterRegistration() {
+                if (--count == 0) cv.notify_all();
+            }
+        } waiter{waiters_, cv_};
+        return wait_locked(lock, event, timeout_ms, flags, token);
     }
 
     // GetFrameStatisticsX(token, type_mask, &count, array). `count` is the room in `out` on entry and the number of
@@ -427,7 +431,13 @@ public:
 
     // The fps cap off (LEONIDA_PRESENT_UNCAP; see the top comment): waits never block and presents count as shown
     // at once. Registration and suspension keep meaning what they did; the flag survives suspend/resume.
-    void set_uncapped(bool on) { std::lock_guard guard(mutex_); uncapped_ = on; }
+    void set_uncapped(bool on) {
+        {
+            std::lock_guard guard(mutex_);
+            uncapped_ = on;
+        }
+        cv_.notify_all();
+    }
     bool uncapped() const { std::lock_guard guard(mutex_); return uncapped_; }
 
     // Frame-time percentiles, mean drift against the active target interval, and origin-to-present latency over
