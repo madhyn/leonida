@@ -5,7 +5,7 @@
 // `python -I tools/xdxr_bvh.py check-build <out dir>` (ctest: xbox_bvh_builder + xbox_bvh_builder_check), which
 // checks the records and traces rays against brute force. Also checked: the shim's prebuild sizes are the layer's,
 // an element asking for offline statistics is skipped and leaves its destination untouched, a non-empty XDXR stream
-// is accepted, rehydration answers E_NOTIMPL, and builders are released.
+// is accepted, rehydration rebuilds or deserializes with S_OK, and builders are released.
 //
 //   xbox_bvh_builder_test <out dir>        the shim
 //   xbox_bvh_builder_test --console        run with LEONIDA_BVH_BUILDER=console: nothing is registered
@@ -373,11 +373,41 @@ int main(int argc, char** argv) {
     list->CopyBufferRegion(compacted_rb.p, 0, compacted.p, 0, post[0]);
     if (!submit()) return fail("the compaction did not complete");
 
-    // ---- RehydrateRaytracingAccelerationStructureBatched2X: not implemented yet ----
+    // ---- RehydrateRaytracingAccelerationStructureBatched2X: rebuilds or deserializes ----
+    Ref<ID3D12Resource> rehydrated_as, rehydrated_rb;
+    if (FAILED(hr = buffer(device.p, D3D12_HEAP_TYPE_DEFAULT, blas_info.ResultDataMaxSizeInBytes, as_state, uav,
+                           rehydrated_as.put())) ||
+        FAILED(hr = buffer(device.p, D3D12_HEAP_TYPE_READBACK, blas_info.ResultDataMaxSizeInBytes,
+                           D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_FLAG_NONE, rehydrated_rb.put())))
+        return fail("rehydrated buffers", hr);
+    if (FAILED(allocator->Reset()) || FAILED(list->Reset(allocator.p, nullptr))) return fail("Reset for rehydrate");
+
     D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC rehydrate_desc{};
+    rehydrate_desc.DestAccelerationStructureData = rehydrated_as->GetGPUVirtualAddress();
+    rehydrate_desc.Inputs = blas_inputs;
+    rehydrate_desc.ScratchAccelerationStructureData = scratch->GetGPUVirtualAddress();
     const UINT64 source = blas->GetGPUVirtualAddress();
-    check(rehydrate(builder, list.p, 1, &rehydrate_desc, &source) == E_NOTIMPL,
-          "RehydrateRaytracingAccelerationStructureBatched2X answers E_NOTIMPL (stage 2)");
+
+    check(rehydrate(builder, nullptr, 1, &rehydrate_desc, &source) == E_INVALIDARG,
+          "RehydrateRaytracingAccelerationStructureBatched2X rejects null list");
+    check(rehydrate(builder, list.p, 1, nullptr, &source) == E_INVALIDARG,
+          "RehydrateRaytracingAccelerationStructureBatched2X rejects null descs");
+    check(rehydrate(builder, list.p, 0, nullptr, nullptr) == S_OK,
+          "RehydrateRaytracingAccelerationStructureBatched2X with count 0 returns S_OK");
+    check(rehydrate(builder, list.p, 1, &rehydrate_desc, &source) == S_OK,
+          "RehydrateRaytracingAccelerationStructureBatched2X rebuilds BLAS and returns S_OK");
+    list->ResourceBarrier(1, &barrier);
+    list->CopyBufferRegion(rehydrated_rb.p, 0, rehydrated_as.p, 0, blas_info.ResultDataMaxSizeInBytes);
+    if (!submit()) return fail("the rehydrate build did not complete");
+    {
+        void* p = nullptr;
+        std::uint32_t units = 0;
+        if (SUCCEEDED(rehydrated_rb->Map(0, nullptr, &p))) {
+            std::memcpy(&units, static_cast<char*>(p) + 4, 4);
+            rehydrated_rb->Unmap(0, nullptr);
+        }
+        check(units > 0, "the rehydrated structure has non-zero totalSizeIn64BNodes header");
+    }
 
     // ---- dump for xdxr_bvh.py check-build ----
     auto dump = [&](ID3D12Resource* rb, UINT64 size, const std::string& name, const std::string& json) {

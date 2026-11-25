@@ -28,8 +28,9 @@
 //   - The DLL throws its validation errors as C++ exceptions (docs/xdxr.md, "Errors are thrown, not returned"). A
 //     shim must not throw into the title, so an element the DLL would reject is logged and skipped instead. The one
 //     rule a correct title meets every time is kept: the offline-statistics postbuild type (0x10) is never written.
-//   - Rehydration is not implemented yet: RehydrateRaytracingAccelerationStructureBatched2X logs once and returns
-//     E_NOTIMPL. (Planned: rebuild each structure from the source geometry its description carries.)
+//   - Rehydration: RehydrateRaytracingAccelerationStructureBatched2X rebuilds each structure from the source
+//     geometry its description carries (BuildRaytracingAccelerationStructure) or deserializes from the source buffer
+//     (CopyRaytracingAccelerationStructure with DESERIALIZE) and returns S_OK.
 //
 // The builder object belongs to the title, which allocates it with a size this file doesn't know, so nothing is
 // written into it: what the shim keeps (the device, the Morton option) lives in a table keyed by its address.
@@ -227,12 +228,38 @@ void builder_copy(void*, void* list, UINT64 dest, UINT64 source, D3D12_RAYTRACIN
 }
 
 // ?RehydrateRaytracingAccelerationStructureBatched2X@XboxBvhBuilder@@QEAAJPEAUID3D12GraphicsCommandList8@@IPEBUD3D12_
-// BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC@@PEB_K@Z -> HRESULT. Not implemented yet (see the header comment).
-HRESULT builder_rehydrate_batched2x(void*, void*, UINT, const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC*,
-                                    const UINT64*) {
-    static std::atomic<bool> s_logged{false};
-    log_once(s_logged, "RehydrateRaytracingAccelerationStructureBatched2X is not implemented yet; E_NOTIMPL");
-    return E_NOTIMPL;
+// BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC@@PEB_K@Z -> HRESULT.
+// Rebuilds or deserializes each acceleration structure on the command list.
+HRESULT builder_rehydrate_batched2x(void*, void* list, UINT count,
+                                    const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC* descs,
+                                    const UINT64* source_data) {
+    if (count == 0) return S_OK;
+    if (!descs) return E_INVALIDARG;
+    if (!list) return E_INVALIDARG;
+    ID3D12GraphicsCommandList4* list4 = list4_of(list);
+    if (!list4) {
+        static std::atomic<bool> s_logged{false};
+        log_once(s_logged, "RehydrateRaytracingAccelerationStructureBatched2X: the list has no ID3D12GraphicsCommandList4");
+        return E_NOINTERFACE;
+    }
+    for (UINT i = 0; i < count; ++i) {
+        D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC build = descs[i];
+        const UINT64 src = source_data ? source_data[i] : build.SourceAccelerationStructureData;
+        if (!build.SourceAccelerationStructureData && src) {
+            build.SourceAccelerationStructureData = src;
+        }
+        if (build.Inputs.NumDescs > 0 && (build.Inputs.pGeometryDescs || build.Inputs.InstanceDescs)) {
+            list4->BuildRaytracingAccelerationStructure(&build, 0, nullptr);
+        } else if (src && build.DestAccelerationStructureData) {
+            list4->CopyRaytracingAccelerationStructure(
+                build.DestAccelerationStructureData, src,
+                D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_DESERIALIZE);
+        } else {
+            list4->BuildRaytracingAccelerationStructure(&build, 0, nullptr);
+        }
+    }
+    list4->Release();
+    return S_OK;
 }
 
 constexpr const char kDll[] = "xboxbvhbuilder.dll";
