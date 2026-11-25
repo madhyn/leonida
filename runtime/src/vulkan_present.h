@@ -74,6 +74,7 @@ struct PresentPlane {
     bool point_filter = false;     // nearest texel; otherwise bilinear inside the source rectangle
     bool hdr10 = false;            // the texture holds ST.2084 (PQ) Rec.2020 values; otherwise sRGB or G2.2 (PresentPlanes::sdr_eotf) Rec.709 ones
     bool straight_alpha = false;   // plane 1 only: alpha is not premultiplied into the colour
+    bool opaque_alpha = false;     // the source format has no alpha, even if its Vulkan image does
 };
 struct PresentPlanes {
     PresentPlane plane[2];
@@ -1299,6 +1300,7 @@ private:
             view_info.image = current[i].image;
             view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
             view_info.format = current[i].format;
+            if (planes.plane[i].opaque_alpha) view_info.components.a = VK_COMPONENT_SWIZZLE_ONE;
             view_info.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
             if (vk.vkCreateImageView(context_.device(), &view_info, nullptr, &frame.views[i]) != VK_SUCCESS) {
                 drop_views(frame);
