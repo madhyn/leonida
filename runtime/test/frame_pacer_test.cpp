@@ -416,6 +416,49 @@ int main() {
         EXPECT(pacer.registered());
     }
 
+    // Preserve already displayed frames and move each remaining frame to a vblank on the rebased grid.
+    {
+        ManualFrameClock clock;
+        FramePacer pacer(clock);
+        EXPECT(setup(pacer, 3));
+        clock.advance_us(period);
+        std::uint64_t first = 0, second = 0, third = 0, fourth = 0;
+        EXPECT(pacer.wait_frame_event(frame_event_origin, 0, 0, &first) == pacer_hr::ok);
+        pacer.commit_present_token(first, 1);
+        EXPECT(pacer.wait_frame_event(frame_event_origin, 0, frame_wait_flag_token_on_timeout, &second) ==
+               pacer_hr::false_);
+        pacer.commit_present_token(second, 1);
+        EXPECT(pacer.wait_frame_event(frame_event_origin, 0, frame_wait_flag_token_on_timeout, &third) ==
+               pacer_hr::false_);
+        pacer.commit_present_token(third, 1);
+        EXPECT(pacer.frames_in_flight() == 3);
+
+        constexpr auto new_epoch = 2 * period + period / 4;
+        constexpr auto new_period = period / 2;
+        clock.advance_us(new_epoch - period);
+        EXPECT(pacer.set_frame_interval(new_period, 3, 0) == pacer_hr::ok);
+        EXPECT(pacer.frames_in_flight() == 2);
+
+        const auto displayed_at = [&](std::uint64_t token) {
+            FrameStatistic stats;
+            std::uint32_t count = 1;
+            return pacer.get_frame_statistics(token, stat_display, &count, &stats) == pacer_hr::ok ?
+                   stats.time_us : no_deadline;
+        };
+        EXPECT(displayed_at(first) == 2 * period);
+        EXPECT(displayed_at(second) == no_deadline);
+        clock.advance_us(new_period);
+        EXPECT(displayed_at(second) == new_epoch + new_period);
+        EXPECT(displayed_at(third) == no_deadline);
+        EXPECT(pacer.wait_frame_event(frame_event_origin, 0, 0, &fourth) == pacer_hr::ok);
+        pacer.commit_present_token(fourth, 1);
+        clock.advance_us(new_period);
+        EXPECT(displayed_at(third) == new_epoch + 2 * new_period);
+        EXPECT(displayed_at(fourth) == no_deadline);
+        clock.advance_us(new_period);
+        EXPECT(displayed_at(fourth) == new_epoch + 3 * new_period);
+    }
+
     // Scheduling inside a period, before the offset has passed: that period's origin is still to come.
     {
         ManualFrameClock clock;
