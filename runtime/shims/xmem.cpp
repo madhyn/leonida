@@ -1992,6 +1992,13 @@ BOOL WINAPI XMemMapPhysicalPagesScatter(void* const* addresses, uint32_t page_co
 // calls with the same page make them. Every source page is looked up before any destination page changes, so a source
 // range that overlaps the destination maps what was there before the call. A destination in a GPU-only range is mapped
 // at its paired CPU range too (title_gpu_views), and a source page missing at a GPU-only address is looked up there.
+auto find_mapped_source_page(uintptr_t source) {
+    const auto mapped = g_mapped.find(source);
+    if (mapped != g_mapped.end()) return mapped;
+    const uintptr_t cpu_source = leonida::title_gpu_views::to_cpu(source, kPhysicalPageSize);
+    return cpu_source == source ? mapped : g_mapped.find(cpu_source);
+}
+
 bool copy_page_mappings(void* destination, const void* source, uint64_t pages, bool repeat_first) {
     const uintptr_t to = reinterpret_cast<uintptr_t>(destination);
     const uintptr_t from = reinterpret_cast<uintptr_t>(source);
@@ -2025,11 +2032,7 @@ bool copy_page_mappings(void* destination, const void* source, uint64_t pages, b
     std::vector<uint64_t> found(static_cast<size_t>(pages), 0);
     for (uint64_t i = 0; i < pages; ++i) {
         const uintptr_t src_va = from + (repeat_first ? 0 : i) * kPhysicalPageSize;
-        auto it = g_mapped.find(src_va);
-        if (it == g_mapped.end()) {  // a GPU-only source whose pages were mapped at its CPU view
-            const uintptr_t cpu_src = leonida::title_gpu_views::to_cpu(src_va, kPhysicalPageSize);
-            if (cpu_src != src_va) it = g_mapped.find(cpu_src);
-        }
+        const auto it = find_mapped_source_page(src_va);
         if (it != g_mapped.end()) found[static_cast<size_t>(i)] = it->second;
     }
     const DWORD protect = view_protect(*window);
@@ -2439,7 +2442,7 @@ bool copy_page_mappings(std::uint32_t count, const PageBatch* batches, std::uint
                         const auto source = pool + uint64_t(r.start) * kPhysicalPageSize;
                         for (uint32_t j = 0; j < n; ++j) {
                             const auto src = source + uint64_t(j) * kPhysicalPageSize;
-                            const auto it = g_mapped.find(src);
+                            const auto it = find_mapped_source_page(src);
                             if (it == g_mapped.end()) {
                                 // A hole in a valid source window unmaps the destination (CLHelper, RT-QUEUE31).
                                 if (!find_window(src, kPhysicalPageSize))
