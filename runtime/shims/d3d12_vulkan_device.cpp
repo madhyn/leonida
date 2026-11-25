@@ -18059,11 +18059,21 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     }
     const char* host_image_copy_name = VK_EXT_HOST_IMAGE_COPY_EXTENSION_NAME;
     info.host_image_copy = has_host_image_copy && host_copy.hostImageCopy;
+    char host_copy_env[8]{};
+    DWORD host_copy_len = 0;
+    if (getenv_s(&host_copy_len, host_copy_env, "LEONIDA_HOST_IMAGE_COPY") == 0 && host_copy_len > 1) {
+        if (host_copy_env[0] == '0' || std::strcmp(host_copy_env, "off") == 0) {
+            info.host_image_copy = false;
+        }
+    }
     if (info.host_image_copy) {
         host_copy.pNext = *v13.next();  // after the conditional rendering features, if any
         *v13.next() = &host_copy;
     } else {
-        std::fprintf(stderr, "[rt] d3d12: no VK_EXT_host_image_copy; CPU texture copies use a staging submit\n");
+        std::fprintf(stderr, "[rt] d3d12: %s; CPU texture copies use a staging submit\n",
+                     (host_copy_len > 1 && (host_copy_env[0] == '0' || std::strcmp(host_copy_env, "off") == 0))
+                         ? "LEONIDA_HOST_IMAGE_COPY=0"
+                         : "no VK_EXT_host_image_copy");
     }
 
     const auto has_device_extension = [&](const char* name) {

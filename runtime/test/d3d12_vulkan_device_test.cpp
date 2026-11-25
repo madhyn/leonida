@@ -7086,6 +7086,20 @@ int main() {
         EXPECT(cpu_copies(device.p, d.bc, path.name) == 0);
     }
 
+    // LEONIDA_HOST_IMAGE_COPY=0 forces staging copies even on a device with VK_EXT_host_image_copy.
+    {
+        _putenv_s("LEONIDA_HOST_IMAGE_COPY", "0");
+        Ref<ID3D12Device> forced_staging;
+        EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device_standalone(IID_PPV_ARGS(&forced_staging.p))));
+        const rt::d3d12::VulkanDeviceInfo* made = rt::d3d12::vulkan_device_info(forced_staging.p);
+        EXPECT(made != nullptr);
+        if (made) {
+            EXPECT(!made->host_image_copy);
+        }
+        EXPECT(cpu_copies(forced_staging.p, d.bc, "staging copy with LEONIDA_HOST_IMAGE_COPY=0") == 0);
+        _putenv_s("LEONIDA_HOST_IMAGE_COPY", "");
+    }
+
     {
         Ref<ID3D12Device> removable;
         EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device_standalone(IID_PPV_ARGS(&removable.p))));

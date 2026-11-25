@@ -2928,6 +2928,9 @@ The console has two list topologies Vulkan lacks: rectangle list (`IASetPrimitiv
     without host-transfer usage before it is bound, and takes the staging path. `d3d12_vulkan_device_test` and
     `d3d12_subresource_copy_test` force this branch on any GPU with `VulkanDeviceInfo::force_host_transfer_retry`
     (their third CPU-copy path; the second compares it with the host runtime).
+  - Setting `LEONIDA_HOST_IMAGE_COPY=0` (or `off`) disables `VK_EXT_host_image_copy` and routes all CPU texture
+    copies through the staging submit path. This provides an immediate diagnostic bypass for driver-side host image
+    transfer write faults (e.g. `WRITE_INVALID` stops during world-start loading on NVIDIA GPUs).
 - 96-bit textures (`R32G32B32_FLOAT`/`_UINT`/`_SINT`/`_TYPELESS`, D3D-62) are `R32G32B32A32` images
   (`ResourceBinding::rgb96`), on every GPU. Most GPUs have no optimal-tiling RGB32 image (an RX 9070 XT reports
   no optimal features for `R32G32B32_SFLOAT`), and one that has would not avoid the repack: D3D12 places

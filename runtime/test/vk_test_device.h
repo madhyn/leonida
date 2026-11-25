@@ -550,6 +550,13 @@ private:
             instance_fn<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(physical, &query);
             host_image_copy = host_copy.hostImageCopy == VK_TRUE;
         }
+        char host_copy_env[8]{};
+        DWORD host_copy_len = 0;
+        if (getenv_s(&host_copy_len, host_copy_env, "LEONIDA_HOST_IMAGE_COPY") == 0 && host_copy_len > 1) {
+            if (host_copy_env[0] == '0' || std::strcmp(host_copy_env, "off") == 0) {
+                host_image_copy = false;
+            }
+        }
         const char* host_image_copy_name = VK_EXT_HOST_IMAGE_COPY_EXTENSION_NAME;
         if (host_image_copy) {
             host_copy.pNext = *v13_.next();  // after the conditional rendering features, if any
