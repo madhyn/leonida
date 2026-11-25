@@ -3086,6 +3086,15 @@ if(TARGET Vulkan::Headers)
     target_compile_definitions(xbox_gpu_label_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX LEONIDA_VULKAN_DEVICE)
     add_test(NAME xbox_gpu_label_completion COMMAND xbox_gpu_label_test)
     set_tests_properties(xbox_gpu_label_completion PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 20)
+    # The list values' write fallbacks (src/value_write_sink.h): an arena offset lands in the arena, a PAGE_NOACCESS
+    # page of xmem's through xmem's own mapping. xmem.cpp and registry.cpp are compiled in for the xmem.dll exports.
+    add_executable(xbox_list_value_fallback_test test/xbox_list_value_fallback_test.cpp shims/d3d12_xs_device.cpp
+                   shims/d3d12_xs_pso_stream.cpp shims/xmem.cpp shims/registry.cpp)
+    target_link_libraries(xbox_list_value_fallback_test PRIVATE gta6rt_d3d12_com psapi)
+    target_compile_definitions(xbox_list_value_fallback_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX LEONIDA_VULKAN_DEVICE)
+    target_link_options(xbox_list_value_fallback_test PRIVATE /OPT:NOREF)
+    add_test(NAME xbox_list_value_fallback COMMAND xbox_list_value_fallback_test)
+    set_tests_properties(xbox_list_value_fallback PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
     add_executable(d3d12_present_test test/d3d12_present_test.cpp)
     target_link_libraries(d3d12_present_test PRIVATE gta6rt_d3d12_com user32 gdi32 dxgi)
     target_compile_definitions(d3d12_present_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)

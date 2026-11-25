@@ -48,6 +48,7 @@
 #include "../src/title_page_watch.h"
 #include "../src/title_geometry_watch.h"
 #include "../src/title_va_alias.h"
+#include "../src/value_write_sink.h"
 
 namespace {
 
@@ -2271,6 +2272,28 @@ BOOL WINAPI TitleVirtualProtect(LPVOID address, SIZE_T size, DWORD protect, PDWO
 
 }  // namespace
 
+// The host bytes of the 64 KiB page at `address` (the 64 KiB-aligned address of the page), with the section kept
+// alive so that the bytes stay mapped after the lock is released. False when the page is not one of xmem's
+// physical pages. The section's own mapping of a page is the host's copy of those bytes, which the CPU may write
+// even where the title's own view of the page is PAGE_NOACCESS.
+namespace {
+struct HostPage {
+    std::shared_ptr<Section> section;
+    std::uint64_t offset = 0;
+};
+
+bool host_page(std::uintptr_t address, HostPage& out) {
+    const std::lock_guard lock(g_phys_mutex);
+    const auto mapped = g_mapped.find(address);
+    if (mapped == g_mapped.end()) return false;
+    const auto page = g_pages.find(mapped->second);
+    if (page == g_pages.end() || !page->second.section || !page->second.section->scratch) return false;
+    out.section = page->second.section;
+    out.offset = page->second.offset;
+    return true;
+}
+}  // namespace
+
 namespace rt::xmem {
 
 void note_stream_reservation(uintptr_t base, size_t size, uintptr_t caller_rva) {
@@ -2627,6 +2650,81 @@ std::shared_ptr<std::uint8_t> pin_mapped_data(const void* address, std::size_t s
     }
     return {section,static_cast<std::uint8_t*>(section->scratch)+offset+(start-first)};
 }
+
+// Writes `size` bytes at `address` in the title's memory, through the host pages xmem manages: the section's own
+// mapping of the physical page, which the CPU may write even where the title's own view of the page is
+// PAGE_NOACCESS (the GPU memory windows are). False when the range is not one of xmem's pages, or when the pages
+// cannot be committed.
+bool write_title_bytes(const void* address, const void* bytes, std::size_t size) {
+    if (!size) return true;
+    if (!address || !bytes) return false;
+    if (size > 2 * kPhysicalPageSize) return false;  // a value write is four or eight bytes
+    if (!commit_physical_range(address, size)) return false;
+    const auto start = reinterpret_cast<std::uintptr_t>(address);
+    const std::uintptr_t mask = ~static_cast<std::uintptr_t>(kPhysicalPageSize - 1);
+    // Every page of the range is resolved before anything is written, so a range that is not entirely xmem's leaves
+    // no half-written value behind. The section is kept alive by the handle, so the bytes stay mapped while they
+    // are written.
+    HostPage pages[2];
+    std::size_t count = 0;
+    for (std::size_t done = 0; done < size;) {
+        const std::uintptr_t at = start + done;
+        const std::uintptr_t page = at & mask;
+        if (count == 2 || !host_page(page, pages[count])) return false;
+        ++count;
+        done += kPhysicalPageSize - static_cast<std::size_t>(at - page);
+    }
+    std::size_t done = 0;
+    for (std::size_t index = 0; done < size; ++index) {
+        const std::uintptr_t at = start + done;
+        const std::uintptr_t page = at & mask;
+        const std::size_t offset = static_cast<std::size_t>(at - page);
+        std::size_t chunk = kPhysicalPageSize - offset;
+        if (chunk > size - done) chunk = size - done;
+        std::uint8_t* const host = static_cast<std::uint8_t*>(pages[index].section->scratch) + pages[index].offset;
+        // An aligned value in one store, as kernel_writes::store makes it: a title thread polling the same physical
+        // page through another view never reads half of it.
+        if (chunk == size && size == 4 && !(offset & 3))
+            std::atomic_ref(*reinterpret_cast<std::uint32_t*>(host + offset))
+                .store(*static_cast<const std::uint32_t*>(bytes), std::memory_order_relaxed);
+        else if (chunk == size && size == 8 && !(offset & 7))
+            std::atomic_ref(*reinterpret_cast<std::uint64_t*>(host + offset))
+                .store(*static_cast<const std::uint64_t*>(bytes), std::memory_order_relaxed);
+        else
+            std::memcpy(host + offset, static_cast<const std::uint8_t*>(bytes) + done, chunk);
+        done += chunk;
+    }
+    return true;
+}
+
+// The D3D12 layer calls this through leonida::value_sink (src/value_write_sink.h), so that the D3D12 library does not
+// have to link the xmem shim into every consumer of that library. A process that links the shim gets the write; one
+// that does not drops a value write that its host store could not land.
+[[maybe_unused]] const bool g_title_write_set = (leonida::value_sink::set_title_pages(&write_title_bytes), true);
+
+// The label target of an address in the pages the title maps: those pages are the title's memory, and the
+// console's value writes name them (src/gpu_label_memory.h). The region is tracked on demand, one per page, so
+// the label path finds a page by its address. The page tables are read under g_phys_mutex, and the region is
+// tracked after that lock is released: the label path takes the two locks the other way round.
+bool label_target(std::uintptr_t address, unsigned bytes, leonida::label::Target& out) {
+    if (!bytes || (bytes != 4 && bytes != 8) || (address & (bytes - 1))) return false;
+    const auto page = address & ~static_cast<std::uintptr_t>(kPhysicalPageSize - 1);
+    {
+        const std::lock_guard lock(g_phys_mutex);
+        const auto mapped = g_mapped.find(page);
+        if (mapped == g_mapped.end()) return false;
+        const auto entry = g_pages.find(mapped->second);
+        if (entry == g_pages.end() || !entry->second.section || !entry->second.section->scratch) return false;
+    }
+    // The region is tracked on demand, one per page. A region that is already there is kept: a target that is
+    // still in flight keeps the region it was captured from, and a replaced region would drop it.
+    if (!leonida::label::memory().capture(page, 4).owner.lock())
+        leonida::label::memory().track(page, kPhysicalPageSize, page, false);
+    out = leonida::label::memory().capture(address, bytes);
+    return static_cast<bool>(out.owner.lock());
+}
+
+[[maybe_unused]] const bool g_label_target_set = (rt::xmem::label_target_fn = &label_target, true);
 
 static bool commit_pages_locked(const uint64_t* page_array, size_t count) {
     if (count == 0) return true;

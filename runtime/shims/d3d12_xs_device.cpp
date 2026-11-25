@@ -3214,6 +3214,12 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
                     const unsigned width = Slot == 71 ? 4u : 8u;
                     const unsigned clock = Slot == 72 ? ((a4 & 1) ? 1u : ((a4 & 2) ? 2u : 0u)) : 0u;
                     auto target = leonida::label::memory().capture(a1, width);
+                    if (!target.owner.lock() && rt::xmem::label_target_fn) {
+                        // The pages the title maps are the title's memory too, and the xmem shim owns their page
+                        // tables (runtime/shims/xmem.h).
+                        leonida::label::Target mapped;
+                        if (rt::xmem::label_target_fn(a1, width, mapped)) target = std::move(mapped);
+                    }
                     if (target.owner.lock())
                         rt::d3d12::record_gpu_label(reinterpret_cast<ID3D12GraphicsCommandList*>(self->real),
                                                     {std::move(target), a2, clock});
@@ -6526,7 +6532,7 @@ const char* list_tail_slot_name(unsigned slot, unsigned char console_layout) {
     X(waits_relayed) X(gates_held) X(gates_met) X(gates_timed_out) X(cuts) X(cuts_deferred) X(cut_failures)  \
     X(gates_short) X(demotions) X(late_met) X(bundle_ops) X(releases) X(release_us) X(release_us_max)        \
     X(pass_us_max) X(release_stalls) X(remaps_now) X(remaps_deferred) X(remaps_failed) X(remap_wait_us_max)    \
-    X(stamps_gpu) X(stamps_cpu) X(labels_handed)
+    X(stamps_gpu) X(stamps_cpu) X(labels_handed) X(writes_arena) X(writes_title_pages)
 
 ListValueStats list_value_stats() {
     const list_values::Counters& c = list_values::counters();

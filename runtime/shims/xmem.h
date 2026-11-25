@@ -6,6 +6,8 @@
 #include <span>
 #include <vector>
 
+#include "../src/gpu_label_memory.h"  // leonida::label::Target: the console's value writes (list slots 71 and 72)
+
 namespace rt::xmem {
 
 // CopyPageMappingsBatchX, Xbox queue slot 31. Measured x64 layout (also documented by VIctory).
@@ -75,5 +77,17 @@ bool transfer_physical(std::span<const std::uint64_t> pages, std::uint16_t offse
 // Set by xmem.cpp when it is linked: the command-object proxy is also compiled into tests without it.
 using CopyPageMappingsFn = bool (*)(void* destination, const void* source, std::uint64_t pages, bool repeat_first);
 inline CopyPageMappingsFn copy_page_mappings_fn = nullptr;
+
+// Writes `size` bytes at `address` in the title's memory, through the host pages xmem manages: its own mapping of the
+// physical page, which the CPU may write where the title's view of the page is PAGE_NOACCESS. False when the range is
+// not xmem's pages. Registered with leonida::value_sink (src/value_write_sink.h) as the fallback of the console's
+// value writes (list slots 71 and 72), so that the D3D12 layer reaches it without linking this shim.
+bool write_title_bytes(const void* address, const void* bytes, std::size_t size);
+
+// The label target of an address in the pages the title maps: those pages are the title's memory too, and the
+// console's value writes name them (runtime/src/vulkan_gpu_labels.h). The shim owns the page tables, so it answers
+// the question. False when the address is not in one of the title's mapped pages.
+using LabelTargetFn = bool (*)(std::uintptr_t address, unsigned bytes, leonida::label::Target& out);
+inline LabelTargetFn label_target_fn = nullptr;
 
 }

@@ -231,6 +231,12 @@ The runtime's model:
   reads half of it, and pinned like any host write, so the slot-133 shadows see it). Later than the console, never
   earlier. Writes land in submission order across queues: the pump reads the fences newest write first, so a write
   whose work waited for an older one is never seen done before it.
+- Two targets that store cannot reach (`runtime/src/value_write_sink.h`). An address in the GPU address arena's
+  range is an arena offset, a default-heap buffer, not a host address: it is asked before any host store and lands
+  in the arena's own mapping (one in the arena's reserved start or a sparse buffer is dropped). A page of xmem's that
+  the title's view keeps `PAGE_NOACCESS` (a GPU-only window), where the store faults, lands through xmem's own
+  mapping of the physical page. Counted as `writes_arena` and `writes_title_pages`. In the boots to the story load no
+  write failed the host store (0 of 63 219), so both are a safety net.
 - `write64` flags 1 and 2 take the GPU's timestamp at the write's place in the list: an `EndQuery(TIMESTAMP)` on
   the real list (the Vulkan layer writes it at the bottom of the pipe) and a `ResolveQueryData` of that one slot into
   a readback ring of the device's, read when the write lands. Flag 1 lands those ticks, which count at the queue's

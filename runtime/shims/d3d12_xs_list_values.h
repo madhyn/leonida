@@ -17,7 +17,8 @@
 // - A part's writes land after the part has run: the queue proxy signals the queue's `written` fence behind the
 //   lists of a group and the pump, a thread of its own, stores the values with the CPU once that fence is reached
 //   (kernel_writes::store: one locked access for an aligned value, as any host write into title memory, so the
-//   slot-133 shadows see it). Later than the console, never earlier: a write in the middle of a part lands when the
+//   slot-133 shadows see it; an arena offset and a page xmem keeps PAGE_NOACCESS land through src/value_write_sink.h,
+//   see land()). Later than the console, never earlier: a write in the middle of a part lands when the
 //   whole part is done. Writes land in the order they were submitted, across queues too: the fences are read newest
 //   first, so a write whose work waited for an older one (a relay, a title fence) is never seen done before it.
 //   A timestamp write (write64 flags 1 and 2) lands the GPU's timestamp for its place in the list (Timestamps).
@@ -60,6 +61,7 @@
 
 #include "d3d12_xs_device.h"          // console_value_met, ListValueStats
 #include "../src/title_page_watch.h"  // leonida::kernel_writes::store
+#include "../src/value_write_sink.h"  // leonida::value_sink: the arena and xmem's PAGE_NOACCESS pages
 
 namespace rt::d3d12_xs::list_values {
 
@@ -171,6 +173,10 @@ struct Counters {
     std::atomic<std::uint64_t> stamps_gpu{0}, stamps_cpu{0};
     // List slot 71/72 writes handed to the GPU-label path (LEONIDA_GPU_LABELS) of a list these values do not track.
     std::atomic<std::uint64_t> labels_handed{0};
+    // Writes landed through the fallbacks (src/value_write_sink.h): in the GPU address arena (an arena offset is never
+    // stored to as a host address), and through xmem's own mapping of a page the title's view keeps PAGE_NOACCESS.
+    // Both are also counted in writes_landed.
+    std::atomic<std::uint64_t> writes_arena{0}, writes_title_pages{0};
 };
 
 inline Counters& counters() {
@@ -860,12 +866,29 @@ private:
                      previous && first >= previous ? static_cast<double>(first - previous) * ms_per_tick : 0.0);
     }
 
+    // A write's target, in this order (src/value_write_sink.h):
+    // - an offset in the GPU address arena (a default-heap buffer): the device writes its own mapping. Asked before
+    //   any host store, since a host store at an arena offset would write whatever host memory is at that number.
+    //   One the arena refuses (its reserved start, a sparse buffer) is dropped.
+    // - the title's memory: kernel_writes::store, as before.
+    // - a page of xmem's that the title's view keeps PAGE_NOACCESS, where that store faults: xmem writes its own
+    //   mapping of the physical page.
     void land(const WriteGroup& group) {
         note_stamps(*group.queue, group);
         for (const Write& write : group.writes) {
             const std::uint64_t value = write.kind == WriteKind::value ? write.value : stamp(*group.queue, write);
-            if (leonida::kernel_writes::store(reinterpret_cast<void*>(static_cast<std::uintptr_t>(write.address)),
-                                              value, write.bytes)) {
+            void* const target = reinterpret_cast<void*>(static_cast<std::uintptr_t>(write.address));
+            const leonida::value_sink::Landing arena = leonida::value_sink::arena(write.address, &value, write.bytes);
+            bool landed = arena == leonida::value_sink::Landing::landed;
+            if (landed) bump(counters().writes_arena);
+            if (arena == leonida::value_sink::Landing::elsewhere) {
+                landed = leonida::kernel_writes::store(target, value, write.bytes);
+                if (!landed && leonida::value_sink::title_pages(target, &value, write.bytes)) {
+                    landed = true;
+                    bump(counters().writes_title_pages);
+                }
+            }
+            if (landed) {
                 bump(counters().writes_landed);
                 continue;
             }

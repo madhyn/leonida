@@ -1909,6 +1909,16 @@ public:
         deletion_queue_.drain(current_ticket, device_, vk);
     }
 
+    // True when the VA names a sparse resource: the sparse pass binds its memory, not the arena's mapping, so the
+    // host's bytes at that offset are not the resource's. The console's value writes skip those.
+    bool is_sparse_va(std::uint64_t va) {
+        const std::shared_lock lock(resource_mutex_);
+        BufferVaIndex<ResourceId>::Hit hit{};
+        if (!buffer_vas_.find(va, hit)) return false;
+        const ResourceBinding* const b = resolve(hit.id);
+        return b && b->sparse_buffer;
+    }
+
     // Both methods are called with submit_mutex_ held. A queue's own progress timeline is
     // monotonic even when another queue completes first; global tickets are retired in order.
     void record_submit_locked(VkSemaphore progress, std::uint64_t value) {

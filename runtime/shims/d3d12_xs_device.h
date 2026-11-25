@@ -58,6 +58,14 @@
 //             CreateCommandList(0, type, allocator, initialState). The type is the first word of the Xbox desc; there
 //             is no node-mask argument in the console call (public HLE; the PC six-argument form differs). An riid the
 //             proxy does not answer (the console's own list IID) is answered with the proxy.
+//   slots 71/72  Write32BitValueBottomOfPipeX and Write64BitValueBottomOfPipeX: the console's value writes, with
+//             slots 73/74 (Wait32BitValueX, Wait64BitValueX) the waits that go with them. A list the list values
+//             track (d3d12_xs_list_values.h, LEONIDA_LIST_VALUES, on by default) records all four, lands each write
+//             once its part has run and holds its queue at a wait. Only for a list they do not track
+//             (LEONIDA_LIST_VALUES=0, bundles) does LEONIDA_GPU_LABELS=1 record slots 71/72 as GPU completion labels
+//             (runtime/src/vulkan_gpu_labels.h): one writer per list. Either writer lands a value at an arena offset
+//             in the arena, and one on a page of xmem's that the title's view keeps PAGE_NOACCESS through xmem's own
+//             mapping (runtime/src/value_write_sink.h).
 //   slots 78/79/80/81  SetFrameIntervalX, ScheduleFrameEventX, WaitFrameEventX, GetFrameStatisticsX. A presentation
 //             attached with set_presentation_handler (below) answers them; without one a per-device token state
 //             machine does, before the PC vtable is indexed: WaitFrameEventX returns at once with a fresh non-zero
@@ -476,6 +484,7 @@ struct ListValueStats {
     std::uint64_t remaps_now, remaps_deferred, remaps_failed, remap_wait_us_max;  // queue slot 31
     std::uint64_t stamps_gpu, stamps_cpu;  // write64 flags 1/2 landed with the GPU's timestamp, the CPU's clock
     std::uint64_t labels_handed;           // slot 71/72 writes given to LEONIDA_GPU_LABELS (lists not tracked here)
+    std::uint64_t writes_arena, writes_title_pages;  // landed in the arena, through xmem's mapping (in writes_landed)
 };
 ListValueStats list_value_stats();
 void reset_list_value_stats();
