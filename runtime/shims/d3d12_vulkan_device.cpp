@@ -476,7 +476,7 @@ public:
             // Wine (NtQueryVirtualMemory waits for Wine's virtual-memory lock, which the mapping threads hold), a
             // fifth of the submitting thread's time.
             const auto skip = [&](std::uint8_t s) {
-                return unchanged(s) || (!copy_aliased_ && (s == kAliased || s == kZero || s == (kZero | kAliased)));
+                return unchanged(s) || (s & ~kAliased) == kZero || (!copy_aliased_ && s == kAliased);
             };
             if (!full_walk && skip(state_[i0])) {
                 std::size_t i = i0 + 1;
@@ -3178,6 +3178,8 @@ struct DeviceState {
         std::vector<std::uint8_t> made;    // the title's bytes each arena slot was last made from
         std::vector<std::uint8_t> retry;   // per slot: not settled yet (fix_console_slot), in `retries`
         std::vector<std::uint32_t> retries;
+        std::vector<std::uint8_t> live_vsharp;  // per slot: buffer V# tracked in `live_vsharp_slots`
+        std::vector<std::uint32_t> live_vsharp_slots;
         std::set<std::uint32_t> empty_slots;
         std::uint32_t next_empty = 0;
         std::size_t retry_at = 0;  // where retry_console_slots goes on
@@ -3255,6 +3257,15 @@ struct DeviceState {
         }
         if (empty) heap.empty_slots.insert(std::uint32_t(slot));
         else if (!heap.empty_slots.empty()) heap.empty_slots.erase(std::uint32_t(slot));
+        const bool track_vsharp = heap.resource_heap && !(w[3] >> 30) && (w[2] || w[6]);
+        if (slot < heap.live_vsharp.size()) {
+            if (track_vsharp && !heap.live_vsharp[slot]) {
+                heap.live_vsharp[slot] = 1;
+                heap.live_vsharp_slots.push_back(std::uint32_t(slot));
+            } else if (!track_vsharp) {
+                heap.live_vsharp[slot] = 0;
+            }
+        }
         std::memcpy(heap.copy + slot * kDescriptorSize, w, kDescriptorSize);
         return settled;
     }
@@ -3285,6 +3296,7 @@ struct DeviceState {
                 std::chrono::steady_clock::now() - heap.fix_start >= std::chrono::microseconds(budget_us))
                 heap.fix_over = true;
             if (heap.fix_over) {
+                if (slot < heap.live_vsharp.size()) heap.live_vsharp[slot] = 0;
                 std::memset(heap.copy + at, 0, kDescriptorSize);
                 ++heap.deferred_fixes;
                 if (!heap.retry[slot]) {
@@ -3370,7 +3382,10 @@ struct DeviceState {
             const auto first = std::uint32_t(offset / kDescriptorSize);
             const auto end = std::uint32_t((offset + bytes) / kDescriptorSize);
             heap.empty_slots.erase(heap.empty_slots.lower_bound(first), heap.empty_slots.lower_bound(end));
-            for (auto slot = first; slot < end; ++slot) heap.retry[slot] = 0;
+            for (auto slot = first; slot < end; ++slot) {
+                heap.retry[slot] = 0;
+                heap.live_vsharp[slot] = 0;
+            }
         });
         const auto t1 = clock::now();
         heap.fix_start = t1;
@@ -3383,15 +3398,25 @@ struct DeviceState {
             heap.alias_generation = alias_generation;
             heap.checked_generation = generation;
             // Even an unchanged title slot may name a buffer released since the last submission.
-            for (size_t at = 0; at + kDescriptorSize <= heap.bytes; at += kDescriptorSize) {
-                auto* w = reinterpret_cast<uint32_t*>(heap.copy + at);
-                if (!(w[3] >> 30) && (w[2] || w[6])) {
-                    const auto slot = at / kDescriptorSize;
-                    if (!fix_console_slot(heap, slot) && !heap.retry[slot]) {
-                        heap.retry[slot] = 1;
-                        heap.retries.push_back(uint32_t(slot));
-                    }
+            // Scan only active buffer V# slots via fix_console_slot() (which reads cached `heap.previous`)
+            // instead of walking all slots in WC-VRAM `heap.copy`.
+            for (std::size_t i = 0; i < heap.live_vsharp_slots.size();) {
+                const auto slot = heap.live_vsharp_slots[i];
+                if (!heap.live_vsharp[slot]) {
+                    heap.live_vsharp_slots[i] = heap.live_vsharp_slots.back();
+                    heap.live_vsharp_slots.pop_back();
+                    continue;
                 }
+                if (!fix_console_slot(heap, slot) && !heap.retry[slot]) {
+                    heap.retry[slot] = 1;
+                    heap.retries.push_back(uint32_t(slot));
+                }
+                if (!heap.live_vsharp[slot]) {
+                    heap.live_vsharp_slots[i] = heap.live_vsharp_slots.back();
+                    heap.live_vsharp_slots.pop_back();
+                    continue;
+                }
+                ++i;
             }
         }
         const auto t2 = clock::now();
@@ -3610,6 +3635,7 @@ struct DeviceState {
                 heap->previous = heap->made.data();
             }
             heap->retry.assign(std::size_t(bytes / kDescriptorSize), 0);
+            heap->live_vsharp.assign(std::size_t(bytes / kDescriptorSize), 0);
             heap->pages = make_shadow_pages(reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(console_va)),
                                             heap->input, std::size_t(bytes));
         }
