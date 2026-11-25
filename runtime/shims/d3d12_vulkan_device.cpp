@@ -11115,7 +11115,8 @@ public:
                                                           return state_.allocate(requirements, 0,
                                                                                  VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
                                                                                  nullptr, /*device_address=*/true);
-                                                      });
+                                                      },
+                                                      state_.families);
             }
         }
         // The copies of a D24 texture stored as D32 convert on the GPU (vulkan_depth24.h), and so do the copies of

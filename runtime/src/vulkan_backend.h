@@ -1326,12 +1326,13 @@ public:
     // device-local memory, and must set VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT. LEONIDA_INDIRECT_CLAMP=0 turns the
     // pass off at replay time.
     void enable_indirect_clamp(PFN_vkGetDeviceProcAddr get, const VkPhysicalDeviceMemoryProperties& memory,
-                               const VkPhysicalDeviceLimits& limits, ScratchBuffers::Allocate allocate) {
+                               const VkPhysicalDeviceLimits& limits, ScratchBuffers::Allocate allocate,
+                               std::vector<std::uint32_t> families = {}) {
         std::unique_lock lock(resource_mutex_);
         replay_.require_indirect_clamp = indirect_clamp_enabled();
         if (!replay_.require_indirect_clamp) return;
         indirect_clamp_ = std::make_unique<IndirectArgumentClamp>(get, device_, memory, limits, std::move(allocate),
-                                                                 device_fault_.get());
+                                                                 device_fault_.get(), std::move(families));
         if (!indirect_clamp_->loaded()) {
             indirect_clamp_.reset();
             return;
