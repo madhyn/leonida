@@ -1794,6 +1794,54 @@ int check_written_pages_all(ID3D12Device* device) {
     return failures;
 }
 
+// A mapped plane above 256 KiB is hashed by samples every pass and every byte each sixth one. A byte the samples do
+// not cover must still reach the GPU, from ordinary pages and from write-combined ones (the title's graphics
+// memory), whose every-byte hash reads through a streaming copy.
+int check_mapped_plane_byte(ID3D12Device* device, DWORD modifier) {
+    const char* who = modifier ? "persistent write-combined plane, one byte" : "persistent plane, one byte";
+    constexpr UINT width = 1024, height = 512, size = width * height;
+    auto* pages = static_cast<std::uint8_t*>(
+        VirtualAlloc(nullptr, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE | modifier));
+    EXPECT(pages);
+    GpuReader gpu;
+    EXPECT(!gpu.init(device, size));
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = width;
+    desc.Height = height;
+    desc.Format = DXGI_FORMAT_R8_UNORM;
+    desc.SampleDesc.Count = desc.DepthOrArraySize = desc.MipLevels = 1;
+    leonida::title_xg_layouts::note({UINT(desc.Dimension), UINT(desc.Format), height, 1, 1, width}, 1);
+    Ref<ID3D12Resource> texture;
+    EXPECT_HR(rt::d3d12::create_buffer_at_host_address(device, pages, desc, 6, IID_PPV_ARGS(&texture.p)), S_OK);
+    void* mapped = nullptr;
+    EXPECT_HR(texture->Map(0, nullptr, &mapped), S_OK);
+    EXPECT(mapped == pages);
+    std::memset(pages, 0x40, size);
+    ID3D12CommandList* lists[]{gpu.list.p};
+    std::vector<std::uint8_t> pixels(size);
+    std::ptrdiff_t changed = 0;
+    for (unsigned pass = 0; pass < 14 && changed != 1; ++pass) {
+        // 1,000 bytes into a page: the sampled hash reads the first 64 bytes of a page and 64 from its middle.
+        if (pass == 1) pages[5 * 4096 + 1000] = 0x41;
+        gpu.queue->ExecuteCommandLists(1, lists);
+        EXPECT_HR(gpu.queue->Signal(gpu.fence.p, pass + 1), S_OK);
+        EXPECT_HR(gpu.fence->SetEventOnCompletion(pass + 1, gpu.done), S_OK);
+        EXPECT(WaitForSingleObject(gpu.done, 30000) == WAIT_OBJECT_0);
+        EXPECT_HR(texture->ReadFromSubresource(pixels.data(), width, size, 0, nullptr), S_OK);
+        changed = std::count(pixels.begin(), pixels.end(), std::uint8_t(0x41));
+        EXPECT(std::count(pixels.begin(), pixels.end(), std::uint8_t(0x40)) == std::ptrdiff_t(size) - changed);
+        if (!pass) EXPECT(!changed);
+    }
+    EXPECT(changed == 1);
+    texture->Unmap(0, nullptr);
+    texture.p->Release();
+    texture.p = nullptr;
+    VirtualFree(pages, 0, MEM_RELEASE);
+    std::printf("%s: seen on the GPU\n", who);
+    return 0;
+}
+
 // Replace mapped bytes twice, including compressed edge blocks, mip tails and array slices.
 int check_mapped_bc_array(ID3D12Device* device) {
     const char* who = "persistent BC1 array";
@@ -1902,6 +1950,8 @@ int main() {
             failures += check_pending_stream_views(ours.p);
             failures += check_shared_bc_placements(ours.p);
             failures += check_mapped_plane(ours.p);
+            for (const DWORD modifier : {DWORD(0), DWORD(PAGE_WRITECOMBINE)})
+                failures += check_mapped_plane_byte(ours.p, modifier);
             failures += check_mapped_bc_array(ours.p);
         }
         failures += check_written_pages_all(ours.p);

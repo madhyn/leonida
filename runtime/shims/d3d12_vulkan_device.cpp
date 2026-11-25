@@ -11871,7 +11871,17 @@ public:
             const auto* bytes = reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(t.cpu));
             const auto timed_hash = [&](std::uint64_t& out, bool all = false) {
                 const auto start = clock::now();
-                const bool ok = hash_guarded(bytes, std::size_t(span), out, all);
+                // Every byte of write-combined memory goes through a streaming copy (copy_guarded): ordinary loads
+                // from it are not cached, and hashing a 4 MiB mapped texture in place took 36 ms on average and up to
+                // 78 ms each sixth pass, one to two frames of a title that paces itself for 30 Hz.
+                bool ok;
+                if (all && title_memory_write_combined(t.cpu)) {
+                    title_tiled_.resize(std::size_t(span));
+                    ok = copy_guarded(title_tiled_.data(), bytes, std::size_t(span), true) &&
+                         hash_guarded(title_tiled_.data(), std::size_t(span), out, true);
+                } else {
+                    ok = hash_guarded(bytes, std::size_t(span), out, all);
+                }
                 stats.hash_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now() - start).count();
                 return ok;
             };
