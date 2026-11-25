@@ -97,6 +97,15 @@ inline bool is_srgb_format(VkFormat format) {
         return false;
     }
 }
+// An sRGB image with the same byte layout as an 8-bit SDR UNORM swapchain image.
+inline VkFormat srgb_copy_format(VkFormat format) {
+    switch (format) {
+    case VK_FORMAT_B8G8R8A8_UNORM: return VK_FORMAT_B8G8R8A8_SRGB;
+    case VK_FORMAT_R8G8B8A8_UNORM: return VK_FORMAT_R8G8B8A8_SRGB;
+    default: return VK_FORMAT_UNDEFINED;
+    }
+}
+
 // What vkCmdBlitImage cannot read: integer and block-compressed colour formats.
 inline bool blit_unsupported_format(VkFormat format) {
     switch (format) {
@@ -1128,17 +1137,7 @@ private:
 
         const PresentRect whole{0, 0, std::int32_t(binding.width), std::int32_t(binding.height)};
         const PresentRect& src = source_rect ? *source_rect : whole;
-        const std::int32_t sw = src.right - src.left, sh = src.bottom - src.top;
-        const std::int32_t dw = std::int32_t(extent_.width), dh = std::int32_t(extent_.height);
-        VkImageBlit blit{};
-        blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-        blit.srcOffsets[0] = {src.left, src.top, 0};
-        blit.srcOffsets[1] = {src.right, src.bottom, 1};
-        blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-        blit.dstOffsets[1] = {dw, dh, 1};
-        vkCmdBlitImage_(commands, binding.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, images_[image],
-                        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
-                        sw == dw && sh == dh ? VK_FILTER_NEAREST : blit_filter(binding.format));
+        record_colour_transfer(commands, binding, target.image, src);
 
         finish_image(commands, image, copy_frame);
         for (const auto& piece : pieces)
@@ -1146,6 +1145,109 @@ private:
                                   piece.layout, VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, any,
                                   VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
         vk.vkEndCommandBuffer(commands);
+    }
+
+    // A blit to an SDR UNORM swapchain would decode an sRGB source without encoding it again. At 1:1 with
+    // matching channel order, copy the encoded bytes. Otherwise let the normal blit scale and reorder channels
+    // into an sRGB image, then copy the bytes. Both paths work on sources that cannot be sampled.
+    void record_colour_transfer(VkCommandBuffer commands, const ResourceBinding& source, VkImage target,
+                                const PresentRect& src) {
+        constexpr VkImageSubresourceLayers colour{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        const auto copy = [&](VkImage from, VkOffset3D offset) {
+            const VkImageCopy region{colour, offset, colour, {}, {extent_.width, extent_.height, 1}};
+            context_.vk.vkCmdCopyImage(commands, from, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, target,
+                                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+        };
+        const bool unscaled = std::uint32_t(src.right - src.left) == extent_.width &&
+                              std::uint32_t(src.bottom - src.top) == extent_.height;
+        const bool srgb_fallback = srgb_transfer_format_ != VK_FORMAT_UNDEFINED && detail::is_srgb_format(source.format);
+        if (srgb_fallback && unscaled && source.format == srgb_transfer_format_) {
+            copy(source.image, {src.left, src.top, 0});
+            return;
+        }
+
+        const bool stage = srgb_fallback && ensure_srgb_transfer_image();
+        ResourceBinding scratch{};
+        if (stage) {
+            scratch.image = srgb_transfer_image_;
+            scratch.format = srgb_transfer_format_;
+            scratch.aspects = VK_IMAGE_ASPECT_COLOR_BIT;
+            // Every blit and copy runs on the same queue. Wait for the last transfer read before discarding
+            // the scratch's contents and writing it again.
+            detail::image_barrier(context_.replay_, commands, scratch, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+                                  VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                  0, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+                                  VK_PIPELINE_STAGE_TRANSFER_BIT);
+        } else if (swapchain_srgb_ && !detail::is_srgb_format(format_) && !warned_srgb_) {
+            warned_srgb_ = true;
+            std::fprintf(stderr, "[rt] present: cannot preserve sRGB on this swapchain; the plain blit may look darker\n");
+        }
+
+        VkImageBlit blit{};
+        blit.srcSubresource = colour;
+        blit.srcOffsets[0] = {src.left, src.top, 0};
+        blit.srcOffsets[1] = {src.right, src.bottom, 1};
+        blit.dstSubresource = colour;
+        blit.dstOffsets[1] = {std::int32_t(extent_.width), std::int32_t(extent_.height), 1};
+        vkCmdBlitImage_(commands, source.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, stage ? scratch.image : target,
+                        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
+                        unscaled ? VK_FILTER_NEAREST : blit_filter(source.format));
+        if (stage) {
+            detail::image_barrier(context_.replay_, commands, scratch, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+                                  VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                  VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                  VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+            copy(scratch.image, {});
+        }
+    }
+
+    bool ensure_srgb_transfer_image() {
+        if (srgb_transfer_image_) return true;
+        if (srgb_transfer_attempted_) return false;
+        srgb_transfer_attempted_ = true;
+
+        constexpr VkFormatFeatureFlags needed = VK_FORMAT_FEATURE_BLIT_DST_BIT | VK_FORMAT_FEATURE_TRANSFER_SRC_BIT |
+                                                VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
+        if (!vkGetPhysicalDeviceMemoryProperties_ || (format_features(srgb_transfer_format_) & needed) != needed)
+            return false;
+        const auto& vk = context_.vk;
+        const VkDevice device = context_.device();
+        VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+        info.imageType = VK_IMAGE_TYPE_2D;
+        info.format = srgb_transfer_format_;
+        info.extent = {extent_.width, extent_.height, 1};
+        info.mipLevels = info.arrayLayers = 1;
+        info.samples = VK_SAMPLE_COUNT_1_BIT;
+        info.tiling = VK_IMAGE_TILING_OPTIMAL;
+        info.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        VkImage image = VK_NULL_HANDLE;
+        if (vk.vkCreateImage(device, &info, nullptr, &image) != VK_SUCCESS) return false;
+
+        VkMemoryRequirements requirements{};
+        vk.vkGetImageMemoryRequirements(device, image, &requirements);
+        VkPhysicalDeviceMemoryProperties memory{};
+        vkGetPhysicalDeviceMemoryProperties_(physical_, &memory);
+        VkMemoryDedicatedAllocateInfo dedicated{VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO};
+        dedicated.image = image;
+        VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        allocation.pNext = &dedicated;
+        allocation.allocationSize = requirements.size;
+        for (std::uint32_t i = 0; i < memory.memoryTypeCount; ++i) {
+            if (!(requirements.memoryTypeBits & (1u << i)) ||
+                !(memory.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT))
+                continue;
+            allocation.memoryTypeIndex = i;
+            VkDeviceMemory object = VK_NULL_HANDLE;
+            if (vk.vkAllocateMemory(device, &allocation, nullptr, &object) != VK_SUCCESS) continue;
+            if (vk.vkBindImageMemory(device, image, object, 0) == VK_SUCCESS) {
+                srgb_transfer_image_ = image;
+                srgb_transfer_memory_ = object;
+                return true;
+            }
+            vk.vkFreeMemory(device, object, nullptr);
+        }
+        vk.vkDestroyImage(device, image, nullptr);
+        return false;
     }
 
     struct RollbackPlane {
@@ -1621,13 +1723,13 @@ private:
                 }
             if (found) break;
         }
+        VkFormat srgb_transfer_format = VK_FORMAT_UNDEFINED;
         if (!found && srgb) {
-            if (!warned_srgb_) std::fprintf(stderr, "[rt] present: the surface has no sRGB 8-bit format; an sRGB back buffer is shown darker\n");
-            warned_srgb_ = true;
             for (const auto& f : formats)
-                if ((f.format == VK_FORMAT_B8G8R8A8_UNORM || f.format == VK_FORMAT_R8G8B8A8_UNORM) &&
+                if (detail::srgb_copy_format(f.format) != VK_FORMAT_UNDEFINED &&
                     f.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) {
                     chosen = f;
+                    srgb_transfer_format = detail::srgb_copy_format(f.format);
                     break;
                 }
         }
@@ -1712,6 +1814,7 @@ private:
         images_ = std::move(images);
         ready_ = std::move(ready);
         format_ = chosen.format;
+        srgb_transfer_format_ = srgb_transfer_format;
         extent_ = extent;
         extent_packed_ = (std::uint64_t(extent.width) << 32) | extent.height;
         hdr_active_ = chose_hdr;
@@ -1787,6 +1890,12 @@ private:
     // Destroys a swapchain that is being replaced (or the last one), with the per-image semaphores that went with it.
     void release(VkSwapchainKHR swapchain) {
         const VkDevice device = context_.device();
+        if (srgb_transfer_image_) context_.vk.vkDestroyImage(device, srgb_transfer_image_, nullptr);
+        if (srgb_transfer_memory_) context_.vk.vkFreeMemory(device, srgb_transfer_memory_, nullptr);
+        srgb_transfer_image_ = VK_NULL_HANDLE;
+        srgb_transfer_memory_ = VK_NULL_HANDLE;
+        srgb_transfer_format_ = VK_FORMAT_UNDEFINED;
+        srgb_transfer_attempted_ = false;
         for (VkSemaphore semaphore : ready_)
             if (semaphore) context_.vk.vkDestroySemaphore(device, semaphore, nullptr);
         ready_.clear();
@@ -1809,6 +1918,10 @@ private:
     std::atomic<std::uint64_t> tear_presents_{0};
     VkSwapchainKHR swapchain_ = VK_NULL_HANDLE;
     VkFormat format_ = VK_FORMAT_UNDEFINED;
+    VkFormat srgb_transfer_format_ = VK_FORMAT_UNDEFINED;
+    VkImage srgb_transfer_image_ = VK_NULL_HANDLE;
+    VkDeviceMemory srgb_transfer_memory_ = VK_NULL_HANDLE;
+    bool srgb_transfer_attempted_ = false;
     VkExtent2D extent_{};
     std::vector<VkImage> images_;
     std::vector<VkSemaphore> ready_;  // per swapchain image: blit done, present may start
