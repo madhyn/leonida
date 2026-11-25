@@ -564,7 +564,8 @@ private:
         auto& tick = last_event_tick_[frame_event_origin];
         tick = std::max(tick, newest);
         const auto origin = first + static_cast<std::uint64_t>(tick) * period_us_;
-        *token = issue_token_locked(origin, origin - offset + period_us_);
+        // The current token can be polled before the first configured origin.
+        *token = issue_token_locked(std::min(origin, now), origin - offset + period_us_);
         return pacer_hr::ok;
     }
 

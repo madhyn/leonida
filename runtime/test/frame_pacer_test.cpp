@@ -195,6 +195,28 @@ int main() {
         EXPECT(next.get().token == 4);
     }
 
+    // A current-token poll before the first origin offset still issues immediately.
+    {
+        ManualFrameClock clock;
+        FramePacer pacer(clock, nullptr, true);
+        const std::uint32_t offset = period / 3;
+        const std::uint64_t poll_us = offset / 2;
+        EXPECT(pacer.set_frame_interval(period, 1, 0) == pacer_hr::ok);
+        EXPECT(pacer.schedule_frame_event(frame_event_origin, offset, 0) == pacer_hr::ok);
+        clock.advance_us(poll_us);
+        std::uint64_t token = 0;
+        EXPECT(pacer.wait_frame_event(frame_event_origin, 0, wait_flag_current_token, &token) == pacer_hr::ok);
+        pacer.commit_present_token(token, 1);
+        std::uint32_t count = 2;
+        FrameStatistic stats[2];
+        EXPECT(pacer.get_frame_statistics(token, stat_frame_event | stat_present, &count, stats) == pacer_hr::ok);
+        EXPECT(count == 2 && stats[0].time_us == poll_us && stats[1].time_us == poll_us);
+        clock.advance_us(period - poll_us);
+        count = 1;
+        EXPECT(pacer.get_frame_statistics(token, stat_display, &count, stats) == pacer_hr::ok);
+        EXPECT(count == 1 && stats[0].time_us == period);
+    }
+
     // Timeouts: 0 polls, a finite one counts fake time, the token is left alone, and a later wait still works.
     {
         ManualFrameClock clock;
