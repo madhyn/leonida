@@ -543,8 +543,8 @@ using AddressList = std::vector<uintptr_t, leonida::host_heap::Allocator<uintptr
 HostUnorderedMap<uintptr_t, AddressList> g_alias_peers;
 
 // With g_phys_mutex held. Keeps leonida::title_page_aliases in step: a page mapped at two or more addresses is
-// aliased at each of them (the D3D12 layer's slot-133 shadows copy those pages at every submission instead of
-// waiting for a write fault, which a write through another address doesn't raise).
+// aliased at each of them (the D3D12 layer's slot-133 shadows guard those pages at every address, since a write
+// through one address doesn't fault a guard on another).
 void note_mapping(uint64_t page, uintptr_t address, bool mapped) {
     auto& addresses = g_page_addresses[page];
     if (mapped) {
@@ -552,12 +552,6 @@ void note_mapping(uint64_t page, uintptr_t address, bool mapped) {
     } else {
         addresses.erase(address);
         leonida::title_page_aliases::set(address, false);
-    }
-    using namespace leonida::geometry_writes;
-    if (state().count.load(std::memory_order_acquire)) {
-        notify(address, address + kPhysicalPageSize, Event::mapping);
-        for (auto other : addresses)
-            if (other != address) notify(other, other + kPhysicalPageSize, Event::mapping);
     }
     const bool aliased = addresses.size() > 1;
     for (const uintptr_t at : addresses) leonida::title_page_aliases::set(at, aliased);
@@ -572,6 +566,13 @@ void note_mapping(uint64_t page, uintptr_t address, bool mapped) {
         peers.clear();
         for (const uintptr_t other : addresses)
             if (other != at) peers.push_back(other);
+    }
+    // After the peers: a cell's watcher that sees the new mapping asks geometry_aliases for the addresses again.
+    using namespace leonida::geometry_writes;
+    if (state().count.load(std::memory_order_acquire)) {
+        notify(address, address + kPhysicalPageSize, Event::mapping);
+        for (auto other : addresses)
+            if (other != address) notify(other, other + kPhysicalPageSize, Event::mapping);
     }
     if (addresses.empty()) g_page_addresses.erase(page);
 }
@@ -2767,6 +2768,8 @@ bool write_title_bytes(const void* address, const void* bytes, std::size_t size)
             std::memcpy(host + offset, static_cast<const std::uint8_t*>(bytes) + done, chunk);
         done += chunk;
     }
+    // Through the section, not the title's views: no fault tells a guard of them (a shadow's cells) of the write.
+    leonida::geometry_writes::notify(start, start + size, leonida::geometry_writes::Event::write);
     return true;
 }
 
