@@ -2441,6 +2441,7 @@ struct DeviceState {
         out = va;
         if (!arena.mapped || !context) return false;
         if (context->knows_buffer_va(va)) return false;  // an upload or readback buffer's biased VA, say
+        if (const std::uint64_t cpu_va = leonida::title_gpu_views::to_cpu(va, bytes); cpu_va != va) va = cpu_va;
         if (va < arena.size) {
             // Below the arena's size an address is an arena address unless the title's own memory is there (its
             // heap is: arena_allocate keeps out of those ranges).
@@ -2912,6 +2913,7 @@ struct DeviceState {
             to = geometry_va(base, bytes, false);
             if (to && encodable(to)) return to;
         }
+        if (const std::uint64_t cpu = leonida::title_gpu_views::to_cpu(base, bytes); cpu != base) base = cpu;
         uint64_t lo{}, hi{};
         if (make_window && aliases.title_memory(base, lo, hi) && bytes <= hi - base) {
             to = aliases.resolve(base, bytes, kind);
@@ -6288,21 +6290,37 @@ public:
                 shared_zero_ = device_.zero_sampled_image(desc_, format, footprint.size);
         }
         std::uint32_t plain_bits = 0;
-        if (stage_title && !shared_zero_ && allow_staged_title && origin != TitleImageOrigin::ordinary && !linear_placement &&
-            host_transfer_ && format.aspects == VK_IMAGE_ASPECT_COLOR_BIT && device_.image_requirements) {
-            for (std::uint32_t i = 0; i < device_.memory.memoryTypeCount; ++i) {
-                const auto flags = device_.memory.memoryTypes[i].propertyFlags;
-                if ((flags & (VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) ==
-                    VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) plain_bits |= 1u << i;
-            }
-            VkMemoryRequirements with{}, without{};
-            auto staged = info;
-            staged.usage &= ~VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT;
-            if (plain_bits && device_.memory_requirements(info, with) && !(with.memoryTypeBits & plain_bits) &&
-                device_.memory_requirements(staged, without) && (without.memoryTypeBits & plain_bits)) {
+        if (stage_title && !shared_zero_ && allow_staged_title && origin != TitleImageOrigin::ordinary &&
+            format.aspects == VK_IMAGE_ASPECT_COLOR_BIT && !format.d24_as_float && !format.rgb96) {
+            if (host_transfer_ && !linear_placement && device_.image_requirements) {
+                for (std::uint32_t i = 0; i < device_.memory.memoryTypeCount; ++i) {
+                    const auto flags = device_.memory.memoryTypes[i].propertyFlags;
+                    if ((flags & (VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) ==
+                        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) plain_bits |= 1u << i;
+                }
+                VkMemoryRequirements with{}, without{};
+                auto staged = info;
+                staged.usage &= ~VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT;
+                if (plain_bits && device_.memory_requirements(info, with) && !(with.memoryTypeBits & plain_bits) &&
+                    device_.memory_requirements(staged, without) && (without.memoryTypeBits & plain_bits)) {
+                    staged_title_ = true;
+                    host_transfer_ = false;
+                    info.usage = staged.usage;
+                }
+            } else if (!host_transfer_ && !device_.info.host_image_copy) {
+                for (std::uint32_t i = 0; i < device_.memory.memoryTypeCount; ++i) {
+                    const auto flags = device_.memory.memoryTypes[i].propertyFlags;
+                    if ((flags & (VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) ==
+                        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) plain_bits |= 1u << i;
+                }
+                if (plain_bits && device_.image_requirements) {
+                    VkMemoryRequirements staged_req{};
+                    if (!device_.memory_requirements(info, staged_req) || !(staged_req.memoryTypeBits & plain_bits))
+                        plain_bits = 0;
+                } else {
+                    plain_bits = 0;
+                }
                 staged_title_ = true;
-                host_transfer_ = false;
-                info.usage = staged.usage;
             }
         }
         auto retry_host = [&] {
@@ -6333,7 +6351,7 @@ public:
         VkMemoryRequirements requirements{};
         std::uint32_t type = UINT32_MAX;
         const bool stream = origin == TitleImageOrigin::streamed || origin == TitleImageOrigin::pending_stream;
-        const auto allowed = staged_title_ ? plain_bits : UINT32_MAX;
+        const auto allowed = (staged_title_ && plain_bits) ? plain_bits : UINT32_MAX;
         const bool deferrable = desc_.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
                                                D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL |
                                                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
@@ -6525,6 +6543,7 @@ public:
     }
 
     VkDeviceSize unbound_bytes() const { return image_backing_bytes() ? 0 : deferred_bytes_; }
+    bool ensure_placed_memory() { return bind_placed_memory(); }
 
 private:
     bool bind_placed_memory() {
@@ -12665,7 +12684,7 @@ private:
             return 0;
         }
         if (!t.owned && t.unbound_bytes) {
-            if (!t.resource->image()) {
+            if (!t.resource->image() || !t.resource->ensure_placed_memory()) {
                 t.stale = true;
                 return 0;
             }
@@ -18060,7 +18079,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     const char* host_image_copy_name = VK_EXT_HOST_IMAGE_COPY_EXTENSION_NAME;
     info.host_image_copy = has_host_image_copy && host_copy.hostImageCopy;
     char host_copy_env[8]{};
-    DWORD host_copy_len = 0;
+    std::size_t host_copy_len = 0;
     if (getenv_s(&host_copy_len, host_copy_env, "LEONIDA_HOST_IMAGE_COPY") == 0 && host_copy_len > 1) {
         if (host_copy_env[0] == '0' || std::strcmp(host_copy_env, "off") == 0) {
             info.host_image_copy = false;
