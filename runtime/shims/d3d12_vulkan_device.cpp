@@ -3025,67 +3025,50 @@ struct DeviceState {
                                                                                std::max<std::uint64_t>(bytes, 1)));
         const std::uint64_t twin = leonida::title_gpu_views::other_view(static_cast<std::uintptr_t>(source));
         const std::uint64_t twin_view = twin ? twin : source;  // the pair always has two addresses
-        if (!readable_page(source)) {
+        auto& aliases = leonida::title_va_aliases();
+        const auto other = source == va ? twin_view : source;
+        const auto max_size = std::min<std::uint64_t>(view.size - offset, kPoolExtentMax);
+        const auto reuse = [&] { return aliases.reuse_pool_mapping(va, other, max_size, out); };
+        const auto unbacked = [&] {
             out = 0;
             ++unbacked_requests;
             note_unbacked("stream pool", va, bytes);
             return true;
-        }
+        };
+        if (reuse()) return true;
+        if (!readable_page(source)) return unbacked();
         const std::uint64_t pool_end = (source >= view.gpu && source - view.gpu < view.size ? view.gpu : view.cpu) +
                                        view.size;
         const std::uint64_t run_end =
             readable_run_end(source & ~(kTitleWindowAlign - 1), std::min(pool_end, source + kPoolExtentMax));
         leonida::TitleWindowRange extent{};
         if (!leonida::title_pool_extent(source - offset, pool_end, source, run_end, kTitleWindowAlign, kPoolExtentMax,
-                                        extent)) {
-            out = 0;
-            ++unbacked_requests;
-            note_unbacked("stream pool", va, bytes);
-            return true;
-        }
-        const std::uint64_t twin_start = twin_view - (source - extent.start);  // the same pages in the other view
-        auto& aliases = leonida::title_va_aliases();
-        // A mapping that already holds the extent's start (a buffer made over these pages, or a window from another
-        // request) serves the request only as far as it reaches: claim that much, never bytes it does not cover.
-        std::uint64_t shader = 0, available = 0;
-        if (aliases.range_of(extent.start, shader, available) ||
-            aliases.range_of(twin_start, shader, available)) {
-            if (available < extent.size) {
-                if (available <= source - extent.start) shader = 0;
-                else extent.size = available;
-            }
-        }
-        if (shader) {
-            // Both addresses must reach it. The address the mapping was found at keeps its own (possibly wider)
-            // range: adding a shorter one over it would drop bytes another view still uses.
-            if (aliases.shader_va(twin_start) == twin_start) aliases.add(twin_start, extent.size, shader);
-            if (aliases.shader_va(extent.start) == extent.start) aliases.add(extent.start, extent.size, shader);
-        } else {
-            bool geometry_copy = false;
-            if (geometry.cap() && watch_shadow_writes() && !context->knows_buffer_va(extent.start, extent.size)) {
-                shader = geometry.resolve(*this, extent.start, extent.size, copy_geometry);
-                geometry_copy = shader != 0;
-            }
-            if (!shader) shader = make_title_window(extent.start, extent.size);
-            if (!shader) {
-                out = 0;
-                ++unbacked_requests;
-                note_unbacked("stream pool", va, bytes);
-                return true;
-            }
-            aliases.add_twin(extent.start, twin_start, extent.size, shader);
-            pool_spans.push_back({extent.start, twin_start, shader, extent.size, geometry_copy});
-            pool_span_count.store(pool_spans.size(), std::memory_order_relaxed);
-            pool_span_bytes += extent.size;
-            if (pool_spans.size() <= 4 || !(pool_spans.size() & (pool_spans.size() - 1)))
-                std::fprintf(stderr,
-                             "[rt] d3d12: a %llu KiB stream-pool extent is one %s mapping (alias 0x%llx and CPU view "
-                             "0x%llx share shader VA 0x%llx; %zu extents, %llu KiB)\n",
-                             static_cast<unsigned long long>(extent.size >> 10),
-                             geometry_copy ? "geometry-copy" : "window", static_cast<unsigned long long>(twin_view),
-                             static_cast<unsigned long long>(source), static_cast<unsigned long long>(shader),
-                             pool_spans.size(), static_cast<unsigned long long>(pool_span_bytes >> 10));
-        }
+                                        extent))
+            return unbacked();
+        std::uint64_t source_lo, source_hi, twin_lo, twin_hi;
+        aliases.gap(source, source_lo, source_hi);
+        aliases.gap(twin_view, twin_lo, twin_hi);
+        if (!leonida::clip_title_pool_extent(extent, source, twin_view, source_lo, source_hi, twin_lo, twin_hi))
+            return reuse() || unbacked();
+        const auto twin_start = twin_view - (source - extent.start);
+        std::uint64_t shader = 0;
+        if (geometry.cap() && watch_shadow_writes() && !context->knows_buffer_va(extent.start, extent.size))
+            shader = geometry.resolve(*this, extent.start, extent.size, copy_geometry);
+        const bool geometry_copy = shader != 0;
+        if (!shader) shader = make_title_window(extent.start, extent.size);
+        if (!shader || !aliases.add_twin(extent.start, twin_start, extent.size, shader))
+            return reuse() || unbacked();
+        pool_spans.push_back({extent.start, twin_start, shader, extent.size, geometry_copy});
+        pool_span_count.store(pool_spans.size(), std::memory_order_relaxed);
+        pool_span_bytes += extent.size;
+        if (pool_spans.size() <= 4 || !(pool_spans.size() & (pool_spans.size() - 1)))
+            std::fprintf(stderr,
+                         "[rt] d3d12: a %llu KiB stream-pool extent is one %s mapping (alias 0x%llx and CPU view "
+                         "0x%llx share shader VA 0x%llx; %zu extents, %llu KiB)\n",
+                         static_cast<unsigned long long>(extent.size >> 10),
+                         geometry_copy ? "geometry-copy" : "window", static_cast<unsigned long long>(twin_view),
+                         static_cast<unsigned long long>(source), static_cast<unsigned long long>(shader),
+                         pool_spans.size(), static_cast<unsigned long long>(pool_span_bytes >> 10));
         out = shader + (source - extent.start);
         return true;
     }

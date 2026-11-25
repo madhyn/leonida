@@ -63,4 +63,17 @@ inline bool title_pool_extent(std::uint64_t pool_lo, std::uint64_t pool_hi, std:
     return true;
 }
 
+inline bool clip_title_pool_extent(TitleWindowRange& extent, std::uint64_t source, std::uint64_t twin,
+                                   std::uint64_t source_lo, std::uint64_t source_hi,
+                                   std::uint64_t twin_lo, std::uint64_t twin_hi) {
+    if (source < source_lo || source >= source_hi || twin < twin_lo || twin >= twin_hi ||
+        source < extent.start || source - extent.start >= extent.size)
+        return false;
+    const auto prefix = source - extent.start;
+    const auto before = std::min({prefix, source - source_lo, twin - twin_lo});
+    const auto after = std::min({extent.size - prefix, source_hi - source, twin_hi - twin});
+    extent = {source - before, before + after};
+    return true;
+}
+
 }  // namespace leonida
