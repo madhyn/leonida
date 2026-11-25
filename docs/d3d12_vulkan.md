@@ -3999,6 +3999,9 @@ will forward to. The queue-side calls ignore which queue they came on (one `VkQu
   types and sizes are ours. The compose target follows the swapchain when it is recreated (resize, out-of-date acquire);
   `xbox_present_test` resizes the window between composed presents.
 
+  A B8G8R8X8 overlay is opaque within its destination rectangle because the sampled view supplies alpha 1. The
+  compositor leaves plane 0 visible outside that rectangle.
+
   Colour. Only `RGB_FULL_G22_NONE_P709` (0, SDR, also the default for a zeroed struct) and `RGB_FULL_G2084_NONE_P2020` (12,
   HDR10) are composed; any other value is composed as SDR and logged once. The swapchain is UNORM. If a plane is HDR10 and
   the surface lists an ST.2084 format (`VK_COLOR_SPACE_HDR10_ST2084_EXT`, `A2B10G10R10` or `A2R10G10B10`; needs

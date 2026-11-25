@@ -312,6 +312,7 @@ HRESULT XboxPresentation::present_x(UINT plane_count, const XboxPresentPlanePara
             out.point_filter = filter_of(p) == xbox_scale_filter_point;
             out.hdr10 = is_hdr10(p);
             out.straight_alpha = (p.Flags & xbox_plane_flag_straight_alpha) != 0;
+            out.opaque_alpha = i == 1 && alpha_unused(source_desc.Format);
         }
         bool tear = false;
         if (wants_tear && sync_interval > 0 && presenter_->tear_supported()) {

@@ -43,6 +43,13 @@ namespace leonida::label { struct Write; }
 namespace rt::d3d12 {
 bool record_gpu_label(ID3D12GraphicsCommandList* list, const leonida::label::Write& write);
 
+// B8G8R8X8 uses a BGRA8 Vulkan format with an unused alpha byte. Its DXGI typeless family is distinct from B8G8R8A8,
+// so a view crossing between them needs a castable-format list.
+constexpr bool alpha_unused(DXGI_FORMAT format) {
+    return format == DXGI_FORMAT_B8G8R8X8_TYPELESS || format == DXGI_FORMAT_B8G8R8X8_UNORM ||
+           format == DXGI_FORMAT_B8G8R8X8_UNORM_SRGB;
+}
+
 // How a queue answers GetClockCalibration. With `calibrated` (vkGetCalibratedTimestampsKHR or its EXT alias, on a
 // device whose time domains include DEVICE and QUERY_PERFORMANCE_COUNTER) both clocks are read in one call. Without
 // it, the queue writes a timestamp query and reads QueryPerformanceCounter around it; that needs `get_device_proc`

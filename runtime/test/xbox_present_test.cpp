@@ -1010,6 +1010,33 @@ int main() {
             refs[1] = model(ui, &middle_half, false);
             EXPECT(frame_matches(frame, refs, 2, false, 203.0, 1));
             std::printf("compose: 2 planes, bilinear overlay: within 1 level of the model\n");
+            {
+                const Px underlay{51, 153, 230}, opaque_green{0, 255, 0};
+                const auto check_overlay = [&](Source& source, float stored_alpha, bool straight, const Px& centre) {
+                    const FLOAT green_with_alpha[4] = {0.0f, 1.0f, 0.0f, stored_alpha};
+                    if (!fill(source, green_with_alpha)) return false;
+                    const UINT flags = rt::d3d12::xbox_plane_flag_overlay |
+                                       (straight ? rt::d3d12::xbox_plane_flag_straight_alpha : 0u);
+                    pair[1] = parameters(source, &middle_half, xbox_scale_filter_point, 0, flags);
+                    return present_planes(pair, 2) && composed_ok() &&
+                           region_is(frame, width / 4, height / 4, 3 * width / 4, 3 * height / 4, centre, 0) &&
+                           region_is(frame, 0, 0, width, height / 4, underlay, 0) &&
+                           region_is(frame, 0, 3 * height / 4, width, height, underlay, 0) &&
+                           region_is(frame, 0, height / 4, width / 4, 3 * height / 4, underlay, 0) &&
+                           region_is(frame, 3 * width / 4, height / 4, width, 3 * height / 4, underlay, 0);
+                };
+                EXPECT(check_overlay(bgra, 0.0f, false, underlay) && check_overlay(bgra, 1.0f, false, opaque_green));
+                std::puts("compose: BGRA overlay still uses its alpha");
+                for (DXGI_FORMAT format : {DXGI_FORMAT_B8G8R8X8_UNORM, DXGI_FORMAT_B8G8R8X8_UNORM_SRGB}) {
+                    Source bgrx;
+                    EXPECT(make_source(format, bgrx, 80, 60));
+                    for (bool straight : {false, true}) {
+                        EXPECT(check_overlay(bgrx, 1.0f, straight, opaque_green));
+                        EXPECT(check_overlay(bgrx, 0.0f, straight, opaque_green));
+                    }
+                }
+                std::puts("compose: BGRX UNORM and sRGB overlays are opaque inside their placement for both alpha modes");
+            }
             // Straight alpha with bilinear filtering across a transparent edge: opaque white on the left, transparent black on the
             // right. Colour is filtered premultiplied, so the edge is white at partial alpha, not grey (filtering the
             // unassociated colour would also quarter the colour and quarter it again by the alpha). At output x=160 the sample

@@ -2155,13 +2155,6 @@ bool rgb96_refused(const D3D12_RESOURCE_DESC& desc) {
                           D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL));
 }
 
-// B8G8R8X8: the BGRA8 Vulkan formats with the alpha byte unused. Its typeless family is a family of its own, so
-// only a castable-format list lets a view cross between it and B8G8R8A8, although both land on the same VkFormat.
-bool alpha_unused(DXGI_FORMAT format) {
-    return format == DXGI_FORMAT_B8G8R8X8_TYPELESS || format == DXGI_FORMAT_B8G8R8X8_UNORM ||
-           format == DXGI_FORMAT_B8G8R8X8_UNORM_SRGB;
-}
-
 // The 8-bit four-channel UNORM and SRGB formats in either channel order, B8G8R8X8 included. A texture in one of them
 // takes an RTV in another when its castable-format list names it: WARP and AMD's D3D12 driver store the clear or the
 // draw in the view's channel order and encoding.
