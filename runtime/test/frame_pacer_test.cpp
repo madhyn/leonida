@@ -459,6 +459,39 @@ int main() {
         EXPECT(displayed_at(fourth) == new_epoch + 3 * new_period);
     }
 
+    // Reapplying the same interval leaves a queued frame on its original display deadline.
+    {
+        constexpr std::uint32_t unchanged_period = 16000;
+        ManualFrameClock clock;
+        FramePacer pacer(clock);
+        EXPECT(pacer.set_frame_interval(unchanged_period, 3, 0) == pacer_hr::ok);
+        EXPECT(pacer.schedule_frame_event(frame_event_origin, 0, 0) == pacer_hr::ok);
+        clock.advance_us(unchanged_period);
+        std::uint64_t token = 0;
+        EXPECT(pacer.wait_frame_event(frame_event_origin, 0, 0, &token) == pacer_hr::ok);
+        pacer.commit_present_token(token, 1);
+        clock.advance_us(unchanged_period / 2);
+        EXPECT(pacer.set_frame_interval(unchanged_period, 3, 0) == pacer_hr::ok);
+
+        FrameStatistic stat;
+        std::uint32_t count = 1;
+        clock.advance_us(unchanged_period / 2 - 1);
+        EXPECT(pacer.get_frame_statistics(token, stat_display, &count, &stat) == pacer_hr::false_ && count == 0);
+        count = 1;
+        clock.advance_us(1);
+        EXPECT(pacer.get_frame_statistics(token, stat_display, &count, &stat) == pacer_hr::ok);
+        EXPECT(stat.time_us == 2 * unchanged_period);
+
+        // Origin events still use the epoch set by the latest call.
+        std::uint64_t next = 0;
+        EXPECT(pacer.wait_frame_event(frame_event_origin, 0, 0, &next) == pacer_hr::timeout);
+        clock.advance_us(unchanged_period / 2);
+        EXPECT(pacer.wait_frame_event(frame_event_origin, 0, 0, &next) == pacer_hr::ok);
+        count = 1;
+        EXPECT(pacer.get_frame_statistics(next, stat_frame_event, &count, &stat) == pacer_hr::ok);
+        EXPECT(stat.time_us == 2 * unchanged_period + unchanged_period / 2);
+    }
+
     // Scheduling inside a period, before the offset has passed: that period's origin is still to come.
     {
         ManualFrameClock clock;
