@@ -252,26 +252,52 @@ inline void log_exception(const EXCEPTION_POINTERS& info) {
 // LEONIDA_SKIP_INT3 (diagnostic, with --trace): an int3 in guest code is logged once per address and stepped over,
 // so a boot can be followed past the title's soft asserts (an int3 followed by code that carries on). Off by default:
 // a console title never reaches one in a correct run, so each skipped address is a finding, not a fix.
+inline bool skip_int3_enabled() noexcept {
+    static const bool skip = [] {
+        wchar_t v[8]{};
+        const DWORD n = GetEnvironmentVariableW(L"LEONIDA_SKIP_INT3", v, 8);
+        return n > 0 && v[0] != L'0';
+    }();
+    return skip;
+}
+
 inline bool skip_int3(EXCEPTION_POINTERS* info) {
-    static const bool skip = GetEnvironmentVariableW(L"LEONIDA_SKIP_INT3", nullptr, 0) != 0;
-    if (!skip || info->ExceptionRecord->ExceptionCode != EXCEPTION_BREAKPOINT || !info->ContextRecord) return false;
+    if (!skip_int3_enabled() || info->ExceptionRecord->ExceptionCode != EXCEPTION_BREAKPOINT || !info->ContextRecord)
+        return false;
     const auto* at = static_cast<const unsigned char*>(info->ExceptionRecord->ExceptionAddress);
-    if (!at || *at != 0xCC || info->ContextRecord->Rip != reinterpret_cast<DWORD64>(at)) return false;
+    const auto* rip = reinterpret_cast<const unsigned char*>(info->ContextRecord->Rip);
+    const unsigned char* site = nullptr;
+    // Windows reports ExceptionAddress == Rip at the 0xCC byte; Wine 11.x reports ExceptionAddress == Rip + 1 while
+    // ContextRecord->Rip still points at 0xCC (or both already point past 0xCC).
+    if (rip && *rip == 0xCC && (at == rip || at == rip + 1)) {
+        site = rip;
+        info->ContextRecord->Rip = reinterpret_cast<DWORD64>(rip + 1);
+    } else if (at && rip == at && *(at - 1) == 0xCC) {
+        site = at - 1;
+    } else {
+        return false;
+    }
     static std::mutex m;
     static std::set<const void*> seen;
     bool first = false;
     {
         const std::lock_guard lock(m);
-        first = seen.insert(at).second;
+        first = seen.insert(site).second;
     }
-    if (first) event("int3_skipped", "\"at\":" + quote(where(reinterpret_cast<uint64_t>(at))));
-    info->ContextRecord->Rip += 1;
+    if (first) {
+        const std::string loc = where(reinterpret_cast<uint64_t>(site));
+        if (enabled())
+            event("int3_skipped", "\"at\":" + quote(loc));
+        else
+            std::fprintf(stderr, "[rt] int3 skipped at %s\n", loc.c_str());
+    }
     return true;
 }
 
 inline LONG CALLBACK handler(EXCEPTION_POINTERS* info) {
-    if (!enabled() || in_handler || !info || !info->ExceptionRecord) return EXCEPTION_CONTINUE_SEARCH;
+    if (in_handler || !info || !info->ExceptionRecord) return EXCEPTION_CONTINUE_SEARCH;
     if (skip_int3(info)) return EXCEPTION_CONTINUE_EXECUTION;
+    if (!enabled()) return EXCEPTION_CONTINUE_SEARCH;
     in_handler = true;
 #ifdef _MSC_VER
     // Under /EHsc, catch(...) does not catch SEH faults (e.g. a bad DBG_PRINTEXCEPTION_C pointer or corrupt unwind).
@@ -293,6 +319,12 @@ inline LONG CALLBACK handler(EXCEPTION_POINTERS* info) {
 
 inline void close();
 
+inline void install_skip_int3() {
+    if (!detail::skip_int3_enabled()) return;
+    const std::lock_guard lock(detail::mutex());
+    if (!detail::veh) detail::veh = AddVectoredExceptionHandler(1, &detail::handler);
+}
+
 // Creates the trace file and installs the exception handler. The file must not exist yet ("x" mode): the trace is
 // opened before the loader reads anything, so overwriting would let `--trace` destroy an input, such as the image
 // itself. Returns false if the file exists or cannot be created; `error`, when given, receives the errno.
@@ -310,8 +342,8 @@ inline bool open(const wchar_t* path, int* error = nullptr) {
         detail::seq = 0;
         static const int atexit_registered = std::atexit(&close);
         (void)atexit_registered;
+        if (!detail::veh) detail::veh = AddVectoredExceptionHandler(1, &detail::handler);
     }
-    detail::veh = AddVectoredExceptionHandler(1, &detail::handler);
     detail::on.store(true, std::memory_order_release);
     event("trace_open", "\"pid\":" + std::to_string(GetCurrentProcessId()));
     return true;
@@ -320,9 +352,9 @@ inline bool open(const wchar_t* path, int* error = nullptr) {
 // Removes the handler and closes the file (tests and process exit via atexit).
 inline void close() {
     detail::on.store(false, std::memory_order_release);
+    const std::lock_guard lock(detail::mutex());
     if (detail::veh) RemoveVectoredExceptionHandler(detail::veh);
     detail::veh = nullptr;
-    const std::lock_guard lock(detail::mutex());
     if (detail::file) std::fclose(detail::file);
     detail::file = nullptr;
 }

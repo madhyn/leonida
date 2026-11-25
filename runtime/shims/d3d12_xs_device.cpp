@@ -1555,12 +1555,16 @@ DWORD WINAPI fallback_window_thread(LPVOID parameter) {
     if (!RegisterClassW(&window_class) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
         std::fprintf(stderr, "[rt] d3d12_xs: PresentX window class failed (error %lu)\n", GetLastError());
     } else {
-        // A 1920x1080 client area where the desktop has room for it; the window manager may still size it.
+        int win_x = CW_USEDEFAULT, win_y = CW_USEDEFAULT;
         RECT frame{0, 0, 1920, 1080};
         AdjustWindowRect(&frame, WS_OVERLAPPEDWINDOW, FALSE);
-        window = CreateWindowExW(0, window_class.lpszClassName, L"Leonida", WS_OVERLAPPEDWINDOW, CW_USEDEFAULT,
-                                 CW_USEDEFAULT, frame.right - frame.left, frame.bottom - frame.top, nullptr, nullptr,
-                                 window_class.hInstance, nullptr);
+        int win_w = frame.right - frame.left, win_h = frame.bottom - frame.top;
+        char opt[8]{};
+        if (!(GetEnvironmentVariableA("LEONIDA_FIT_WINDOW", opt, sizeof(opt)) == 1 && opt[0] == '0')) {
+            rt::d3d12::compute_fitted_window_rect(nullptr, WS_OVERLAPPEDWINDOW, 0, win_x, win_y, win_w, win_h);
+        }
+        window = CreateWindowExW(0, window_class.lpszClassName, L"Leonida", WS_OVERLAPPEDWINDOW, win_x, win_y, win_w,
+                                 win_h, nullptr, nullptr, window_class.hInstance, nullptr);
         if (!window) std::fprintf(stderr, "[rt] d3d12_xs: PresentX window failed (error %lu)\n", GetLastError());
     }
     if (window && start->show) ShowWindow(window, SW_SHOWNOACTIVATE);

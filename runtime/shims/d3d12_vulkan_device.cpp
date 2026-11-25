@@ -1859,7 +1859,7 @@ struct DeviceState {
     leonida::cached_pso::Identity pso_identity;  // what GetCachedBlob records and CachedPSO is checked against
     std::once_flag pipeline_cache_once;
     VkPipelineCache pipeline_cache_handle = VK_NULL_HANDLE;
-    std::atomic<ULONGLONG> next_checkpoint{GetTickCount64() + 120000};
+    std::atomic<ULONGLONG> next_checkpoint{GetTickCount64() + 15000};
     std::atomic<unsigned> active_compiles{0};
 
     VkPipelineCache pipeline_cache() {
@@ -8059,11 +8059,11 @@ private:
                 } catch (const std::exception& e) {
                     std::fprintf(stderr, "[rt] pipeline cache checkpoint failed: %s\n", e.what());
                 }
-                device_.next_checkpoint.store(GetTickCount64() + 120000);
+                device_.next_checkpoint.store(GetTickCount64() + 15000);
                 Release();
             });
         } catch (...) {
-            device_.next_checkpoint.store(now + 120000);
+            device_.next_checkpoint.store(now + 15000);
             Release();
         }
     }
