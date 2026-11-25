@@ -1870,13 +1870,23 @@ inline bool zero_image_aspect(const ReplayFunctions& vk, VkCommandBuffer command
         // vkCmdFillBuffer requires 4-byte aligned dstOffset and size (VUID-vkCmdFillBuffer-dstOffset-00024 /
         // -size-00028), while vkCmdCopyBufferToImage requires fmt.bytes alignment (1, 2, 4, 8, or 16).
         // Uncompressed 1B/2B color formats reach this path on copy-only queues (!can_clear).
+        // Request align - 1 extra bytes so a non-align-aligned scratch offset still leaves full fill_bytes usable
+        // (e.g. a 1x1 8B/16B BC/RGBA32F image with a 4-byte-aligned scratch offset).
         const VkDeviceSize align = std::max<VkDeviceSize>(4, fmt.bytes);
         const VkDeviceSize fill_bytes = ((needed + align - 1) / align) * align;
+        const VkDeviceSize extra = align - 1;
+        const VkDeviceSize padded_request = fill_bytes <= UINT64_MAX - extra ? fill_bytes + extra : fill_bytes;
         VkBuffer scratch = VK_NULL_HANDLE;
         VkDeviceSize offset = 0;
-        if (vk.copy_scratch(fill_bytes, scratch, offset)) {
+        VkDeviceSize granted = 0;
+        if (vk.copy_scratch(padded_request, scratch, offset)) {
+            granted = padded_request;
+        } else if (padded_request != fill_bytes && vk.copy_scratch(fill_bytes, scratch, offset)) {
+            granted = fill_bytes;
+        }
+        if (granted && scratch) {
             const VkDeviceSize pad = (align - (offset % align)) % align;
-            const VkDeviceSize usable = fill_bytes > pad ? ((fill_bytes - pad) / align) * align : 0;
+            const VkDeviceSize usable = granted > pad ? std::min(fill_bytes, ((granted - pad) / align) * align) : 0;
             if (usable >= fmt.bytes) {
                 vk.fill_buffer(command_buffer, scratch, offset + pad, usable, 0);
                 memory_barrier(vk, command_buffer, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
@@ -3411,7 +3421,8 @@ inline bool zero_clear_unavailable(const PreparedList& prepared, const ReplayFun
             block_format(resource.format, VK_IMAGE_ASPECT_COLOR_BIT).block > 1)   // only moved, never cleared
             return false;
         pieces.clear();
-        if (!tracker.pieces(id, range, pieces)) return false;
+        if (!tracker.pieces(id, detail::planes_for_layout(resource, range, vk.separate_depth_stencil_layouts), pieces))
+            return false;
         for (const auto& piece : pieces)
             if (piece.layout == VK_IMAGE_LAYOUT_UNDEFINED &&
                 ((piece.range.aspectMask & VK_IMAGE_ASPECT_COLOR_BIT) ? !vk.clear_color_image
@@ -3424,6 +3435,15 @@ inline bool zero_clear_unavailable(const PreparedList& prepared, const ReplayFun
         const auto& command = commands[i];
         const auto& p = prepared.commands[i];
         if (p.skip) continue;
+        if (draw_command(command).state) {
+            const detail::PreparedDraw& d = prepared.draws[p.draw];
+            if (!d.skipped) {
+                for (const auto& a : d.colors)
+                    if (missing(a.id, a.binding, a.range)) return true;
+                if (d.depth.id && missing(d.depth.id, d.depth.binding, d.depth.range)) return true;
+            }
+            continue;
+        }
         if (const auto [dst, src] = copy_ids(command); dst || src) {
             if (missing(dst, p.binding, p.range) || missing(src, p.source, p.source_range)) return true;
             continue;
@@ -4018,8 +4038,18 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             const ResourceBinding* source = resolve(atomic->src);
             if (!bind(atomic->dst) || !source) return unresolved_at(__LINE__);
             p.source = *source;
-            if (!p.binding.buffer || !p.source.buffer || !detail::within(atomic->dst_offset, atomic->bytes, p.binding.size) ||
+            if (!atomic->bytes || !p.binding.buffer || !p.source.buffer ||
+                !detail::within(atomic->dst_offset, atomic->bytes, p.binding.size) ||
                 !detail::within(atomic->src_offset, atomic->bytes, p.source.size))
+                return ReplayResult::invalid_copy;
+            if (atomic->src_offset > UINT64_MAX - p.source.buffer_offset ||
+                atomic->dst_offset > UINT64_MAX - p.binding.buffer_offset)
+                return ReplayResult::invalid_copy;
+            const VkDeviceSize src = p.source.buffer_offset + atomic->src_offset;
+            const VkDeviceSize dst = p.binding.buffer_offset + atomic->dst_offset;
+            if (atomic->bytes > UINT64_MAX - src || atomic->bytes > UINT64_MAX - dst)
+                return ReplayResult::invalid_copy;
+            if (p.source.buffer == p.binding.buffer && src < dst + atomic->bytes && dst < src + atomic->bytes)
                 return ReplayResult::invalid_copy;
             for (const auto& d : atomic->dependencies) {
                 const ResourceBinding* dependent = resolve(d.resource);
@@ -4030,8 +4060,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                         return ReplayResult::invalid_copy;
                 }
             }
-            p.buffer_copies.push_back({p.source.buffer_offset + atomic->src_offset,
-                                       p.binding.buffer_offset + atomic->dst_offset, atomic->bytes});
+            p.buffer_copies.push_back({src, dst, atomic->bytes});
             if (p.binding.host_readable) {
                 out.wrote_readback = true;
                 out.readback_src_stages |= VK_PIPELINE_STAGE_2_COPY_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT;

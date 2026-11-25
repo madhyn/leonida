@@ -4500,6 +4500,17 @@ if(TARGET Vulkan::Headers)
     endif()
     add_test(NAME frame_pacer COMMAND frame_pacer_test)
 
+    # Replay zero-clear draw gate, AtomicCopyBuffer overflow/overlap guards, and unaligned zero_image_aspect scratch.
+    add_executable(replay_draw_zero_and_atomic_guards_test test/replay_draw_zero_and_atomic_guards_test.cpp)
+    target_link_libraries(replay_draw_zero_and_atomic_guards_test PRIVATE Vulkan::Headers)
+    if(WIN32)
+      target_compile_definitions(replay_draw_zero_and_atomic_guards_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+      if(MSVC)
+        target_compile_options(replay_draw_zero_and_atomic_guards_test PRIVATE /W4 /permissive- /EHsc /utf-8)
+      endif()
+    endif()
+    add_test(NAME replay_draw_zero_and_atomic_guards COMMAND replay_draw_zero_and_atomic_guards_test)
+
     # Replay refuses a list whose whole-view or implicit zero-clear needs an unset vkCmdClear*Image (no GPU).
     add_executable(replay_clear_gate_test test/replay_clear_gate_test.cpp)
     target_link_libraries(replay_clear_gate_test PRIVATE Vulkan::Headers)
