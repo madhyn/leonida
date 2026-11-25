@@ -2879,6 +2879,7 @@ inline void to_attachment(const ReplayFunctions& vk, VkCommandBuffer command_buf
     const VkImageSubresourceRange range = planes_for_layout(a.binding, a.range, separate);
     auto pieces = current(tracker, a.id, range, layout);
     initialize(vk, command_buffer, a.binding, a.id, pieces, layout, tracker);
+    bool layout_changed = false;
     for (const auto& piece : pieces) {
         if (piece.layout == layout) {
             // Attachment writes of an earlier rendering scope are not ordered with this one without a barrier.
@@ -2887,8 +2888,9 @@ inline void to_attachment(const ReplayFunctions& vk, VkCommandBuffer command_buf
         }
         image_barrier(vk, command_buffer, a.binding, piece.range, piece.layout, layout,
                       VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, access, stages);
+        layout_changed = true;
     }
-    if (tracker) tracker->set(a.id, range, layout);
+    if (tracker && layout_changed) tracker->set(a.id, range, layout);
 }
 
 } // namespace detail
@@ -4523,9 +4525,11 @@ inline void emit_commands(const PreparedList& prepared, VkCommandBuffer command_
             if (pieces.size() > few.size()) many.resize(pieces.size());
             VkImageMemoryBarrier2* const barriers = many.empty() ? few.data() : many.data();
             std::uint32_t barrier_count = 0;
+            bool layout_changed = discard;
             for (const auto& piece : pieces) {
                 // Released before it was ever used (the tracker still has it in UNDEFINED): nothing to order.
                 if (release && piece.layout == VK_IMAGE_LAYOUT_UNDEFINED) continue;
+                layout_changed |= piece.layout != new_layout;
                 VkImageMemoryBarrier2& b = barriers[barrier_count++];
                 b = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
                 b.srcStageMask = src.stages;
@@ -4547,7 +4551,8 @@ inline void emit_commands(const PreparedList& prepared, VkCommandBuffer command_
                 dependency.pImageMemoryBarriers = barriers;
                 vk.pipeline_barrier2(command_buffer, &dependency);
             }
-            if (tracker && !release) tracker->set(id, range, new_layout);
+            // Same-layout barriers still order memory, but leave nothing to note for a rollback.
+            if (tracker && !release && layout_changed) tracker->set(id, range, new_layout);
             if (!release) finish_depth_uav_barrier(p, new_layout);
         } else if (const auto* color_clear = std::get_if<ClearRenderTarget>(&command)) {
             if (p.skip) continue;

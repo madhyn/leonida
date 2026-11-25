@@ -73,6 +73,12 @@ void VKAPI_CALL record_barrier2(VkCommandBuffer, const VkDependencyInfo* info) {
         g_barriers.push_back(info->pImageMemoryBarriers[i]);
 }
 
+void VKAPI_CALL record_memory_barrier(VkCommandBuffer, VkPipelineStageFlags, VkPipelineStageFlags, VkDependencyFlags,
+                                      std::uint32_t count, const VkMemoryBarrier* barriers, std::uint32_t,
+                                      const VkBufferMemoryBarrier*, std::uint32_t, const VkImageMemoryBarrier*) {
+    if (count == 1 && barriers[0].srcAccessMask && barriers[0].dstAccessMask) ++g_calls;
+}
+
 // What zero-filling an image that was never used calls: its own layout changes and the clear. Counted, not recorded.
 std::uint32_t g_fill_calls = 0;
 
@@ -476,6 +482,82 @@ int main() {
                "after a release: one barrier from UNDEFINED into the new layout");
         for (std::uint32_t mip = 0; mip < mips; ++mip)
             expect(tracker.layout(id, mip) == attachment, "after a release: the tracker has the new layout");
+    }
+
+    // A submission that does not reach the queue takes its changes back; one that does keeps them.
+    {
+        constexpr ResourceId other = 77;  // not one of the images the cases above track
+        const VkImageSubresourceRange mip1{VK_IMAGE_ASPECT_COLOR_BIT, 1, 1, 0, 1};
+        const VkImageLayout mip0 = tracker.layout(id, 0), was = tracker.layout(id, 1);
+        tracker.begin();
+        tracker.set(id, mip1, transfer_src);
+        tracker.set(id, mip1, transfer_dst);  // the second change of an image keeps what the first one noted
+        tracker.track(other, image, shader_read);
+        tracker.rollback();
+        expect(tracker.layout(id, 1) == was && tracker.layout(id, 0) == mip0, "rollback puts a changed layout back");
+        expect(!tracker.tracked(other), "rollback forgets an image tracked since begin");
+        tracker.begin();
+        tracker.forget(id);
+        tracker.rollback();
+        expect(tracker.tracked(id) && tracker.layout(id, 1) == was, "rollback brings back a forgotten image");
+        tracker.begin();
+        tracker.set(id, mip1, transfer_src);
+        tracker.commit();
+        tracker.rollback();  // nothing noted: no change
+        expect(tracker.layout(id, 1) == transfer_src && tracker.layout(id, 0) == mip0, "commit keeps the change");
+    }
+
+    // Reusing a render-target layout still needs synchronization, but does not need an undo entry.
+    {
+        const VkImageSubresourceRange all_mips{VK_IMAGE_ASPECT_COLOR_BIT, 0, mips, 0, 1};
+        const VkImageSubresourceRange last_mip{VK_IMAGE_ASPECT_COLOR_BIT, mips - 1, 1, 0, 1};
+        tracker.set(id, all_mips, attachment);
+        tracker.begin();
+        tracker.set(id, last_mip, transfer_src);
+        tracker.rollback();  // warm the undo map's buckets before measuring
+
+        CommandList list;
+        expect(list.barrier(TextureBarrier{y::render_target, y::render_target, a::render_target, a::render_target,
+                                           l::render_target, l::render_target, id, all, 0}) &&
+                   list.close(),
+               "record a barrier that keeps the render-target layout");
+        PreparedList prepared;
+        expect(prepare(list, resolve, vk, prepared) == ReplayResult::success, "prepare a same-layout barrier");
+        g_barriers.clear();
+        g_calls = 0;
+        tracker.begin();
+        const std::size_t before = g_allocations;
+        emit(prepared, cb, vk, &tracker);
+        const std::size_t allocations = g_allocations - before;
+        if (allocations) std::fprintf(stderr, "same-layout emit allocated %zu times\n", allocations);
+        expect(allocations == 0, "same-layout emit does not allocate an undo entry");
+        expect(g_calls == 1 && g_barriers.size() == 1 && g_barriers[0].oldLayout == attachment &&
+                   g_barriers[0].newLayout == attachment && g_barriers[0].srcAccessMask && g_barriers[0].dstAccessMask,
+               "same-layout emit still records one barrier with both access scopes");
+        tracker.set(id, last_mip, transfer_src);
+        tracker.rollback();
+        expect(tracker.layout(id, mips - 1) == attachment, "rollback restores a change after same-layout emit");
+
+        tracker.set(id, last_mip, transfer_dst);
+        g_barriers.clear();
+        tracker.begin();
+        emit(prepared, cb, vk, &tracker);  // the first mips agree; only the last actually changes
+        expect(tracker.layout(id, mips - 1) == attachment, "update reaches the first different mip");
+        tracker.rollback();
+        expect(tracker.layout(id, 0) == attachment && tracker.layout(id, mips - 1) == transfer_dst,
+               "rollback restores the different mip without changing the others");
+
+        tracker.set(id, last_mip, attachment);
+        const detail::PreparedDraw::Attachment target{image, id, all_mips};
+        vk.pipeline_barrier = record_memory_barrier;
+        g_calls = 0;
+        tracker.begin();
+        const std::size_t before_attachment = g_allocations;
+        detail::to_attachment(vk, cb, target, attachment, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+                              VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, &tracker, false);
+        expect(g_allocations == before_attachment, "reusing an attachment does not allocate an undo entry");
+        expect(g_calls == 1, "reusing an attachment still orders its writes");
+        tracker.commit();
     }
 
     depth_uav_barriers(cb);
