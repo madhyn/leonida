@@ -1743,6 +1743,15 @@ The runtime allocates image keys from `0x100000000` (4 GiB) in 256-byte steps, a
     heap of 256 MiB or less (214 MiB on an RTX 3090 with driver 616.56), so the 256 MiB default arena lands in
     system memory there. Asking that heap for it broke VUID-vkAllocateMemory-pAllocateInfo-01713 even though the
     driver returned `VK_SUCCESS` (reported by CharlyRien).
+  - With Resizable BAR a driver can still leave the `DEVICE_LOCAL | HOST_VISIBLE` type out of a large buffer's
+    `memoryTypeBits`. On an RTX 5070 Ti (NVIDIA 617.42, Windows 11) an arena-shaped buffer of 4,090 MiB may use
+    it and one of 4,092 MiB may not, so `LEONIDA_ARENA_MB=4096` (4,095 MiB) put the whole arena in system memory.
+    `create_arena` tries smaller sizes in 16 MiB steps, by at most an eighth, and keeps the largest whose
+    requirements allow that type and fit its heap. Placing the arena in ReBAR does not guarantee a reduction in
+    host commit. An [RTX 4080 comparison](https://github.com/ubiquitarianism/leonida/pull/1732#issuecomment-7159574385)
+    confirmed ReBAR placement and measured higher process private bytes. The runtime logs the size cap:
+    `GPU address arena: 4080 MiB of the 4095 MiB asked for, capped by the device's Resizable BAR memory types`.
+    Without Resizable BAR nothing changes.
 - M4+: allocate the arena `DEVICE_LOCAL` and stage CPU writes (descriptor heaps, shader blobs, buffer uploads)
   through a host-visible staging buffer, copied before the commands that use them. The hash table is not in the
   arena either: it is a normal storage buffer in `DEVICE_LOCAL` memory, uploaded from a mapped staging copy before
