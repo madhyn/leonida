@@ -8853,7 +8853,7 @@ public:
                 *data = title_address_;
                 rt::placed_image_map_note::note(title_address_, subresource, read,
                     desc_.Width == 1 && desc_.Height == 1 && desc_.Format == DXGI_FORMAT_R32G32B32A32_FLOAT);
-                read_back_on_map(subresource);
+                if (!read || read->End > read->Begin) read_back_on_map(subresource);
             }
             // From now on the CPU may write its texels whenever it likes (video planes are mapped once): the
             // registry checks this texture's bytes before submissions (Device::refresh_title_textures).

@@ -2788,6 +2788,8 @@ if(TARGET Vulkan::Headers)
     target_compile_options(d3d12_existing_heap_test PRIVATE /W4 /permissive- /utf-8)
     add_test(NAME d3d12_existing_heap COMMAND d3d12_existing_heap_test)
     add_test(NAME d3d12_host_prefix COMMAND d3d12_existing_heap_test --host-prefix-only)
+    add_test(NAME d3d12_placed_target_map_readback COMMAND d3d12_existing_heap_test --map-readback-only)
+    set_tests_properties(d3d12_placed_target_map_readback PROPERTIES SKIP_RETURN_CODE 77)
     set_tests_properties(d3d12_host_prefix PROPERTIES SKIP_RETURN_CODE 77)
     set_tests_properties(d3d12_existing_heap PROPERTIES SKIP_RETURN_CODE 77)
     # LEONIDA_TEXTURE_REFRESH_ASYNC=1 (set by the test itself): a mapped plane's first submission reads its bytes.

@@ -1234,6 +1234,47 @@ int check_placed_target_backing(ID3D12Device* device) {
     return 0;
 }
 
+int check_placed_target_map_readback(ID3D12Device* device) {
+    const char* who = "slot-133 target Map readback";
+    const auto release_pages = [](void* p) { VirtualFree(p, 0, MEM_RELEASE); };
+    const std::unique_ptr<void, decltype(release_pages)> pages(
+        VirtualAlloc(nullptr, 65536, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE), release_pages);
+    EXPECT(pages);
+
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = desc.Height = desc.DepthOrArraySize = desc.MipLevels = desc.SampleDesc.Count = 1;
+    desc.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    Ref<ID3D12Resource> target;
+    EXPECT_HR(rt::d3d12::create_buffer_at_host_address(device, pages.get(), desc, 2, IID_PPV_ARGS(&target.p)), S_OK);
+    const float gpu_texel[]{1, 2, 3, 4};
+    const float cpu_texel[]{5, 6, 7, 8};
+    EXPECT_HR(target->WriteToSubresource(0, nullptr, gpu_texel, sizeof(gpu_texel), sizeof(gpu_texel)), S_OK);
+
+    const D3D12_RANGE empty{0, 0}, inverted{sizeof(gpu_texel), 0}, nonempty{0, sizeof(gpu_texel)};
+    const struct {
+        const char* name;
+        const D3D12_RANGE* range;
+        const void* expected_texel;
+    } cases[]{
+        {"slot-133 Map empty range", &empty, cpu_texel},
+        {"slot-133 Map inverted range", &inverted, cpu_texel},
+        {"slot-133 Map nonempty range", &nonempty, gpu_texel},
+        {"slot-133 Map null range", nullptr, gpu_texel},
+    };
+    for (const auto& test : cases) {
+        who = test.name;
+        std::memcpy(pages.get(), cpu_texel, sizeof(cpu_texel));
+        void* mapped = nullptr;
+        EXPECT_HR(target->Map(0, test.range, &mapped), S_OK);
+        EXPECT(mapped == pages.get());
+        EXPECT(std::memcmp(mapped, test.expected_texel, sizeof(gpu_texel)) == 0);
+        target->Unmap(0, &empty);
+    }
+    return 0;
+}
+
 // Two sampled BC placements have distinct T#s. A CPU write to the first and a GPU copy into
 // the second must each promote only their destination and keep previously copied descriptors usable.
 int check_shared_bc_placements(ID3D12Device* device, bool must_share = false) {
@@ -2045,8 +2086,10 @@ void print_cases(const std::vector<Case>& cases, const char* who) {
 int main(int argc, char** argv) {
     const bool prefix_only = argc == 2 && std::strcmp(argv[1], "--host-prefix-only") == 0;
     const bool async_plane = argc == 2 && std::strcmp(argv[1], "--mapped-plane-async") == 0;
-    if (argc != 1 && !prefix_only && !async_plane) return 2;
+    const bool map_readback_only = argc == 2 && std::strcmp(argv[1], "--map-readback-only") == 0;
+    if (argc != 1 && !prefix_only && !async_plane && !map_readback_only) return 2;
     if (async_plane) _putenv_s("LEONIDA_TEXTURE_REFRESH_ASYNC", "1");  // read once, at the device's first refresh
+    if (map_readback_only && _putenv_s("LEONIDA_MAP_READBACK", "1") != 0) return 1;
     _putenv_s("LEONIDA_TITLE_TEXTURE_PERIOD_MS", "0");
     _putenv_s("LEONIDA_TITLE_TEXTURE_CHECK_KB", "0");
     vktest::Device vk;
@@ -2081,6 +2124,10 @@ int main(int argc, char** argv) {
             Ref<ID3D12Device> staged;
             if (FAILED(rt::d3d12::create_vulkan_device(no_host_copy, IID_PPV_ARGS(&staged.p)))) return 1;
             result += check_mapped_plane_first_use(staged.p);
+            return result || vk.validation_errors() ? 1 : 0;
+        }
+        if (map_readback_only) {
+            const int result = check_placed_target_map_readback(ours.p);
             return result || vk.validation_errors() ? 1 : 0;
         }
         failures += check(ours.p, "vulkan");
