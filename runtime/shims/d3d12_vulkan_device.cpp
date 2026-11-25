@@ -10034,6 +10034,38 @@ bool vertex_format(DXGI_FORMAT format, VkFormat& out, UINT& bytes) {
     return false;
 }
 
+// The render-target formats that hold integers. The console leaves its blender enabled on them (the native state
+// keeps CB_BLENDn regardless of the format; D3D12Xbox bypasses the blender there), and Vulkan requires
+// blendEnable = VK_FALSE for them (VUID-VkPipelineColorBlendAttachmentState-blendEnable-04727), so the layer clears
+// the enable for such a target and keeps the target's write mask. Adapted from DexNom/VIctory ddb7332
+// (GPL-3.0-or-later), "Restore 40 shader variants and repair integer-target blending".
+bool integer_color_format(DXGI_FORMAT format) {
+    switch (format) {
+    case DXGI_FORMAT_R32G32B32A32_UINT:
+    case DXGI_FORMAT_R32G32B32A32_SINT:
+    case DXGI_FORMAT_R32G32B32_UINT:
+    case DXGI_FORMAT_R32G32B32_SINT:
+    case DXGI_FORMAT_R16G16B16A16_UINT:
+    case DXGI_FORMAT_R16G16B16A16_SINT:
+    case DXGI_FORMAT_R32G32_UINT:
+    case DXGI_FORMAT_R32G32_SINT:
+    case DXGI_FORMAT_R10G10B10A2_UINT:
+    case DXGI_FORMAT_R8G8B8A8_UINT:
+    case DXGI_FORMAT_R8G8B8A8_SINT:
+    case DXGI_FORMAT_R16G16_UINT:
+    case DXGI_FORMAT_R16G16_SINT:
+    case DXGI_FORMAT_R32_UINT:
+    case DXGI_FORMAT_R32_SINT:
+    case DXGI_FORMAT_R8G8_UINT:
+    case DXGI_FORMAT_R8G8_SINT:
+    case DXGI_FORMAT_R16_UINT:
+    case DXGI_FORMAT_R16_SINT:
+    case DXGI_FORMAT_R8_UINT:
+    case DXGI_FORMAT_R8_SINT: return true;
+    default: return false;
+    }
+}
+
 VkBlendFactor blend_factor(D3D12_BLEND blend) {
     switch (blend) {
     case D3D12_BLEND_ZERO: return VK_BLEND_FACTOR_ZERO;
@@ -11489,7 +11521,7 @@ public:
                 return f == D3D12_BLEND_SRC1_COLOR || f == D3D12_BLEND_INV_SRC1_COLOR || f == D3D12_BLEND_SRC1_ALPHA ||
                        f == D3D12_BLEND_INV_SRC1_ALPHA;
             };
-            if (b.BlendEnable &&
+            if (b.BlendEnable && !integer_color_format(desc.RTVFormats[i]) &&
                 (src1(b.SrcBlend) || src1(b.DestBlend) || src1(b.SrcBlendAlpha) || src1(b.DestBlendAlpha)))
                 dual_source = true;
         }
@@ -11880,7 +11912,7 @@ public:
         for (UINT i = 0; i < desc.NumRenderTargets; ++i) {
             const D3D12_RENDER_TARGET_BLEND_DESC& b =
                 desc.BlendState.RenderTarget[desc.BlendState.IndependentBlendEnable ? i : 0];
-            blends[i].blendEnable = b.BlendEnable;
+            blends[i].blendEnable = b.BlendEnable && !integer_color_format(desc.RTVFormats[i]);
             blends[i].srcColorBlendFactor = blend_factor(b.SrcBlend);
             blends[i].dstColorBlendFactor = blend_factor(b.DestBlend);
             blends[i].colorBlendOp = blend_op(b.BlendOp);
