@@ -1,8 +1,10 @@
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <deque>
+#include <exception>
 #include <functional>
 #include <mutex>
 #include <unordered_map>
@@ -66,9 +68,8 @@ public:
         if (held_.load(std::memory_order_acquire) == 0 || in_pump()) return;
         {
             std::lock_guard pump(pump_mutex_);
-            in_pump() = true;  // what is dropped may release other fences: they must not wait for this lock
+            PumpScope scope(this);  // what is dropped may release other fences: they must not wait for this lock
             for (Holder* holder : snapshot()) holder->discard_waiting_on(semaphore);
-            in_pump() = false;
         }
         pump_ready();
     }
@@ -157,27 +158,59 @@ public:
 
     // Releases every held operation that has become ready, in dependency order: a release can submit a Signal
     // that makes another queue's front ready, so passes repeat until one finds nothing new. Then the callbacks
-    // whose held work is all gone.
+    // whose held work is all gone. If a holder or callback throws, the first exception is captured and rethrown
+    // only after any concurrent dirty_ handoff has been honoured (skipping holders that already threw in this
+    // pump so a failing holder cannot spin), so work handed off by another thread is never left stranded.
     void pump_ready() {
         if (!any_held() && barrier_count_.load(std::memory_order_acquire) == 0) return;
-        dirty_.store(true, std::memory_order_release);
-        if (in_pump()) return;  // a release on this thread submitted a Signal: the running pass will go again
-        for (;;) {
-            std::unique_lock pump(pump_mutex_, std::try_to_lock);
-            if (!pump) return;  // another thread is releasing and will see dirty_
-            in_pump() = true;
-            while (dirty_.exchange(false, std::memory_order_acq_rel)) {
+        {
+            std::lock_guard lock(mutex_);
+            dirty_ = true;
+            if (in_pump() || pump_active_) return;  // this thread or another is releasing and will see dirty_
+            pump_active_ = true;
+        }
+        struct ActiveGuard {
+            QueueHolds* self;
+            bool active = true;
+            ~ActiveGuard() {
+                if (!active) return;
+                std::lock_guard lock(self->mutex_);
+                self->pump_active_ = false;
+            }
+        } active_guard{this};
+        std::exception_ptr first_error;
+        {
+            std::lock_guard pump(pump_mutex_);
+            PumpScope scope(this);
+            std::vector<Holder*> failed_holders;
+            for (;;) {
+                {
+                    std::lock_guard lock(mutex_);
+                    if (!dirty_) {
+                        pump_active_ = false;
+                        active_guard.active = false;
+                        break;
+                    }
+                    dirty_ = false;
+                }
                 bool progress = true;
                 while (progress) {
                     progress = false;
-                    for (Holder* holder : snapshot()) progress |= holder->release_ready();
+                    for (Holder* holder : snapshot()) {
+                        if (std::find(failed_holders.begin(), failed_holders.end(), holder) != failed_holders.end())
+                            continue;
+                        try {
+                            progress |= holder->release_ready();
+                        } catch (...) {
+                            if (!first_error) first_error = std::current_exception();
+                            failed_holders.push_back(holder);
+                        }
+                    }
                 }
-                run_barriers();
+                run_barriers(first_error);
             }
-            in_pump() = false;
-            pump.unlock();
-            if (!dirty_.load(std::memory_order_acquire)) return;
         }
+        if (first_error) std::rethrow_exception(first_error);
     }
 
 private:
@@ -187,9 +220,28 @@ private:
         std::function<void()> fn;
     };
 
-    static bool& in_pump() {
-        static thread_local bool pumping = false;
-        return pumping;
+    // Per-instance re-entrancy guard on the current thread's stack: zero heap allocation, exception-safe, and
+    // distinct QueueHolds instances nested on the same thread do not suppress each other.
+    struct PumpScope {
+        const QueueHolds* owner;
+        PumpScope* previous;
+        explicit PumpScope(const QueueHolds* self) noexcept : owner(self), previous(active_scope()) {
+            active_scope() = this;
+        }
+        ~PumpScope() noexcept { active_scope() = previous; }
+        PumpScope(const PumpScope&) = delete;
+        PumpScope& operator=(const PumpScope&) = delete;
+    };
+
+    static PumpScope*& active_scope() noexcept {
+        static thread_local PumpScope* top = nullptr;
+        return top;
+    }
+
+    bool in_pump() const noexcept {
+        for (const PumpScope* s = active_scope(); s != nullptr; s = s->previous)
+            if (s->owner == this) return true;
+        return false;
     }
 
     std::vector<Holder*> snapshot() const {
@@ -198,7 +250,7 @@ private:
     }
 
     // Called with pump_mutex_ held. A callback runs when no held operation is older than the moment it was asked.
-    void run_barriers() {
+    void run_barriers(std::exception_ptr& first_error) {
         for (;;) {
             Barrier front;
             {
@@ -207,8 +259,13 @@ private:
                 front = barriers_.front();
             }
             for (Holder* holder : snapshot()) {
-                const std::uint64_t oldest = holder->oldest_held_seq();
-                if (oldest && oldest <= front.seq) return;
+                try {
+                    const std::uint64_t oldest = holder->oldest_held_seq();
+                    if (oldest && oldest <= front.seq) return;
+                } catch (...) {
+                    if (!first_error) first_error = std::current_exception();
+                    return;
+                }
             }
             {
                 std::lock_guard lock(mutex_);
@@ -217,7 +274,11 @@ private:
                 barriers_.pop_front();
                 barrier_count_.fetch_sub(1, std::memory_order_acq_rel);
             }
-            front.fn();
+            try {
+                front.fn();
+            } catch (...) {
+                if (!first_error) first_error = std::current_exception();
+            }
         }
     }
 
@@ -229,7 +290,8 @@ private:
     std::atomic<std::int64_t> held_{0};
     std::atomic<std::int64_t> barrier_count_{0};
     std::atomic<std::uint64_t> seq_{0};
-    std::atomic<bool> dirty_{false};
+    bool dirty_ = false;
+    bool pump_active_ = false;
 };
 
 }  // namespace leonida
