@@ -31,6 +31,7 @@
 #include "d3d12_xs_alloc_size.h"
 #include "d3d12_xs_desc_clean.h"
 #include "../src/frame_pacer.h"
+#include "../src/vulkan_gpu_labels.h"
 #include "xmem.h"  // rt::xmem::copy_page_mappings_fn for queue slot 31
 #include "../src/shader_library.h"  // leonida::fspx_payload_from_parts for slot 67
 
@@ -1339,6 +1340,28 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
         note_list_slot(Slot, a1, a2, a3, a4);
         constexpr unsigned pc = console_to_pc_list_slot(Slot);
         if constexpr (pc == kListNotForwarded) {
+#ifdef LEONIDA_VULKAN_DEVICE
+            if constexpr (Slot == 71 || Slot == 72) {
+                if (leonida::label::enabled() && a1) {
+                    const unsigned width = Slot == 71 ? 4u : 8u;
+                    const unsigned clock = Slot == 72 ? ((a4 & 1) ? 1u : ((a4 & 2) ? 2u : 0u)) : 0u;
+                    auto target = leonida::label::memory().capture(a1, width);
+                    if (target.owner.expired()) {
+                        MEMORY_BASIC_INFORMATION mbi{};
+                        if (VirtualQuery(reinterpret_cast<LPCVOID>(a1), &mbi, sizeof(mbi)) &&
+                            mbi.State == MEM_COMMIT && mbi.RegionSize > 0) {
+                            leonida::label::memory().track(
+                                reinterpret_cast<std::uintptr_t>(mbi.BaseAddress), mbi.RegionSize,
+                                reinterpret_cast<std::uintptr_t>(mbi.AllocationBase), false);
+                            target = leonida::label::memory().capture(a1, width);
+                        }
+                    }
+                    if (target.owner.lock())
+                        rt::d3d12::record_gpu_label(reinterpret_cast<ID3D12GraphicsCommandList*>(self->real),
+                                                    {std::move(target), a2, clock});
+                }
+            }
+#endif
             if constexpr (Slot == 148) {
                 static std::atomic<bool> logged{false};
                 if (!logged.exchange(true, std::memory_order_relaxed))

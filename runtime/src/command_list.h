@@ -1,4 +1,5 @@
 #pragma once
+#include "gpu_label_memory.h"
 
 // The command-list IR (docs/d3d12_vulkan.md section 3.2): what a D3D12 command list records, kept until
 // ExecuteCommandLists replays it on Vulkan (vulkan_replay.h). This slice covers legacy and enhanced barriers and
@@ -663,7 +664,7 @@ struct AccelerationStructurePostbuild {
 using Command = std::variant<TransitionBarrier, UavBarrier, AliasingBarrier, GlobalBarrier, BufferBarrier,
                              TextureBarrier, ClearRenderTarget, ClearDepthStencil, CopyBuffer, CopyTexture,
                              CopyResource, ResolveSubresource, Predication, ClearUnorderedAccess, DiscardResource,
-                             WriteImmediate, AtomicCopyBuffer, BeginQuery, EndQuery, ResolveQueries, DebugMarker,
+                             WriteImmediate, label::Write, AtomicCopyBuffer, BeginQuery, EndQuery, ResolveQueries, DebugMarker,
                              ExecuteIndirect, BuildAccelerationStructure, Dispatch, Draw, CopyAccelerationStructure,
                              AccelerationStructurePostbuild>;
 
@@ -794,6 +795,11 @@ public:
         if (discard.count == 0) return !closed_;
         if (std::uint64_t(discard.first_subresource) + discard.count > all_subresources) return false;
         return append(discard);
+    }
+
+    bool write_gpu_label(const label::Write& write) {
+        if (write.target.owner.expired() || write.clock > 2) return false;
+        return append(write);
     }
 
     // WriteBufferImmediate: D3D12 requires a 4-byte aligned, non-null address and one of the three modes.

@@ -737,6 +737,8 @@ public:
             check(list_.write_immediate({params[i].Dest, params[i].Value, modes ? u(modes[i]) : 0}));
     }
 
+    bool xbox_label(const leonida::label::Write& op) { return list_.write_gpu_label(op); }
+
     // GCL1. Not allowed in a bundle, as no copy is.
     void STDMETHODCALLTYPE AtomicCopyBufferUINT(ID3D12Resource* dst, UINT64 dst_offset, ID3D12Resource* src,
                                                 UINT64 src_offset, UINT count, ID3D12Resource* const* resources,
@@ -1267,7 +1269,25 @@ private:
     void address(RootState& state, UINT index, std::uint64_t va, rt::rootsig::ParamType type) {
         if (list_.closed()) return;
         if (type == rt::rootsig::ParamType::Descriptor && va && context_) {
-            if (const auto bda = context_->resolve_gpu_bda(va)) va = *bda;
+            auto bda = context_->resolve_gpu_bda(va);
+            if (!bda) {
+                MEMORY_BASIC_INFORMATION mbi{};
+                if (VirtualQuery(reinterpret_cast<LPCVOID>(va), &mbi, sizeof(mbi)) &&
+                    mbi.State == MEM_COMMIT && mbi.RegionSize > 0 &&
+                    !(mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD | PAGE_WRITECOMBINE | PAGE_NOCACHE))) {
+                    leonida::title_host_regions().register_range(
+                        reinterpret_cast<std::uint64_t>(mbi.BaseAddress), mbi.RegionSize, 1);
+                    bda = context_->resolve_gpu_bda(va);
+                }
+            }
+            if (bda) {
+                va = *bda;
+            } else {
+                static std::atomic<int> misses{0};
+                if (misses.fetch_add(1) < 10)
+                    std::fprintf(stderr, "[rt] diag root_desc MISS va=0x%llx\n",
+                                 static_cast<unsigned long long>(va));
+            }
         }
         if (defer([=, compute = &state == &compute_](GraphicsCommandList& l) {
                 l.address(compute ? l.compute_ : l.graphics_, index, va, type);
@@ -2020,6 +2040,11 @@ HRESULT create_command_list(D3D12_COMMAND_LIST_TYPE type, ID3D12CommandAllocator
         if (GraphicsCommandList* list = GraphicsCommandList::from(static_cast<IUnknown*>(*out)))
             list->set_initial_pipeline(initial_state);
     return hr;
+}
+
+bool record_gpu_label(ID3D12GraphicsCommandList* list, const leonida::label::Write& write) {
+    GraphicsCommandList* gcl = GraphicsCommandList::from(list);
+    return gcl && gcl->xbox_label(write);
 }
 
 HRESULT create_fence(leonida::VulkanContext& context, UINT64 initial_value, D3D12_FENCE_FLAGS flags, REFIID riid,

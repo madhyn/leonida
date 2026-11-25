@@ -1,4 +1,5 @@
 #pragma once
+#include "vulkan_gpu_labels.h"
 
 // The execution side of the D3D12 layer, without COM: the per-device Vulkan context (resources, layout tracker,
 // image views), queues that execute command lists, and timeline-semaphore fences. The COM objects in
@@ -969,6 +970,9 @@ public:
                   bool conditional_rendering = false, bool ray_tracing = false, bool xdxr = false)
         : device_(device), tracker_(separate_depth_stencil_layouts), ray_tracing_(ray_tracing) {
         loaded_ = vk.load(get, device);
+        if (loaded_ && gpu_labels_.initialize(device, get)) {
+            replay_.gpu_label = [this](VkCommandBuffer cb, const label::Write& write) { gpu_labels_.record(cb, write); };
+        }
         replay_.pipeline_barrier = vk.vkCmdPipelineBarrier;
         replay_.clear_color_image = vk.vkCmdClearColorImage;
         replay_.clear_depth_stencil_image = vk.vkCmdClearDepthStencilImage;
@@ -1136,6 +1140,7 @@ public:
     }
 
     ~VulkanContext() {
+        gpu_labels_.stop(device_);
         fence_dispatcher_.reset();
         deletion_queue_.drain(UINT64_MAX, device_, vk);
         for (const auto& [key, framebuffer] : resolve_framebuffers_)
@@ -1826,6 +1831,7 @@ private:
     std::uint32_t predicate_family_ = UINT32_MAX;
     std::uint32_t transfer_only_family_ = UINT32_MAX;
     DebugLabelFunctions labels_;
+    label::Completions gpu_labels_;
 };
 #ifdef _MSC_VER
 #pragma warning(pop)
@@ -2665,6 +2671,7 @@ private:
         };
         VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
         begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        context_.gpu_labels_.begin_record(command_buffer);
         if (context_.vk.vkBeginCommandBuffer(command_buffer, &begin) != VK_SUCCESS) {
             discard();
             return ReplayResult::unsupported;
@@ -3082,6 +3089,7 @@ private:
         auto& vk = context_.vk;
         VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
         begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        context_.gpu_labels_.begin_record(command_buffer);
         if (vk.vkBeginCommandBuffer(command_buffer, &begin) != VK_SUCCESS) {
             slot->ticket = 0;
             return false;
@@ -3356,7 +3364,9 @@ private:
             submit.pCommandBuffers = &command_buffer;
             submit.signalSemaphoreCount = signal_count;
             submit.pSignalSemaphores = signals;
-            res = context_.vk.vkQueueSubmit(queue_, 1, &submit, VK_NULL_HANDLE);
+            const auto label_fence = context_.gpu_labels_.submit_fence(command_buffer);
+            res = context_.vk.vkQueueSubmit(queue_, 1, &submit, label_fence);
+            context_.gpu_labels_.submitted(command_buffer, res == VK_SUCCESS);
             if (res == VK_SUCCESS) {
                 context_.record_submit_locked(progress_, ticket);
                 if (signals_fence) context_.holds().signaled(fence, value);
