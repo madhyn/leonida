@@ -1524,6 +1524,24 @@ void test_extended(Env& env) {
             check(leonida::bcpack::decode(codec, raw, result, false, &history) == leonida::bcpack::Quality::failed &&
                   leonida::bcpack::decode(codec, raw, result, true, &history) == leonida::bcpack::Quality::fitted,
                   "partially confirmed BPTC profile requires fitted mode");
+            // A history entry the profile does not know (no bits at all): every block whose predictor chain starts
+            // there is lost. The reference limit (1 in 1,024, at least 2) refuses the request; a lower divisor
+            // rebuilds it and reports how many blocks were approximated. Strict mode still refuses it.
+            auto unknown = history;
+            if (codec == 6) unknown.bc6[255].ep_class = 0;
+            else unknown.bc7[255].ep_bits.fill(0);
+            const char* why = nullptr;
+            leonida::bcpack::Report report;
+            check(leonida::bcpack::decode(codec, raw, result, true, &unknown, &why) == leonida::bcpack::Quality::failed &&
+                      why && std::string(why) == "missing-endpoint",
+                  "an unknown BPTC predictor past the reference limit fails as missing-endpoint");
+            check(leonida::bcpack::decode(codec, raw, result, true, &unknown, &why, true, 1, &report) ==
+                          leonida::bcpack::Quality::fitted &&
+                      report.blocks == result.size() / 16 && report.lost > 2 && report.lost <= report.blocks,
+                  "a lower lost-block divisor rebuilds the request and reports the approximated blocks");
+            check(leonida::bcpack::decode(codec, raw, result, false, &unknown, &why, true, 1, &report) ==
+                      leonida::bcpack::Quality::failed,
+                  "strict decoding still refuses an unknown BPTC predictor");
         }
     }
     std::vector<uint8_t> fitted(512);
