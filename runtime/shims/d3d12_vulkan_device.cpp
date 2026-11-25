@@ -2198,6 +2198,13 @@ struct DeviceState {
     void title_texture_mapped(const void* resource, std::uint64_t address);
     void title_texture_unmapped(const void* resource, std::uint64_t address);  // the title wrote texels
     void title_texture_gone(const void* resource, std::uint64_t address);
+    // Textures destroyed while their thread held title_texture_mutex (inside the registry, t_in_title_textures): a
+    // descriptor it overwrote held the last reference. title_texture_gone cannot take the mutex again there (MSVC's
+    // std::mutex throws resource_deadlock_would_occur, which Wine's msvcp140 aborts on), so their entries only stop
+    // naming the resource and are removed by drain_titles_gone once the mutex is free. Under title_texture_mutex.
+    std::vector<std::pair<const void*, std::uint64_t>> titles_gone;
+    std::atomic<bool> titles_gone_pending{false};
+    void drain_titles_gone();
 
     // Windows of the title's own memory in the GPU address arena (src/title_va_alias.h, docs/d3d12_vulkan.md
     // section 3.3 "Title-chosen addresses"): a root view or buffer V# that names the title's memory outside any
@@ -10180,6 +10187,13 @@ void DeviceState::title_texture_unmapped(const void* resource, std::uint64_t add
 }
 
 void DeviceState::title_texture_gone(const void* resource, std::uint64_t address) {
+    if (t_in_title_textures) {  // this thread holds title_texture_mutex, and perhaps descriptor_mutex
+        const auto it = title_textures.find(address);
+        if (it != title_textures.end() && it->second->resource == resource) it->second->resource = nullptr;
+        titles_gone.push_back({resource, address});
+        titles_gone_pending.store(true, std::memory_order_release);
+        return;
+    }
     std::lock_guard lock(title_texture_mutex);
     {
         std::lock_guard descriptors(descriptor_mutex);
@@ -10187,6 +10201,21 @@ void DeviceState::title_texture_gone(const void* resource, std::uint64_t address
     }
     const auto it = title_textures.find(address);
     if (it != title_textures.end() && it->second->resource == resource) title_textures.erase(it);
+}
+
+void DeviceState::drain_titles_gone() {
+    if (!titles_gone_pending.load(std::memory_order_acquire)) return;
+    std::lock_guard lock(title_texture_mutex);
+    for (const auto& [resource, address] : titles_gone) {
+        {
+            std::lock_guard descriptors(descriptor_mutex);
+            gpu_placements.remove(address, resource);
+        }
+        const auto it = title_textures.find(address);
+        if (it != title_textures.end() && !it->second->resource) title_textures.erase(it);
+    }
+    titles_gone.clear();
+    titles_gone_pending.store(false, std::memory_order_release);
 }
 
 // The T# of a view: what the shader gets to know about it, in the structure the console's shaders read.
@@ -11774,6 +11803,7 @@ public:
             if (!written) ++stats.null_views;
             if (stats.views == 64 || !(stats.views % 2048)) log_title_census("slot-70 texture views");
         }
+        state_.drain_titles_gone();
         return written;
     }
 
@@ -12055,6 +12085,7 @@ public:
             log_title_census("refresh");
         }
         lock.unlock();
+        state_.drain_titles_gone();
         for (Resource* r : release) r->Release();
     }
 
@@ -12355,7 +12386,8 @@ private:
         };
         auto& textures = state_.title_textures;
         const auto it = textures.find(address);
-        TitleTexture* t = it == textures.end() ? nullptr : it->second.get();
+        // An entry without a resource is one destroyed inside the registry, waiting for drain_titles_gone.
+        TitleTexture* t = it == textures.end() || !it->second->resource ? nullptr : it->second.get();
         if (!t || !TitleGpuPlacements<Resource>::matches(d, *t->resource)) {
             if (Resource* gpu = matching_gpu_placement(d, address)) {
                 ++title_stats_.of_slot133;
