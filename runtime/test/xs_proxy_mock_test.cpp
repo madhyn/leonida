@@ -363,6 +363,7 @@ struct QueueCall {
 };
 QueueCall g_queue_calls[64];
 unsigned g_queue_call_count = 0;
+void (*g_on_queue_wait)(Mock* queue, Mock* fence, std::uint64_t value) = nullptr;
 
 void log_queue_call(const Mock* queue, unsigned slot, std::uint64_t a1, std::uint64_t a2) {
     if (g_queue_call_count < std::size(g_queue_calls)) g_queue_calls[g_queue_call_count++] = {queue, slot, a1, a2};
@@ -532,6 +533,8 @@ std::uint64_t mock_call(Mock* m, unsigned slot, const std::uint64_t* words) {
         log_queue_call(m, 10, static_cast<std::uint32_t>(a1), a2 ? *reinterpret_cast<const std::uint64_t*>(a2) : 0);
     }
     if (m->kind == Kind::queue && (slot == 14 || slot == 15)) log_queue_call(m, slot, a1, a2);  // Signal, Wait
+    if (m->kind == Kind::queue && slot == 15 && g_on_queue_wait && a1)
+        g_on_queue_wait(m, reinterpret_cast<Mock*>(a1), a2);
     if (m->kind == Kind::queue && slot == 14 && m->signals_complete && a1)
         fence_signal(reinterpret_cast<Mock*>(a1), a2);
     if ((m->kind == Kind::command_list || m->kind == Kind::list) && slot == 28)
@@ -4282,6 +4285,214 @@ std::uint64_t logged_signal(const Mock* queue, const Mock* fence) {
     return 0;
 }
 
+int check_list_values_relay_safety() {
+    Mock* mock = nullptr;
+    void* device = make_device(mock, 9, true, true, true);
+    EXPECT(device);
+    mock->zero_fences = true;
+    xs::reset_list_value_stats();
+    xs::set_list_value_wait_timeout_ms(5000);
+    void* qa = make_queue(device);
+    void* qb = make_queue(device);
+    EXPECT(qa && qb);
+    Mock* const qa_mock = reinterpret_cast<Mock*>(xs::queue_proxy_real_queue(qa));
+    const IID allocator_iid = __uuidof(ID3D12CommandAllocator);
+    void* allocator = nullptr;
+    EXPECT(hr_of(raw(device, 9, 0, word(&allocator_iid), word(&allocator))) == S_OK);
+    Mock* lw_real = nullptr;
+    Mock* lv_real = nullptr;
+    void* lw = make_console_list(device, allocator, mock, &lw_real);
+    void* lv = make_console_list(device, allocator, mock, &lv_real);
+    EXPECT(lw && lv && hr_of(raw(lw, 9)) == S_OK && hr_of(raw(lv, 9)) == S_OK);
+    std::memset(g_cells, 0, sizeof(g_cells));
+
+    // 1. Relay fence lifetime (RT-LIST-VALUES-RELAY-LIFECYCLE): if the writer queue is released while its write group
+    // is in flight and the pump drains that group while the waiter is inside queue->Wait(fence, value), the relay must
+    // retain QueueValues across Wait so the fence is not released underneath it (UAF).
+    {
+        void* q_temp = make_queue(device);
+        EXPECT(q_temp);
+        EXPECT(hr_of(raw(lw, 139, word(allocator), 0)) == S_OK);
+        raw(lw, 14, 1, 1, 1);
+        raw(lw, 72, word(&g_cells[0]), 0x2222, 0, 0);
+        EXPECT(hr_of(raw(lw, 9)) == S_OK);
+        EXPECT(submit(q_temp, lw) == 0);
+        Mock* const temp_written = mock->last_child;
+        Mock* const temp_gate = temp_written - 1;
+        EXPECT(temp_written->kind == Kind::fence && temp_gate->kind == Kind::fence);
+        EXPECT(release(q_temp) == 0);  // Pump::writes_ is now the sole owner of q_temp's QueueValues
+        EXPECT(temp_written->refs == 1 && temp_gate->refs == 1);
+
+        EXPECT(hr_of(raw(lv, 139, word(allocator), 0)) == S_OK);
+        raw(lv, 74, word(&g_cells[0]), 3, 0x2222, 1);  // wait64(cell == 0x2222)
+        raw(lv, 14, 1, 1, 1);
+        EXPECT(hr_of(raw(lv, 9)) == S_OK);
+
+        static long wait_fence_refs = -1;
+        static Mock* wait_fence_seen = nullptr;
+        wait_fence_refs = -1;
+        wait_fence_seen = nullptr;
+        g_on_queue_wait = [](Mock*, Mock* fence, std::uint64_t val) {
+            wait_fence_seen = fence;
+            fence_signal(fence, val);
+            xs::list_values_idle(2000);
+            wait_fence_refs = fence->refs;
+        };
+        const std::uint64_t relayed_before = xs::list_value_stats().waits_relayed;
+        EXPECT(submit(qb, lv) == 0);
+        g_on_queue_wait = nullptr;
+        EXPECT(xs::list_value_stats().waits_relayed == relayed_before + 1);
+        EXPECT(wait_fence_seen == temp_written && wait_fence_refs >= 1);
+        EXPECT(cell(0) == 0x2222 && temp_written->refs == 0 && temp_gate->refs == 0);
+    }
+
+    // 2. Overwritten and partial-overlap writes inside one WriteGroup: all writes in a group land together at its
+    // fence, so relay must inspect the last write overlapping [wait.address, wait.address + need).
+    // Each non-relayed gate is satisfied via CPU memory after confirming the landed write did not meet it, so the
+    // global timeout-demotion state stays clean for check_list_values_more().
+    xs::set_list_value_wait_timeout_ms(5000);
+    // (a) Overwritten to non-matching value in the same group: must NOT relay.
+    g_cells[0] = 0;
+    EXPECT(hr_of(raw(lw, 139, word(allocator), 0)) == S_OK);
+    raw(lw, 14, 1, 1, 1);
+    raw(lw, 72, word(&g_cells[0]), 9, 0, 0);
+    raw(lw, 72, word(&g_cells[0]), 0, 0, 0);  // overwrites 9 -> 0 in the same WriteGroup
+    EXPECT(hr_of(raw(lw, 9)) == S_OK);
+    g_queue_call_count = 0;
+    EXPECT(submit(qa, lw) == 0);
+    Mock* const a_written = mock->last_child;
+    Mock* const a_gate = a_written - 1;
+    EXPECT(a_written->kind == Kind::fence && a_gate->kind == Kind::fence);
+    const std::uint64_t f_overwrite = logged_signal(qa_mock, a_written);
+    EXPECT(f_overwrite != 0);
+    EXPECT(hr_of(raw(lv, 139, word(allocator), 0)) == S_OK);
+    raw(lv, 74, word(&g_cells[0]), 3, 9, 1);  // wait64(cell == 9): must NOT relay
+    raw(lv, 14, 1, 1, 1);
+    EXPECT(hr_of(raw(lv, 9)) == S_OK);
+    const auto s0 = xs::list_value_stats();
+    EXPECT(submit(qb, lv) == 0);
+    EXPECT(xs::list_value_stats().waits_relayed == s0.waits_relayed);
+    EXPECT(xs::list_value_stats().gates_held == s0.gates_held + 1);
+    fence_signal(a_written, f_overwrite);
+    EXPECT(!xs::list_values_idle(20) && cell(0) == 0);
+    InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_cells[0]), 9);
+    EXPECT(xs::list_values_idle(2000));
+
+    // (b) Overwritten by a GPU timestamp in the same WriteGroup: must NOT relay.
+    g_cells[0] = 0;
+    EXPECT(hr_of(raw(lw, 139, word(allocator), 0)) == S_OK);
+    raw(lw, 14, 1, 1, 1);
+    raw(lw, 72, word(&g_cells[0]), 9, 0, 0);
+    raw(lw, 72, word(&g_cells[0]), 0, 0, 1);
+    EXPECT(hr_of(raw(lw, 9)) == S_OK);
+    g_queue_call_count = 0;
+    EXPECT(submit(qa, lw) == 0);
+    const std::uint64_t f_ts = logged_signal(qa_mock, a_written);
+    EXPECT(f_ts != 0);
+    EXPECT(hr_of(raw(lv, 139, word(allocator), 0)) == S_OK);
+    raw(lv, 74, word(&g_cells[0]), 3, 9, 1);
+    raw(lv, 14, 1, 1, 1);
+    EXPECT(hr_of(raw(lv, 9)) == S_OK);
+    const auto s1 = xs::list_value_stats();
+    EXPECT(submit(qb, lv) == 0);
+    EXPECT(xs::list_value_stats().waits_relayed == s1.waits_relayed);
+    EXPECT(xs::list_value_stats().gates_held == s1.gates_held + 1);
+    fence_signal(a_written, f_ts);
+    EXPECT(!xs::list_values_idle(20));
+    InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_cells[0]), 9);
+    EXPECT(xs::list_values_idle(2000));
+
+    // (c) 64-bit write followed by 32-bit write to high half (addr + 4):
+    //     64-bit wait >= 0x100000000 must NOT relay; 32-bit wait == 9 on low half DOES relay.
+    g_cells[0] = 0;
+    EXPECT(hr_of(raw(lw, 139, word(allocator), 0)) == S_OK);
+    raw(lw, 14, 1, 1, 1);
+    raw(lw, 72, word(&g_cells[0]), 0x100000009ull, 0, 0);
+    raw(lw, 71, word(&g_cells[0]) + 4, 0, 0, 0);
+    EXPECT(hr_of(raw(lw, 9)) == S_OK);
+    g_queue_call_count = 0;
+    EXPECT(submit(qa, lw) == 0);
+    const std::uint64_t f_hi = logged_signal(qa_mock, a_written);
+    EXPECT(f_hi != 0);
+    EXPECT(hr_of(raw(lv, 139, word(allocator), 0)) == S_OK);
+    raw(lv, 74, word(&g_cells[0]), 7, 0x100000000ull, 1);
+    raw(lv, 14, 1, 1, 1);
+    EXPECT(hr_of(raw(lv, 9)) == S_OK);
+    const auto s2 = xs::list_value_stats();
+    EXPECT(submit(qb, lv) == 0);
+    EXPECT(xs::list_value_stats().waits_relayed == s2.waits_relayed);
+    EXPECT(xs::list_value_stats().gates_held == s2.gates_held + 1);
+    EXPECT(hr_of(raw(lv, 139, word(allocator), 0)) == S_OK);
+    raw(lv, 73, word(&g_cells[0]), 3, 9, 1);
+    raw(lv, 14, 1, 1, 1);
+    EXPECT(hr_of(raw(lv, 9)) == S_OK);
+    const auto s3 = xs::list_value_stats();
+    EXPECT(submit(qb, lv) == 0);
+    EXPECT(xs::list_value_stats().waits_relayed == s3.waits_relayed + 1);
+    EXPECT(xs::list_value_stats().gates_held == s3.gates_held);
+    fence_signal(a_written, f_hi);
+    EXPECT(!xs::list_values_idle(20) && cell(0) == 9);
+    InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_cells[0]), 0x100000009ll);
+    EXPECT(xs::list_values_idle(2000));
+
+    // (d) 64-bit write followed by 32-bit write to low half (addr): 64-bit wait must NOT relay.
+    g_cells[0] = 0;
+    EXPECT(hr_of(raw(lw, 139, word(allocator), 0)) == S_OK);
+    raw(lw, 14, 1, 1, 1);
+    raw(lw, 72, word(&g_cells[0]), 0x100000009ull, 0, 0);
+    raw(lw, 71, word(&g_cells[0]), 0, 0, 0);
+    EXPECT(hr_of(raw(lw, 9)) == S_OK);
+    g_queue_call_count = 0;
+    EXPECT(submit(qa, lw) == 0);
+    const std::uint64_t f_lo = logged_signal(qa_mock, a_written);
+    EXPECT(f_lo != 0);
+    EXPECT(hr_of(raw(lv, 139, word(allocator), 0)) == S_OK);
+    raw(lv, 74, word(&g_cells[0]), 3, 0x100000009ull, 1);
+    raw(lv, 14, 1, 1, 1);
+    EXPECT(hr_of(raw(lv, 9)) == S_OK);
+    const auto s3b = xs::list_value_stats();
+    EXPECT(submit(qb, lv) == 0);
+    EXPECT(xs::list_value_stats().waits_relayed == s3b.waits_relayed);
+    EXPECT(xs::list_value_stats().gates_held == s3b.gates_held + 1);
+    fence_signal(a_written, f_lo);
+    EXPECT(!xs::list_values_idle(20) && cell(0) == 0x100000000ull);
+    InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_cells[0]), 0x100000009ll);
+    EXPECT(xs::list_values_idle(2000));
+
+    // (e) Non-matching write followed by matching write in the same group: DOES relay.
+    g_cells[0] = 0;
+    EXPECT(hr_of(raw(lw, 139, word(allocator), 0)) == S_OK);
+    raw(lw, 14, 1, 1, 1);
+    raw(lw, 72, word(&g_cells[0]), 0, 0, 0);
+    raw(lw, 72, word(&g_cells[0]), 0x3333, 0, 0);
+    EXPECT(hr_of(raw(lw, 9)) == S_OK);
+    g_queue_call_count = 0;
+    EXPECT(submit(qa, lw) == 0);
+    const std::uint64_t f_pos = logged_signal(qa_mock, a_written);
+    EXPECT(f_pos != 0);
+    EXPECT(hr_of(raw(lv, 139, word(allocator), 0)) == S_OK);
+    raw(lv, 74, word(&g_cells[0]), 3, 0x3333, 1);
+    raw(lv, 14, 1, 1, 1);
+    EXPECT(hr_of(raw(lv, 9)) == S_OK);
+    const auto s4 = xs::list_value_stats();
+    EXPECT(submit(qb, lv) == 0);
+    EXPECT(xs::list_value_stats().waits_relayed == s4.waits_relayed + 1);
+    fence_signal(a_written, f_pos);
+    EXPECT(xs::list_values_idle(2000) && cell(0) == 0x3333);
+
+    xs::set_list_value_wait_timeout_ms(5000);
+    EXPECT(release(lw) == 0 && lw_real->refs == 0);
+    EXPECT(release(lv) == 0 && lv_real->refs == 0);
+    EXPECT(release(allocator) == 0);
+    EXPECT(release(qa) == 0 && release(qb) == 0);
+    EXPECT(a_gate->refs == 0 && a_written->refs == 0);
+    EXPECT(release(device) == 0 && mock->refs == 0);
+    std::printf("%s: list-values relay retains writer QueueValues across Wait and inspects the final overlapping write "
+                "in a WriteGroup\n",
+                g_label);
+    return 0;
+}
+
 DWORD WINAPI tear_reader(LPVOID) {
     while (!g_tear.stop.load(std::memory_order_relaxed)) {
         const std::uint64_t v = *reinterpret_cast<volatile std::uint64_t*>(&g_tear.cell);
@@ -4318,6 +4529,71 @@ static bool record_page_mapping(std::uint32_t count, const rt::xmem::PageBatch* 
             g_page_mapping.first_ranges[i] = batches[0].ranges[i];
     }
     return true;
+}
+
+int run_list_values_stop_before_start() {
+    g_label = "xs_proxy_mock(--list-values-stop-before-start)";
+    // Stopping list values before any submission starts the pump must be idempotent, spawn no pump threads, and make
+    // later CopyPageMappingsBatchX calls remap immediately while dropping post-stop writes/gates without leaking refs.
+    xs::stop_list_values(2000);
+    xs::stop_list_values(2000);
+
+    Mock* mock = nullptr;
+    void* device = make_device(mock, 9, true, true, true);
+    EXPECT(device);
+    mock->zero_fences = true;
+    xs::reset_list_value_stats();
+    void* qa = make_queue(device);
+    void* qb = make_queue(device);
+    EXPECT(qa && qb);
+    const IID allocator_iid = __uuidof(ID3D12CommandAllocator);
+    void* allocator = nullptr;
+    EXPECT(hr_of(raw(device, 9, 0, word(&allocator_iid), word(&allocator))) == S_OK);
+    Mock* lw_real = nullptr;
+    Mock* lv_real = nullptr;
+    void* lw = make_console_list(device, allocator, mock, &lw_real);
+    void* lv = make_console_list(device, allocator, mock, &lv_real);
+    EXPECT(lw && lv && hr_of(raw(lw, 9)) == S_OK && hr_of(raw(lv, 9)) == S_OK);
+    std::memset(g_cells, 0, sizeof(g_cells));
+
+    // CopyPageMappingsBatchX on an unreached queue remaps synchronously after stop_list_values().
+    xs::set_copy_page_mappings_hook(&record_page_mapping);
+    g_page_mapping = {};
+    const rt::xmem::PageRange remap_ranges[] = {{0, 4, 2}};
+    const rt::xmem::PageBatch remap[] = {{0x9000000000, 1, remap_ranges}};
+    EXPECT(hr_of(raw(qa, 31, 1, word(remap), 0x7000000000, 8, 0)) == S_OK);
+    Mock* const a_written = mock->last_child;
+    Mock* const a_gate = a_written - 1;
+    EXPECT(a_written->kind == Kind::fence && a_gate->kind == Kind::fence);
+    EXPECT(g_page_mapping.count == 1 && g_page_mapping.batches == remap);
+    EXPECT(xs::list_value_stats().remaps_now == 1 && xs::list_value_stats().remaps_deferred == 0);
+    xs::set_copy_page_mappings_hook(nullptr);
+
+    // Writes and waits submitted after stop() are dropped cleanly without retaining QueueValues or spawning threads.
+    EXPECT(hr_of(raw(lw, 139, word(allocator), 0)) == S_OK);
+    raw(lw, 14, 1, 1, 1);
+    raw(lw, 72, word(&g_cells[0]), 0x4444, 0, 0);
+    EXPECT(hr_of(raw(lw, 9)) == S_OK);
+    EXPECT(submit(qa, lw) == 0);
+    EXPECT(hr_of(raw(lv, 139, word(allocator), 0)) == S_OK);
+    raw(lv, 74, word(&g_cells[0]), 3, 0x4444, 1);
+    raw(lv, 14, 1, 1, 1);
+    EXPECT(hr_of(raw(lv, 9)) == S_OK);
+    EXPECT(submit(qb, lv) == 0);
+    Mock* const b_written = mock->last_child;
+    Mock* const b_gate = b_written - 1;
+    EXPECT(b_written->kind == Kind::fence && b_gate->kind == Kind::fence);
+    Sleep(20);
+    EXPECT(cell(0) == 0 && fence_completed(b_gate) == 0 && xs::list_value_stats().writes_landed == 0);
+
+    EXPECT(release(lw) == 0 && lw_real->refs == 0);
+    EXPECT(release(lv) == 0 && lv_real->refs == 0);
+    EXPECT(release(allocator) == 0);
+    EXPECT(release(qa) == 0 && release(qb) == 0);
+    EXPECT(a_gate->refs == 0 && a_written->refs == 0 && b_gate->refs == 0 && b_written->refs == 0);
+    EXPECT(release(device) == 0 && mock->refs == 0);
+    std::printf("%s: PASS\n", g_label);
+    return 0;
 }
 
 int check_list_values_more() {
@@ -5300,6 +5576,7 @@ int main(int argc, char** argv) {
         if (std::strcmp(argv[1], "--env-slots-74") == 0) return run_env_slots(true, true);
         if (std::strcmp(argv[1], "--env-slots-70") == 0) return run_env_slots(true, false, true);
         if (std::strcmp(argv[1], "--slot133-layout") == 0) return run_slot133_layout_word();
+        if (std::strcmp(argv[1], "--list-values-stop-before-start") == 0) return run_list_values_stop_before_start();
         return run_fault_mode(argv[1]);
     }
     if (argc != 1) return 2;
@@ -5324,6 +5601,7 @@ int main(int argc, char** argv) {
         return 1;
     if (check_placed_resource_x() || check_depth_provider_refusal()) return 1;
     if (check_list_values()) return 1;       // last: it starts the list-values threads
+    if (check_list_values_relay_safety()) return 1;
     if (check_list_values_more()) return 1;  // and this one stops them
     std::printf("xs_proxy_mock_test: PASS (%d allocations refused on purpose)\n", g_failed_news);
     return 0;

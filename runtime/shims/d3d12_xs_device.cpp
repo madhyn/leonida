@@ -3924,9 +3924,9 @@ private:
                 list_values::bump(counters.waits_met_at_submit);
                 continue;
             }
-            ID3D12Fence* fence = nullptr;
+            std::shared_ptr<list_values::QueueValues> owner;
             std::uint64_t value = 0;
-            if (list_values::Pump::get().relay(w, fence, value) && SUCCEEDED(wait(fence, value))) {
+            if (list_values::Pump::get().relay(w, owner, value) && SUCCEEDED(wait(owner->written, value))) {
                 const std::uint64_t relayed = counters.waits_relayed.fetch_add(1, std::memory_order_relaxed) + 1;
                 if (relayed <= 4)  // the first few, to show the model at work in a boot log
                     std::fprintf(stderr, "[rt] d3d12_xs: a wait for 0x%llx is relayed onto a write in flight (fence "

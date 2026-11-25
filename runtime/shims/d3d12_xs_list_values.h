@@ -359,9 +359,10 @@ public:
     // Writes that land once `queue->written` reaches `value`. The caller signalled that value on the queue and
     // asked the fence to set wake() on it (SetEventOnCompletion), so the pump needs no polling for writes.
     void add_writes(std::shared_ptr<QueueValues> queue, std::uint64_t value, std::vector<Write> writes) {
-        if (writes.empty() || exiting_.load(std::memory_order_relaxed)) return;  // stop(): see there
+        if (writes.empty() || exiting_.load(std::memory_order_acquire)) return;  // stop(): see there
         {
             std::lock_guard lock(mutex_);
+            if (exiting_.load(std::memory_order_acquire)) return;
             writes_.push_back({std::move(queue), value, std::move(writes)});
         }
         start_or_settle();
@@ -370,9 +371,10 @@ public:
     // The queue waits on `queue->gate` for `value`: signalled once every wait is met, or the gate timed out. Its
     // time starts when the gates before it on its queue have opened (start_gate).
     void add_gate(std::shared_ptr<QueueValues> queue, std::uint64_t value, std::vector<Wait> waits) {
-        if (exiting_.load(std::memory_order_relaxed)) return;  // stop(): never signalled, see there
+        if (exiting_.load(std::memory_order_acquire)) return;  // stop(): never signalled, see there
         {
             std::lock_guard lock(mutex_);
+            if (exiting_.load(std::memory_order_acquire)) return;
             Gate gate;
             gate.queue = std::move(queue);
             gate.value = value;
@@ -391,6 +393,7 @@ public:
         if (!start()) return false;
         {
             std::lock_guard lock(mutex_);
+            if (exiting_.load(std::memory_order_acquire)) return false;
             Gate gate;
             gate.queue = std::move(queue);
             gate.value = value;
@@ -405,35 +408,56 @@ public:
         return true;
     }
 
-    // A write still in flight that will meet `wait` when it lands: the fence and value whose completion lands it
-    // (the earliest such write). False when there is none.
-    bool relay(const Wait& wait, ID3D12Fence*& fence, std::uint64_t& value) {
+    // A write still in flight that will meet `wait` when it lands: the owning QueueValues (keeping its `written`
+    // fence alive across the caller's Wait) and the fence value whose completion lands it (the earliest such group).
+    // Within one WriteGroup all writes land together when its fence is reached, so the last write touching
+    // [wait.address, wait.address + need) determines what that group leaves in memory. False when there is none.
+    bool relay(const Wait& wait, std::shared_ptr<QueueValues>& owner, std::uint64_t& value) {
+        owner.reset();
+        value = 0;
+        const std::uint64_t need = wait.wide ? 8u : 4u;
+        if (wait.address > UINT64_MAX - need) return false;
+        const std::uint64_t wait_end = wait.address + need;
         std::lock_guard lock(mutex_);
-        const std::uint8_t need = wait.wide ? 8 : 4;
-        for (const WriteGroup& group : writes_)
-            for (const Write& write : group.writes)
+        for (const WriteGroup& group : writes_) {
+            for (auto it = group.writes.rbegin(); it != group.writes.rend(); ++it) {
+                const Write& write = *it;
+                if (!write.bytes || write.address > UINT64_MAX - write.bytes) continue;
+                const std::uint64_t write_end = write.address + write.bytes;
+                if (write.address >= wait_end || wait.address >= write_end) continue;
                 if (write.kind == WriteKind::value && write.address == wait.address && write.bytes >= need &&
                     console_value_met(wait.comparison, write.value, wait.reference, wait.wide)) {
-                    fence = group.queue->written;
+                    owner = group.queue;
                     value = group.value;
                     return true;
                 }
+                break;  // a later write in this group overwrites, timestamps, or partially overlaps the waited range
+            }
+        }
         return false;
     }
 
     HANDLE wake() const { return wake_; }
 
     // stop() ran: nothing new is landed or opened (the process is ending).
-    bool stopped() const { return exiting_.load(std::memory_order_relaxed); }
+    bool stopped() const { return exiting_.load(std::memory_order_acquire); }
 
-    // Starts the threads if they are not running yet; true while they run.
+    // Starts the threads if they are not running yet; true while they run. Never spawns threads once stop() has run.
     bool start() {
-        std::call_once(start_, [this] {
+        if (exiting_.load(std::memory_order_acquire)) return false;
+        if (started_.load(std::memory_order_acquire))
+            return releaser_ && !stop_.load(std::memory_order_acquire);
+        std::lock_guard lock(lifecycle_mutex_);
+        if (exiting_.load(std::memory_order_acquire)) return false;
+        if (!start_attempted_) {
+            start_attempted_ = true;
+            DWORD create_error = 0;
             if (wake_) {
                 thread_ = CreateThread(nullptr, 0, &Pump::pump_main, this, 0, nullptr);
                 if (thread_) releaser_ = CreateThread(nullptr, 0, &Pump::releaser_main, this, 0, nullptr);
+                if (!releaser_) create_error = GetLastError();
                 if (thread_ && !releaser_) {  // the pump alone would wait for a releaser forever
-                    stop_.store(true, std::memory_order_relaxed);
+                    stop_.store(true, std::memory_order_release);
                     SetEvent(wake_);
                     WaitForSingleObject(thread_, INFINITE);
                     CloseHandle(thread_);
@@ -442,12 +466,13 @@ public:
             }
             if (!releaser_)
                 std::fprintf(stderr, "[rt] d3d12_xs: no threads for list memory writes and waits (error %lu): "
-                                     "writes land at submission and waits run on\n", GetLastError());
+                                     "writes land at submission and waits run on\n", create_error);
             else
                 std::fprintf(stderr, "[rt] d3d12_xs: list memory writes land after their part ran, waits hold their "
                                      "queue (timeout %u ms)\n", timeout_ms_.load(std::memory_order_relaxed));
-        });
-        return releaser_ && !stop_.load(std::memory_order_relaxed);
+            started_.store(true, std::memory_order_release);
+        }
+        return releaser_ && !stop_.load(std::memory_order_acquire);
     }
 
     void set_timeout_ms(unsigned ms) { timeout_ms_.store(ms ? ms : 1, std::memory_order_relaxed); }
@@ -473,17 +498,23 @@ public:
     // whose remap was skipped, or signal a gate value above one still to come. The queues' held work is not run at
     // exit.
     void stop(unsigned ms) {
-        if (exiting_.exchange(true, std::memory_order_relaxed)) return;
-        stop_.store(true, std::memory_order_relaxed);
+        HANDLE threads[2];
+        DWORD count = 0;
+        {
+            std::lock_guard lock(lifecycle_mutex_);
+            if (exiting_.exchange(true, std::memory_order_acq_rel)) return;
+            stop_.store(true, std::memory_order_release);
+            if (thread_) threads[count++] = thread_;
+            if (releaser_) threads[count++] = releaser_;
+        }
+        {
+            std::lock_guard lock(mutex_);
+        }
         if (wake_) SetEvent(wake_);
         {
             std::lock_guard release(release_mutex_);
         }
         release_ready_.notify_all();
-        HANDLE threads[2];
-        DWORD count = 0;
-        if (thread_) threads[count++] = thread_;
-        if (releaser_) threads[count++] = releaser_;
         if (count && WaitForMultipleObjects(count, threads, TRUE, ms) == WAIT_TIMEOUT)
             std::fprintf(stderr, "[rt] d3d12_xs: list value threads still busy after %u ms at exit\n", ms);
     }
@@ -552,7 +583,7 @@ private:
             SetEvent(wake_);
             return;
         }
-        if (exiting_.load(std::memory_order_relaxed)) return;
+        if (exiting_.load(std::memory_order_acquire)) return;
         // One thread at a time, so that the gates are signalled in order.
         std::lock_guard settle(settle_mutex_);
         pass(true);
@@ -967,7 +998,7 @@ private:
             timeouts_in_a_row_ = 0;
             for (const Wait& wait : gate.waits) note_met(wait.address);
             if (gate.cut_short && !gate.waits.empty()) lift_demotion(gate.waits.front().address);
-            if (logged_met_ < 4) {  // the first few, to show the model at work in a boot log
+            if (logged_met_ < 4 && !gate.waits.empty()) {  // the first few, to show the model at work in a boot log
                 ++logged_met_;
                 const double ms = std::chrono::duration<double, std::milli>(Clock::now() - gate.since).count();
                 std::fprintf(stderr, "[rt] d3d12_xs: a queue's wait for 0x%llx was met after %.2f ms\n",
@@ -1021,7 +1052,9 @@ private:
     }
 
     std::mutex mutex_;  // the lists below; never held while a fence is signalled or a write lands
-    std::once_flag start_;
+    std::mutex lifecycle_mutex_;  // serializes start() and stop() around thread_ and releaser_
+    bool start_attempted_ = false;
+    std::atomic<bool> started_{false};
     HANDLE wake_ = nullptr;
     HANDLE timer_ = nullptr;
     HANDLE thread_ = nullptr;
