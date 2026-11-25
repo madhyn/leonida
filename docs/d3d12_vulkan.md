@@ -1744,18 +1744,36 @@ The game can use D3D12 descriptors in three ways, and the layer must handle all 
    include PS_NoStripImmutableTable at s11 and VS_TransformD at s12. Their shader inputs establish the
    destination dwords. The explicit graphics layouts and ordering for signatures with spills still need
    independent root-signature evidence.
+   **Inline compute layout (integration #984).** Run
+   `python -I tools/compute_heap_layout_census.py <carve>/disasm` on each compute carve. Of 5,450 indexed compute
+   entries, 2,959 advertise direct indexing and none of those embeds its root signature. Adding
+   `--group fspx_compute --dispatch-log <dispatch-log>` joined seven resource-indexing entries to independently
+   recorded layouts. In all seven, a dynamically indexed resource descriptor used the first SGPR after the explicit
+   arguments. There were zero mismatches and zero cases without room **among those seven**. For the remaining
+   2,952 entries the layout is unknown. These are entries across carves, which can contain the same program.
+   No sampler-indexing entry had a matched layout. Putting the resource heap first when both flags are set, then the
+   sampler in the next dword, remains a hypothesis. D3D-329's adjacent SGPR examples alone do not establish it.
    The runtime snapshots the bound resource and sampler heap pointers in that order after the explicit
-   arguments for direct and indirect compute dispatches with an inline signature. Set
+   arguments for direct and indirect compute dispatches with an inline signature. An unbound heap contributes
+   zero, and rebinding affects later commands. A heap that cannot fit in the inline user data is reported once,
+   and a signature whose compute arguments spill gets nothing written (logged once). Set
    `LEONIDA_COMPUTE_DIRECT_HEAPS=0` to restore the previous compute arguments.
    Draws do the same in the graphics layout (`pack_stage(Stage::Pixel)`, from s8, one dword per table): the
    resource heap's 32-bit shader VA goes in the dword after the explicit arguments, then the sampler heap's, each
    only when the signature has its flag, snapshotted per draw. Vertex, pixel and geometry shaders share one
    user-data block and that layout, so one write serves all three; a signature whose explicit arguments take
    s8..s10 gives s11, one whose arguments take s8..s11 gives s12 (the two program reads above). A mesh shader reads
-   its arguments from s16, which is not modelled, so in a mesh pipeline only the pixel shader gets the heaps. A
-   signature that keeps the s0 graphics layout, or whose arguments fill s31, gets none (logged once).
-   `d3d12_graphics_direct_heaps_test` checks the recorded draws and what a vertex and a pixel shader read, with
-   and without the flags. Set `LEONIDA_GRAPHICS_DIRECT_HEAPS=0` to restore the previous draw arguments.
+   push dword d as s(d + 8) through its root window (section 3.5), so `DispatchMesh` records the same dwords and
+   the mesh stage finds the resource heap at s(16 + end − 8), right after its arguments from s16, where DadaCap
+   reports every directly indexed program of the retail library reads it, for compute from s4, VS/PS/GS from s8
+   and mesh from s16 (issue #14, comment 7143020922, on a `boot-prototype` run; not reproduced in this
+   repository). A mesh signature that fills the window leaves no room there: a heap past s31 of the mesh shader
+   (push dword 24 or later) is logged once. A signature that keeps the s0 graphics layout, or whose arguments fill
+   s31, gets none (logged once). `d3d12_graphics_direct_heaps_test` checks the recorded draws and what a vertex
+   and a pixel shader read, with and without the flags; `d3d12_mesh_test` checks that a mesh draw records the
+   vertex draw's dwords, a resource-only rebind, a signature ending at s30 and one on the s0 layout (recorded
+   arguments only; no GPU read through a mesh shader). Set `LEONIDA_GRAPHICS_DIRECT_HEAPS=0` to restore the
+   previous draw arguments.
 3. **Game-built descriptor memory.** The game writes raw T#/S# bytes into a heap itself, without calling
    `CreateShaderResourceView`. The shaders then read those bytes exactly as in case 1.
 
@@ -2837,7 +2855,12 @@ The console has two list topologies Vulkan lacks: rectangle list (`IASetPrimitiv
   plane 1. For `R16_TYPELESS`, use `R16_UINT` on plane 0 to access the raw D16 bits. An array UAV selects a
   contiguous range of layers. The depth/stencil and shader-resource views continue to use the attachment image.
   Slot 133 keeps the guest address. Identical, live placements share their image and writable planes across
-  distinct COM objects. A partial overlap or incompatible reinterpretation is refused.
+  distinct COM objects. An incompatible reinterpretation at the same address is refused. A placement's extent is
+  the PC allocation size, which can exceed the title's own block (RADV sizes a large D16 target above it, so the
+  title's next block starts inside the range); a placement that starts inside another one therefore gets its own
+  image when both layouts are opaque, since D3D12 leaves an alias's contents undefined until reinitialized, and is
+  refused only for a non-opaque layout. Before this, the retail boot stopped on the title's assert while it created
+  its D16 depth targets on an RDNA2 iGPU under RADV. A refused depth placement is logged (no trace line covers it).
 - Legacy and enhanced texture transitions copy the selected planes and layers to or from their storage images.
   Fence-ordered graphics and compute queues can share UAV access. A dedicated compute family can perform
   the plane transfer itself when `VK_KHR_maintenance10` and the format's depth/stencil copy flags allow it.

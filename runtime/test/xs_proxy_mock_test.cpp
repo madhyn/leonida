@@ -2030,9 +2030,29 @@ int check_xbox_queue_slots() {
     raw(queue, 18, word(&host_desc));
     EXPECT(queue_mock->calls[16] == 1 && queue_mock->calls[18] == 2);
 
+    // Queue slots 16 and 17 with one of the title's fences are Signal and Wait, PC slots 14 and 15, with the real
+    // fence, and never the PC slots 16 and 17, which write through their first argument: forwarded by number, the
+    // frequency went over the fence proxy's first word, its vtable pointer, and the title's next call on that fence
+    // went through a null pointer. The fence also marks the newer layout (check_signalx_detection).
+    void* fence = make_fence(device);
+    EXPECT(fence);
+    const auto real_fence = word(xs::fence_proxy_real_fence(fence));
+    void* const fence_vtable_before = *reinterpret_cast<void**>(fence);
+    const std::uint64_t signal14 = queue_mock->calls[14], wait15 = queue_mock->calls[15];
+    const std::uint64_t getter16 = queue_mock->calls[16], getter17 = queue_mock->calls[17];
+    EXPECT(hr_of(raw(queue, 16, word(fence), 7)) == S_OK);
+    EXPECT(queue_mock->calls[14] == signal14 + 1 && queue_mock->args[14][0] == real_fence &&
+           queue_mock->args[14][1] == 7);
+    EXPECT(hr_of(raw(queue, 17, word(fence), 9)) == S_OK);
+    EXPECT(queue_mock->calls[15] == wait15 + 1 && queue_mock->args[15][0] == real_fence &&
+           queue_mock->args[15][1] == 9);
+    EXPECT(queue_mock->calls[16] == getter16 && queue_mock->calls[17] == getter17);
+    EXPECT(*reinterpret_cast<void**>(fence) == fence_vtable_before);
+    EXPECT(release(fence) == 0);
+
     EXPECT(release(queue) == 0 && release(device) == 0 && mock->refs == 0);
     std::printf("%s: queue slot 35 routes ExecuteCommandLists(count, lists) to PC slot 10 with UINT count masking "
-                "and list proxies unwrapped\n", g_label);
+                "and list proxies unwrapped; slots 16 and 17 with a fence are Signal and Wait\n", g_label);
     return 0;
 }
 

@@ -4275,13 +4275,27 @@ HRESULT create_depth_uav_backing(DeviceProxy* self, const D3D12_HEAP_PROPERTIES*
 HRESULT proxy_create_placed_depth(DeviceProxy* self, UINT64 address, const D3D12_RESOURCE_DESC& desc,
                                   std::uint32_t layout, const D3D12_CLEAR_VALUE* clear, REFIID riid, void** out) {
     const auto native = depth_image_desc(desc);
-    if (!self->validate_depth_placement(native, layout, clear)) return E_INVALIDARG;
-    const auto alloc = self->real->GetResourceAllocationInfo(0, 1, &native);
-    const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
-    return self->placed_depth_textures.create(address, native, alloc, clear, desc.Layout == D3D12_TEXTURE_LAYOUT_UNKNOWN, riid, out, [&](ID3D12Resource** backing) {
-        return create_depth_uav_backing(self, &heap, D3D12_HEAP_FLAG_NONE, native, D3D12_RESOURCE_STATE_COMMON,
-                                        clear, backing);
-    });
+    const bool valid = self->validate_depth_placement(native, layout, clear);
+    D3D12_RESOURCE_ALLOCATION_INFO alloc{};
+    HRESULT hr = E_INVALIDARG;
+    if (valid) {
+        alloc = self->real->GetResourceAllocationInfo(0, 1, &native);
+        const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
+        hr = self->placed_depth_textures.create(address, native, alloc, clear, desc.Layout == D3D12_TEXTURE_LAYOUT_UNKNOWN, riid, out, [&](ID3D12Resource** backing) {
+            return create_depth_uav_backing(self, &heap, D3D12_HEAP_FLAG_NONE, native, D3D12_RESOURCE_STATE_COMMON,
+                                            clear, backing);
+        });
+    }
+    // A refusal here reaches no trace line, and the title stops on an int3 right after it: log the first few.
+    static std::atomic<int> refusals{0};
+    if (FAILED(hr) && refusals.fetch_add(1, std::memory_order_relaxed) < 8)
+        std::fprintf(stderr,
+                     "[rt] d3d12_xs: slot 133 depth texture refused (hr=0x%08x, %s): format %d %llux%ux%u, Xbox layout "
+                     "0x%x, layout word 0x%x, PC size %llu\n",
+                     static_cast<unsigned>(hr), valid ? "placement" : "description", int(desc.Format),
+                     static_cast<unsigned long long>(desc.Width), unsigned(desc.Height), unsigned(desc.DepthOrArraySize),
+                     unsigned(desc.Layout), layout, static_cast<unsigned long long>(alloc.SizeInBytes));
+    return hr;
 }
 
 HRESULT proxy_create_resource(DeviceProxy* self, const D3D12_HEAP_PROPERTIES* heap_properties,

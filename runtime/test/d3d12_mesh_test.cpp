@@ -188,13 +188,14 @@ int main(int argc, char** argv) {
     };
     // Twenty constants: s8..s27 for a pixel shader, but past a mesh shader's 16-dword window (s16..s31). Thirty:
     // past the graphics window (24 from s8) and the compute one (28 from s4) too, as a retail start-up signature is.
-    const auto wide_root_signature = [&](ID3D12Device* device, Ref<ID3D12RootSignature>& root, UINT values = 20) {
+    const auto wide_root_signature = [&](ID3D12Device* device, Ref<ID3D12RootSignature>& root, UINT values = 20,
+                                         D3D12_ROOT_SIGNATURE_FLAGS flags = D3D12_ROOT_SIGNATURE_FLAG_NONE) {
         D3D12_ROOT_PARAMETER param{};
         param.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
         param.Constants = {0, 0, values};
         D3D12_VERSIONED_ROOT_SIGNATURE_DESC root_desc{};
         root_desc.Version = D3D_ROOT_SIGNATURE_VERSION_1_0;
-        root_desc.Desc_1_0 = {1, &param, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+        root_desc.Desc_1_0 = {1, &param, 0, nullptr, flags};
         const auto blob = serialize_root_signature(root_desc);
         return !blob.empty() &&
                SUCCEEDED(device->CreateRootSignature(0, blob.data(), blob.size(), IID_PPV_ARGS(&root.p)));
@@ -526,6 +527,68 @@ int main(int argc, char** argv) {
             list->RSSetViewports(1, &viewport);
             list6->DispatchMesh(1, 1, 1);
             EXPECT(SUCCEEDED(list->Close()));
+
+            // RT-DIRECT-HEAP-GRAPHICS: with the directly-indexed flags, the dword after the graphics root arguments
+            // holds the resource heap's 32-bit address and the next one the sampler heap's, for vertex and mesh draws
+            // alike (a mesh shader reads them through its window). 4 constants take s8..s11, so the heaps are at 12
+            // and 13; 23 constants leave room for the resource heap only (s31); a signature past the graphics window
+            // (30 constants) keeps pack()'s s0 layout, which has no measured slot, so nothing is written.
+            const auto direct = static_cast<D3D12_ROOT_SIGNATURE_FLAGS>(
+                D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED |
+                D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED);
+            Ref<ID3D12RootSignature> direct4, direct23, direct30;
+            EXPECT(wide_root_signature(device.p, direct4, 4, direct));
+            EXPECT(wide_root_signature(device.p, direct23, 23, direct));
+            EXPECT(wide_root_signature(device.p, direct30, 30, direct));
+            D3D12_DESCRIPTOR_HEAP_DESC resources_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 8,
+                                                      D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+            auto samplers_desc = resources_desc;
+            samplers_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER;
+            Ref<ID3D12DescriptorHeap> resources, samplers;
+            EXPECT(SUCCEEDED(device->CreateDescriptorHeap(&resources_desc, IID_PPV_ARGS(&resources.p))));
+            EXPECT(SUCCEEDED(device->CreateDescriptorHeap(&samplers_desc, IID_PPV_ARGS(&samplers.p))));
+            const std::uint64_t res_va = reinterpret_cast<XboxHeapHandleFn>(slot(resources.p, 10))(resources.p);
+            const std::uint64_t smp_va = reinterpret_cast<XboxHeapHandleFn>(slot(samplers.p, 10))(samplers.p);
+            EXPECT(res_va && res_va < (1ull << 32) && smp_va && smp_va < (1ull << 32));
+            const std::array<std::uint32_t, 4> four{1, 2, 3, 4};
+            ID3D12DescriptorHeap* both[] = {resources.p, samplers.p};
+            EXPECT(SUCCEEDED(list->Reset(allocator.p, vs_pso.p)));
+            list->SetDescriptorHeaps(2, both);
+            list->SetGraphicsRootSignature(direct4.p);
+            list->SetGraphicsRoot32BitConstants(0, 4, four.data(), 0);
+            list->RSSetViewports(1, &viewport);
+            list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            list->DrawInstanced(3, 1, 0, 0);
+            list->SetPipelineState(mesh_pso.p);
+            list6->DispatchMesh(1, 1, 1);
+            list->SetPipelineState(vs_pso.p);
+            list->SetDescriptorHeaps(1, &resources.p);  // rebinding only the resource heap unbinds the sampler heap
+            list->DrawInstanced(3, 1, 0, 0);
+            list->SetDescriptorHeaps(2, both);
+            list->SetGraphicsRootSignature(direct23.p);
+            list->SetGraphicsRoot32BitConstant(0, 77, 22);
+            list->DrawInstanced(3, 1, 0, 0);
+            list->SetGraphicsRootSignature(direct30.p);
+            list->DrawInstanced(3, 1, 0, 0);
+            EXPECT(SUCCEEDED(list->Close()));
+            std::vector<leonida::Command> commands;
+            EXPECT(rt::d3d12::recorded_commands(list.p, commands));
+            std::vector<const leonida::Draw*> draws;
+            for (const auto& command : commands)
+                if (const auto* recorded = std::get_if<leonida::Draw>(&command)) draws.push_back(recorded);
+            EXPECT(draws.size() == 5);
+            char setting[2]{};
+            const bool enabled = GetEnvironmentVariableA("LEONIDA_GRAPHICS_DIRECT_HEAPS", setting, 2) != 1 ||
+                                 setting[0] != '0';
+            const auto res = enabled ? std::uint32_t(res_va) : 0u, smp = enabled ? std::uint32_t(smp_va) : 0u;
+            const auto& vertex = draws[0]->user_data;
+            EXPECT(vertex[8] == 1 && vertex[11] == 4 && vertex[12] == res && vertex[13] == smp);
+            EXPECT(draws[1]->mesh && draws[1]->user_data == vertex);  // the mesh draw: the same dwords
+            EXPECT(draws[2]->user_data[12] == res && draws[2]->user_data[13] == 0);
+            EXPECT(draws[3]->user_data[30] == 77 && draws[3]->user_data[31] == res);
+            for (std::uint32_t k = 0; k < 32; ++k) EXPECT(draws[4]->user_data[k] == 0);
+            std::printf("direct heaps on graphics draws: resource heap at s%u, sampler heap at s%u%s\n", 12u, 13u,
+                        enabled ? "" : " (LEONIDA_GRAPHICS_DIRECT_HEAPS=0: not written)");
         }
         // A DISPATCH_MESH command signature (D3D12_DISPATCH_MESH_ARGUMENTS, 12 bytes) is created; a stride below its
         // 12 bytes is refused as the PC runtime refuses it. ExecuteIndirect with it records nothing yet (#3777 replays
