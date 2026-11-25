@@ -1871,13 +1871,17 @@ void update_keyboard_pad() {
         int x = 0, y = 0;
         const bool have = g_cursor_pos.load()(&x, &y);
         const bool moved = have && g_keyboard.have_cursor;
+        // Raw input exposes the low bits of a running total. Keep subtraction modular across a wrap.
+        auto delta = [](int current, int previous) {
+            return static_cast<int>(static_cast<unsigned>(current) - static_cast<unsigned>(previous));
+        };
         auto step = [sens](int v, int pixels) {
             const long long n = static_cast<long long>(v) * kMouseDecayNum / kMouseDecayDen +
-                                std::lround(static_cast<long long>(pixels) * kMouseAxisPerPixel * sens);
+                                std::llround(static_cast<long long>(pixels) * kMouseAxisPerPixel * sens);
             return static_cast<int>(std::clamp<long long>(n, -kStickFull, kStickFull));
         };
-        g_keyboard.right_x = step(g_keyboard.right_x, moved ? x - g_keyboard.cursor_x : 0);
-        g_keyboard.right_y = step(g_keyboard.right_y, moved ? y - g_keyboard.cursor_y : 0);
+        g_keyboard.right_x = step(g_keyboard.right_x, moved ? delta(x, g_keyboard.cursor_x) : 0);
+        g_keyboard.right_y = step(g_keyboard.right_y, moved ? delta(y, g_keyboard.cursor_y) : 0);
         if (have) g_keyboard.cursor_x = x, g_keyboard.cursor_y = y;
         g_keyboard.have_cursor = have;
     } else {
