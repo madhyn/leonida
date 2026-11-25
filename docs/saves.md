@@ -130,6 +130,10 @@ The runtime's offline `XGameSaveImpl` (`runtime/shims/xgameruntime_gamesave.cpp`
 `LEONIDA_SAVE_DIR\local-user\<container>\<blob>`, defaulting to `%LOCALAPPDATA%\Leonida\saves`, with names
 %-encoded. `python -I tools/saves.py import <save folder>... [--out DIR] [--map OLD=CONTAINER/BLOB] [--with-packed]`
 writes payloads in that layout with the same encoding, plus `import-manifest.json` (source, size, SHA-256).
+The runtime keeps a hidden journal alongside the container folders while committing a save update. After a
+process interruption, the runtime restores an unfinished update before reading the save again. Blobs and display
+metadata are recovered together. Import into an idle save directory. Recovery assumes one runtime process uses
+that directory and covers interrupted processes on the same volume.
 `--with-packed` also imports `chives.dat`, the packed `SLAYER1` copy of the same save (below), as a blob of its own;
 without it only the plain payload is imported.
 
