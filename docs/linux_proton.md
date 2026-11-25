@@ -150,6 +150,10 @@ Each item was a stop on at least one of the machines. Tests named in the pull re
 
 ## Where it stops
 
+- **Writes into title memory.** A window is a read-side copy, so a UAV or raw write used to stop at the copy: the
+  missing return copy is the `WRITE_INVALID` device loss of #1537. The layer now copies the reached ranges back to
+  the title's pages at the next refresh, before the forward copy, and the title's own newer words win. Not yet
+  measured on a GPU with the world phase in front of it.
 - **Streamed memory that reaches its destination late or not at all.** The title calls queue slot 31
   (`CopyPageMappingsBatchX`) about 300 times per boot. With #968 this branch maps each batch's pool pages at the
   destination and at the paired CPU view the layer reads (`docs/d3d12_vulkan.md`, section 4.9), so most streamed
