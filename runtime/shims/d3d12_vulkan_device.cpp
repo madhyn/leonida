@@ -4680,12 +4680,10 @@ struct DeviceState {
             }
         }
         view_info.components = g::vulkan_swizzle(swizzle, channels_format);
-        // The cast: MSVC's enums are ints, and it rejects int to VkImageAspectFlags in braces as narrowing.
-        view_info.subresourceRange = {
-            VkImageAspectFlags(stencil                                   ? VK_IMAGE_ASPECT_STENCIL_BIT
-                               : (aspects & VK_IMAGE_ASPECT_DEPTH_BIT) ? VK_IMAGE_ASPECT_DEPTH_BIT
-                                                                       : VK_IMAGE_ASPECT_COLOR_BIT),
-            image.first_mip, image.mip_count, image.first_layer, image.layer_count};
+        view_info.subresourceRange = g::vulkan_subresource_range(
+            image, stencil ? VK_IMAGE_ASPECT_STENCIL_BIT
+                            : (aspects & VK_IMAGE_ASPECT_DEPTH_BIT) ? VK_IMAGE_ASPECT_DEPTH_BIT
+                                                                   : VK_IMAGE_ASPECT_COLOR_BIT);
         ImageEntry entry{dimension, 0, VK_NULL_HANDLE, VK_NULL_HANDLE, image.address};
         if (sampled) {
             const VkResult result = vk.vkCreateImageView(info.device, &view_info, nullptr, &entry.sampled);
@@ -10281,6 +10279,8 @@ TitleImage bind_title_image(DeviceState& device, const leonida::gfx10::ImageWord
         std::lock_guard lock(device.descriptor_mutex);
         if (!device.bindless) return refuse("no bindless set");
         if (device.image_entries.count(words)) return TitleImage::known;
+        if (g::has_hardware_volume_uav_slice_offset(words, image))
+            return refuse("a title-written 3D UAV with a slice offset is not supported");
         auto found = device.images_by_address.find(image.address);
         // Memory of the texture stream pool has two addresses, the CPU view's and the GPU-only alias the title hands
         // to the GPU (title_gpu_views): a T# naming either finds a texture registered under the other.
