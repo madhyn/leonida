@@ -28,6 +28,7 @@
 #include "d3d12_com.h"  // rt::d3d12::create_console_descriptor_heap for slot 14
 #endif
 #include "d3d12_trace.h"
+#include "xmem.h"  // rt::xmem::copy_page_mappings_fn for queue slot 31
 #include "d3d12_xs_alloc_size.h"
 #include "d3d12_xs_desc_clean.h"
 #include "../src/frame_pacer.h"
@@ -875,6 +876,7 @@ static_assert(kFenceCompletedValueSlot >= kFence1PublicSlots && kFenceCompletedV
 struct FenceMirror;
 
 constexpr unsigned kQueueExecuteCommandListsX = 35;  // console ExecuteCommandLists(count, lists) variant
+constexpr unsigned kQueueCopyPageMappingsBatchX = 31;  // CopyPageMappingsBatchX(count, batches, pool, pool pages, flags)
 static_assert(kQueueExecuteCommandLists < kQueuePublicSlots && kQueueExecuteCommandListsX < kQueueSlots,
               "queue execution slots must stay within their respective tables");
 
@@ -1314,6 +1316,67 @@ LONG CALLBACK table_overrun_handler(EXCEPTION_POINTERS* info) {
     return EXCEPTION_CONTINUE_SEARCH;  // diagnostics only: the fault goes on to the title's handlers or the crash
 }
 
+// ---- Queue slot 31: CopyPageMappingsBatchX (RT-QUEUE31) ----
+struct ConsolePageRange {
+    std::uint32_t kind, start, count;
+};
+struct ConsolePageBatch {
+    std::uint64_t destination;
+    std::uint32_t count;
+    const ConsolePageRange* ranges;
+};
+static_assert(sizeof(ConsolePageRange) == 12 && sizeof(ConsolePageBatch) == 24, "the title's page batch layout");
+
+constexpr std::uint64_t kConsolePageSize = 0x10000;
+
+bool copy_console_page_range(const ConsolePageRange& range, std::uint64_t destination, std::uint64_t pool,
+                             std::uint32_t pool_pages) {
+    void* const at = reinterpret_cast<void*>(destination);
+    const void* const from = reinterpret_cast<const void*>(pool + std::uint64_t{range.start} * kConsolePageSize);
+    switch (range.kind) {
+        case 0:
+            return std::uint64_t{range.start} + range.count <= pool_pages &&
+                   rt::xmem::copy_page_mappings_fn(at, from, range.count, false);
+        case 1:
+            return range.start < pool_pages && rt::xmem::copy_page_mappings_fn(at, from, range.count, true);
+        case 2:
+            return rt::xmem::copy_page_mappings_fn(at, nullptr, range.count, false);
+        case 3:
+            return true;
+        default:
+            return false;
+    }
+}
+
+HRESULT queue_copy_page_mappings(std::uint64_t count_word, std::uint64_t batches_word, std::uint64_t pool,
+                                 std::uint64_t pool_pages_word) {
+    const auto count = static_cast<std::uint32_t>(count_word);
+    const auto pool_pages = static_cast<std::uint32_t>(pool_pages_word);
+    const auto* const batches = reinterpret_cast<const ConsolePageBatch*>(batches_word);
+    if (count && !batches) return E_INVALIDARG;
+    static std::atomic<bool> first_call{true}, first_refusal{true};
+    if (first_call.exchange(false, std::memory_order_relaxed))
+        std::fprintf(stderr, "[rt] d3d12_xs: queue slot 31 (CopyPageMappingsBatchX) first call: %u batch(es), pool "
+                     "0x%llx of %u pages\n", count, static_cast<unsigned long long>(pool), pool_pages);
+    bool all = true;
+    for (std::uint32_t b = 0; b < count; ++b) {
+        if (!batches[b].ranges) continue;
+        std::uint64_t at = batches[b].destination;
+        for (std::uint32_t r = 0; r < batches[b].count; ++r) {
+            const ConsolePageRange& range = batches[b].ranges[r];
+            if (!copy_console_page_range(range, at, pool, pool_pages)) {
+                all = false;
+                if (first_refusal.exchange(false, std::memory_order_relaxed))
+                    std::fprintf(stderr, "[rt] d3d12_xs: queue slot 31: range kind %u, pool pages %u+%u at 0x%llx not "
+                                 "mapped (pool of %u pages, error %lu); logged once\n", range.kind, range.start,
+                                 range.count, static_cast<unsigned long long>(at), pool_pages, GetLastError());
+            }
+            at += std::uint64_t{range.count} * kConsolePageSize;
+        }
+    }
+    return all ? S_OK : E_INVALIDARG;
+}
+
 // ---- PresentX on the queue (LEONIDA_VULKAN_DEVICE) ---------------------------------------------------------
 //
 // The measured console queue slots (docs/d3d12_xs_console_abi.md §4): the older runtime keeps the PC order —
@@ -1380,12 +1443,10 @@ DWORD WINAPI fallback_window_thread(LPVOID parameter) {
     if (!RegisterClassW(&window_class) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
         std::fprintf(stderr, "[rt] d3d12_xs: PresentX window class failed (error %lu)\n", GetLastError());
     } else {
-        // A 1920x1080 client area where the desktop has room for it; the window manager may still size it.
-        RECT frame{0, 0, 1920, 1080};
-        AdjustWindowRect(&frame, WS_OVERLAPPEDWINDOW, FALSE);
-        window = CreateWindowExW(0, window_class.lpszClassName, L"Leonida", WS_OVERLAPPEDWINDOW, CW_USEDEFAULT,
-                                 CW_USEDEFAULT, frame.right - frame.left, frame.bottom - frame.top, nullptr, nullptr,
-                                 window_class.hInstance, nullptr);
+        int x = CW_USEDEFAULT, y = CW_USEDEFAULT, w = 1280, h = 720;
+        rt::d3d12::compute_fitted_window_rect(nullptr, WS_OVERLAPPEDWINDOW, 0, x, y, w, h);
+        window = CreateWindowExW(0, window_class.lpszClassName, L"Leonida", WS_OVERLAPPEDWINDOW, x, y, w, h, nullptr,
+                                 nullptr, window_class.hInstance, nullptr);
         if (!window) std::fprintf(stderr, "[rt] d3d12_xs: PresentX window failed (error %lu)\n", GetLastError());
     }
     if (window && start->show) ShowWindow(window, SW_SHOWNOACTIVATE);
@@ -1533,6 +1594,12 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
         return fence_completed_value_address(self, a1, a2, a3);
     } else {
         note_child_slot<K>(Slot);
+        if constexpr (K == ChildKind::queue && Slot == kQueueCopyPageMappingsBatchX) {
+            if (rt::xmem::copy_page_mappings_fn) {
+                d3d12_trace::record(child_trace_name<K>(Slot));
+                return hr_to_u64(queue_copy_page_mappings(a1, a2, a3, a4));
+            }
+        }
         if constexpr (K == ChildKind::queue && Slot == kQueueExecuteCommandListsX) {
             d3d12_trace::record(child_trace_name<K>(Slot));
             return queue_execute_command_lists(self, a1, a2);

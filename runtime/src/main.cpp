@@ -138,6 +138,9 @@ void start_title_peek(std::uint8_t* base) {
 #include "../shims/shims.h"
 #include "../shims/startup_trace.h"
 #include "../shims/xmem.h"
+#ifdef LEONIDA_VULKAN_DEVICE
+#include "../shims/title_window.h"
+#endif
 
 namespace {
 
@@ -172,6 +175,7 @@ int usage() {
 
 #ifdef LEONIDA_VULKAN_DEVICE
 static BOOL WINAPI show_package_window(HWND window, int command) {
+    if (command != SW_HIDE) rt::d3d12::fit_title_window_to_monitor(window);
     const BOOL previous = ShowWindow(window, command);
     const DWORD error = GetLastError();
     if (command != SW_HIDE && rt::package_splash::paint_window(window))
@@ -268,13 +272,11 @@ int wmain(int argc, wchar_t** argv) {
 #ifdef LEONIDA_VULKAN_DEVICE
     if (run) {
         rt::package_splash::configure(game_dir);
-        if (rt::package_splash::configured()) {
-            const rt::shims::Entry window_imports[] = {
-                {"ext-ms-win-rtcore-ntuser-window-l1-1-0.dll", "ShowWindow", reinterpret_cast<void*>(&show_package_window)},
-                {"user32.dll", "ShowWindow", reinterpret_cast<void*>(&show_package_window)},
-            };
-            rt::shims::Table{window_imports, std::size(window_imports)};
-        }
+        static const rt::shims::Entry window_imports[] = {
+            {"ext-ms-win-rtcore-ntuser-window-l1-1-0.dll", "ShowWindow", reinterpret_cast<void*>(&show_package_window)},
+            {"user32.dll", "ShowWindow", reinterpret_cast<void*>(&show_package_window)},
+        };
+        rt::shims::Table{window_imports, std::size(window_imports)};
     }
 #endif
     // Mods (docs/modding.md): <folder of gta6rt.exe>\mods unless --mods names another. Loaded and reported here;
