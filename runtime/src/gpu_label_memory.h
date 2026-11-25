@@ -35,8 +35,14 @@ class Memory {
         auto previous = regions_.upper_bound(base);
         if (!heap && previous != regions_.begin()) {
             --previous;
-            const auto &r = *previous->second;
-            if (!r.heap && r.allocation_base == allocation_base && base >= r.begin && end <= r.end) return;
+            auto &r = *previous->second;
+            if (!r.heap && r.allocation_base == allocation_base && base >= r.begin) {
+                if (end <= r.end) return;
+                if (base == r.begin) {
+                    r.end = end;
+                    return;
+                }
+            }
         }
         regions_[base] = std::make_shared<Region>(Region{base, end, allocation_base, heap});
     }
