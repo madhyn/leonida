@@ -2604,7 +2604,8 @@ struct DeviceState {
     // A window is a read-side mirror, so without this a UAV or a raw write lands in the copy and the title never sees
     // it (#1537, the WRITE_INVALID stop at the world start).
     std::mutex title_write_back_mutex;  // its own: taken under shadow_mutex, never the other way round
-    std::map<std::uint64_t, std::uint64_t> title_write_back;  // start -> end
+    std::map<std::uint64_t, std::uint64_t> title_write_back;  // start -> end, of the submission about to run
+    std::deque<std::pair<std::uint64_t, std::map<std::uint64_t, std::uint64_t>>> title_write_back_pending;  // by ticket
     std::uint64_t title_write_back_refused = 0;               // ranges past the caps, logged once
     std::uint64_t title_write_back_bytes = 0;                 // queued for this submission
     std::uint64_t title_write_back_total = 0;                 // copied back, all submissions
@@ -2813,18 +2814,32 @@ struct DeviceState {
     }
 
     // What the GPU wrote into those copies goes back to the title's pages, so a later read by the title or the next
-    // forward copy sees it. Runs at the start of the next refresh, under shadow_mutex and before the forward copies,
-    // so a page the title itself wrote again is copied forward over the result.
+    // forward copy sees it. Only once the submission that wrote them has completed: a batch carries the ticket of the
+    // submission after it (a submission's commands are recorded before it exists), and is copied back when the
+    // context reports that ticket done. Runs at the start of a refresh, under shadow_mutex and before the forward
+    // copies, so a page the title wrote again is copied forward over the result.
     void write_back_titles() {
-        if (title_write_back.empty()) return;
-        std::map<std::uint64_t, std::uint64_t> reached;
+        if (!&context) return;
+        const std::uint64_t done = context->completed_retire_ticket();
+        std::vector<std::pair<uint64_t, std::uint64_t>> finished;  // one entry per range, collected under the lock
         {
             std::lock_guard lock(title_write_back_mutex);
-            reached.swap(title_write_back);
-            title_write_back_bytes = 0;
+            if (!title_write_back.empty()) {
+                // The ranges of the submission about to execute, which is the next ticket.
+                title_write_back_pending.push_back({context->submitted_retire_ticket() + 1,
+                                                    std::move(title_write_back)});
+                title_write_back.clear();
+                title_write_back_bytes = 0;
+            }
+            while (!title_write_back_pending.empty() && title_write_back_pending.front().first <= done) {
+                for (const auto& [begin, end] : title_write_back_pending.front().second)
+                    finished.push_back({begin, end});
+                title_write_back_pending.pop_front();
+            }
         }
+        if (finished.empty()) return;
         std::uint64_t written = 0, ranges = 0;
-        for (const auto& [begin, end] : reached)
+        for (const auto& [begin, end] : finished)
             for (const ShadowPagesPtr& s : shadows)
                 if (end > s->first() && begin < s->last()) {
                     const std::uint64_t bytes = s->write_back(begin, end);
@@ -17973,7 +17988,7 @@ public:
     // imported, or a shadow copied from them before every submission) and kept until the device goes, up to
     // LEONIDA_TITLE_BUFFERS_MB (512 by default).
     void make_title_buffer(std::uint64_t va, std::uint64_t bytes) {
-        if (!state_.context) return;
+        if (!&context()) return;
         static const bool check_size = [] {
             wchar_t flag[2]{};
             return !(GetEnvironmentVariableW(L"LEONIDA_TITLE_BUFFER_COVERAGE", flag, 2) == 1 && flag[0] == L'0');
