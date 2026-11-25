@@ -272,6 +272,65 @@ inline bool apply(const Decoded& d, CONTEXT* c, EXCEPTION_RECORD* fault = nullpt
     return true;
 }
 
+// MONITORX (0F 01 FA) and MWAITX (0F 01 FB) are AMD-only spin-wait instructions. On Intel hosts every execution
+// raises #UD; under Wine each #UD costs tens of microseconds. Rewrite bare 3-byte sites in place at their first
+// #UD: MONITORX becomes a 3-byte NOP (0F 1F 00) and MWAITX becomes PAUSE; NOP (F3 90 90). The 3 bytes are swapped
+// via an atomic 32-bit compare-exchange kept strictly within the instruction's 4 KiB page so concurrent threads
+// executing the same site never observe a torn intermediate encoding. Prefixed and page-straddling forms fall back
+// to per-fault emulation. LEONIDA_MONITORX_PATCH=0 keeps emulating every execution instead.
+inline bool patch_monitorx_mwaitx(uint64_t rip, Op op, const uint8_t* code, std::size_t length) {
+    static const bool enabled = [] {
+        char value[4]{};
+        return !(GetEnvironmentVariableA("LEONIDA_MONITORX_PATCH", value, sizeof(value)) > 0 && value[0] == '0');
+    }();
+    if (!enabled || length != 3) return false;
+    const uint8_t modrm = (op == Op::monitorx) ? 0xFA : 0xFB;
+    if (code[0] != 0x0F || code[1] != 0x01 || code[2] != modrm) return false;
+    // Keep the 4-byte atomic window inside one 4 KiB page; straddling sites (>= 0xFFE) stay on per-fault emulation.
+    if ((rip & 0xFFFu) > 0xFFDu) return false;
+    const bool shift_back = (rip & 0xFFFu) == 0xFFDu;
+    const uint64_t window_addr = shift_back ? rip - 1 : rip;
+    const std::size_t off = shift_back ? 1 : 0;
+    const uint8_t target[3] = {uint8_t(op == Op::monitorx ? 0x0F : 0xF3),
+                               uint8_t(op == Op::monitorx ? 0x1F : 0x90),
+                               uint8_t(op == Op::monitorx ? 0x00 : 0x90)};
+    static SRWLOCK patch_lock = SRWLOCK_INIT;
+    AcquireSRWLockExclusive(&patch_lock);
+    bool ok = false;
+    const auto* live = reinterpret_cast<const uint8_t*>(rip);
+    if (live[0] == target[0] && live[1] == target[1] && live[2] == target[2]) {
+        ok = true;
+    } else if (live[0] == 0x0F && live[1] == 0x01 && live[2] == modrm) {
+        DWORD old = 0;
+        if (VirtualProtect(reinterpret_cast<void*>(window_addr), 4, PAGE_EXECUTE_READWRITE, &old)) {
+            uint8_t before[4]{}, after[4]{};
+            std::memcpy(before, reinterpret_cast<const void*>(window_addr), 4);
+            std::memcpy(after, before, 4);
+            after[off] = target[0];
+            after[off + 1] = target[1];
+            after[off + 2] = target[2];
+            LONG expected = 0, desired = 0;
+            std::memcpy(&expected, before, 4);
+            std::memcpy(&desired, after, 4);
+            const LONG observed = InterlockedCompareExchange(
+                reinterpret_cast<volatile LONG*>(window_addr), desired, expected);
+            DWORD unused = 0;
+            VirtualProtect(reinterpret_cast<void*>(window_addr), 4, old, &unused);
+            FlushInstructionCache(GetCurrentProcess(), reinterpret_cast<void*>(rip), 3);
+            if (observed == expected) {
+                ok = true;
+                static std::atomic<unsigned> sites{0};
+                const unsigned n = ++sites;
+                if (n <= 8 || !(n & (n - 1)))
+                    std::fprintf(stderr, "[rt] cpu: %s at %p rewritten as %s (%u sites so far)\n", name(op),
+                                 reinterpret_cast<void*>(rip), op == Op::monitorx ? "3-byte NOP" : "PAUSE; NOP", n);
+            }
+        }
+    }
+    ReleaseSRWLockExclusive(&patch_lock);
+    return ok;
+}
+
 inline uint64_t gpr_read(const CONTEXT* c, int r) {
     switch (r) {
     case 0: return c->Rax;   case 1: return c->Rcx;   case 2: return c->Rdx;   case 3: return c->Rbx;
@@ -377,6 +436,10 @@ inline LONG CALLBACK handler(EXCEPTION_POINTERS* info) {
             r->ExceptionInformation[1] = fault.ExceptionInformation[1];
             return EXCEPTION_CONTINUE_SEARCH;
         }
+    }
+    if ((d.op == Op::monitorx || d.op == Op::mwaitx) && patch_monitorx_mwaitx(c->Rip, d.op, code, d.length)) {
+        count(d.op).fetch_add(1, std::memory_order_relaxed);
+        return EXCEPTION_CONTINUE_EXECUTION;
     }
     if (!apply(d, c, &fault)) {
         // CLZERO on a line it cannot write: the CPU would raise that fault at this instruction, so the next handlers
