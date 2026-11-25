@@ -6,11 +6,13 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
 #include <functional>
 #include <map>
 #include <mutex>
 #include <thread>
 #include <string>
+#include <vector>
 
 namespace rt::d3d12 {
 inline bool trace_pipeline_compile() {
@@ -84,18 +86,49 @@ struct CompileTrace {
 
 
 // Demanded work has priority zero, speculative work is ordered by module size, and
-// an idle checkpoint runs last. Jobs own their object until they finish. No Vulkan
-// call runs with the queue lock held. The worker outlives individual D3D12 devices.
+// an idle checkpoint runs last. With two or more workers (LEONIDA_COMPILE_THREADS, default
+// 2..6 by hardware concurrency; 1 keeps the single-worker path), at least one worker is
+// reserved so demanded builds never stall behind speculative warmup compiles, and an idle
+// checkpoint waits until no compile jobs are running. Jobs own their object until they
+// finish. No Vulkan call runs with the queue lock held. The singleton outlives individual
+// D3D12 devices.
 class PipelineCompiler {
 public:
     static PipelineCompiler& instance() {
         static auto* pool = new PipelineCompiler;
         return *pool;
     }
+    static unsigned configured_worker_count(unsigned hw = std::thread::hardware_concurrency()) {
+        char text[16]{};
+        const DWORD n = GetEnvironmentVariableA("LEONIDA_COMPILE_THREADS", text, sizeof(text));
+        if (n > 0 && n < sizeof(text)) {
+            char* end = nullptr;
+            const unsigned long parsed = std::strtoul(text, &end, 10);
+            if (end != text && *end == '\0' && parsed >= 1 && parsed <= 32) return static_cast<unsigned>(parsed);
+        }
+        return hw >= 18 ? 6u : hw >= 12 ? 4u : hw >= 6 ? 3u : 2u;
+    }
+    explicit PipelineCompiler(unsigned workers = 0)
+        : workers_(workers ? workers : configured_worker_count()) {}
+    ~PipelineCompiler() {
+        {
+            std::lock_guard lock(mutex_);
+            stopping_ = true;
+        }
+        wake_.notify_all();
+        for (auto& t : threads_)
+            if (t.joinable()) t.join();
+    }
+    PipelineCompiler(const PipelineCompiler&) = delete;
+    PipelineCompiler& operator=(const PipelineCompiler&) = delete;
+
+    unsigned worker_count() const noexcept { return workers_; }
+
     void submit(std::size_t priority, std::function<void()> work) {
         std::lock_guard lock(mutex_);
         if (!started_) {
-            std::thread([this] { run(); }).detach();
+            threads_.reserve(workers_);
+            for (unsigned i = 0; i < workers_; ++i) threads_.emplace_back([this] { run(); });
             started_ = true;
         }
         jobs_.emplace(priority, std::move(work));
@@ -103,41 +136,61 @@ public:
     }
     bool has_compile_waiter() {
         std::lock_guard lock(mutex_);
-        return !jobs_.empty() && jobs_.begin()->first != SIZE_MAX;
+        return (!jobs_.empty() && jobs_.begin()->first != SIZE_MAX) || compile_running_ > 0;
     }
     // Returns when no job is queued or running. A job owns its pipeline state, and through it the device, until it
     // finishes; a caller that counts references (rt::d3d12_xs::device_proxy_ref_count) waits here first.
     void wait_idle() {
         std::unique_lock wait(mutex_);
-        idle_.wait(wait, [this] { return jobs_.empty() && !running_; });
+        idle_.wait(wait, [this] { return jobs_.empty() && running_ == 0; });
     }
 private:
+    bool can_take_locked(std::size_t priority) const noexcept {
+        if (priority == 0) return true;
+        if (priority == SIZE_MAX) return running_ == 0;
+        return workers_ <= 1 || speculative_running_ + 1 < workers_;
+    }
     void run() {
         SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
         for (;;) {
+            std::size_t priority = 0;
             std::function<void()> job;
             {
                 std::unique_lock wait(mutex_);
-                wake_.wait(wait, [this] { return !jobs_.empty(); });
+                wake_.wait(wait, [this] {
+                    return stopping_ || (!jobs_.empty() && can_take_locked(jobs_.begin()->first));
+                });
+                if (stopping_) return;
                 auto first = jobs_.begin();
+                priority = first->first;
                 job = std::move(first->second);
                 jobs_.erase(first);
-                running_ = true;
+                ++running_;
+                if (priority != SIZE_MAX) ++compile_running_;
+                if (priority != 0 && priority != SIZE_MAX) ++speculative_running_;
             }
             job();
             job = nullptr;  // what the job captured goes before the pool reports itself idle
             {
                 std::lock_guard done(mutex_);
-                running_ = false;
+                --running_;
+                if (priority != SIZE_MAX) --compile_running_;
+                if (priority != 0 && priority != SIZE_MAX) --speculative_running_;
             }
+            wake_.notify_all();
             idle_.notify_all();
         }
     }
+    unsigned workers_ = 1;
     std::mutex mutex_;
     std::condition_variable wake_;
     std::condition_variable idle_;
-    bool running_ = false;
+    std::size_t running_ = 0;
+    std::size_t compile_running_ = 0;
+    std::size_t speculative_running_ = 0;
     std::multimap<std::size_t, std::function<void()>> jobs_;
+    std::vector<std::thread> threads_;
     bool started_ = false;
+    bool stopping_ = false;
 };
 }  // namespace rt::d3d12
