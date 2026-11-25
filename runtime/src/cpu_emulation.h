@@ -350,6 +350,40 @@ inline ClzeroLoopResult try_clzero_loop(const uint8_t* code, std::size_t avail, 
     return ClzeroLoopResult::ok;
 }
 
+// CLWB is rewritten in place at its first #UD, so a loop over a buffer faults once instead of once per cache line.
+// The retail title's GPU upload worker flushes whole buffers that way (exe+0x532f1b0 on 1.0.2.1); under Wine a #UD
+// costs tens of microseconds, which kept that worker busy for minutes per buffer and the boot waiting on it.
+// 66 0F AE /6 (CLWB) becomes 66 0F AE /7 (CLFLUSHOPT): the same operand and length, and it writes the line back too
+// (then evicts it). A host without CLFLUSHOPT gets 66 0F 1F /0, a NOP of the same length that touches no memory.
+// LEONIDA_CLWB_PATCH=0 keeps emulating every execution instead.
+inline bool patch_clwb(uint64_t rip, const uint8_t* code, std::size_t length) {
+    static const int mode = [] {
+        char value[4]{};
+        if (GetEnvironmentVariableA("LEONIDA_CLWB_PATCH", value, sizeof(value)) > 0 && value[0] == '0') return 0;
+        int r[4];
+        __cpuidex(r, 7, 0);
+        return ((r[1] >> 23) & 1) ? 1 : 2;  // EBX bit 23: CLFLUSHOPT
+    }();
+    if (!mode) return false;
+    std::size_t at = 0;
+    while (at + 2 < length && !(code[at] == 0x0F && code[at + 1] == 0xAE)) ++at;
+    if (at + 2 >= length) return false;
+    uint8_t patched[3] = {0x0F, 0xAE, uint8_t(code[at + 2] | 0x08)};  // reg field 6 -> 7
+    if (mode == 2) patched[1] = 0x1F, patched[2] = uint8_t(code[at + 2] & ~0x38);  // reg field 0
+    void* const where = reinterpret_cast<void*>(rip + at);
+    DWORD old = 0;
+    if (!VirtualProtect(where, sizeof patched, PAGE_EXECUTE_READWRITE, &old)) return false;
+    std::memcpy(where, patched, sizeof patched);
+    VirtualProtect(where, sizeof patched, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), where, sizeof patched);
+    static std::atomic<unsigned> sites{0};
+    const unsigned n = ++sites;
+    if (n <= 4 || !(n & (n - 1)))
+        std::fprintf(stderr, "[rt] cpu: CLWB at %p rewritten as %s (%u sites so far)\n", reinterpret_cast<void*>(rip),
+                     mode == 1 ? "CLFLUSHOPT" : "a NOP", n);
+    return true;
+}
+
 inline LONG CALLBACK handler(EXCEPTION_POINTERS* info) {
     if (info->ExceptionRecord->ExceptionCode != STATUS_ILLEGAL_INSTRUCTION) return EXCEPTION_CONTINUE_SEARCH;
     CONTEXT* c = info->ContextRecord;
@@ -358,6 +392,7 @@ inline LONG CALLBACK handler(EXCEPTION_POINTERS* info) {
     std::memcpy(code, reinterpret_cast<const void*>(c->Rip), avail);
     const Decoded d = decode(code, avail);
     if (d.op == Op::none) return EXCEPTION_CONTINUE_SEARCH;
+    if (d.op == Op::clwb && patch_clwb(c->Rip, code, d.length)) return EXCEPTION_CONTINUE_EXECUTION;
     EXCEPTION_RECORD fault;
     if (d.op == Op::clzero && !d.addr32 && d.length == 3) {
         const uint64_t fault_rip = c->Rip;

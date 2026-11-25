@@ -334,6 +334,17 @@ void test_live(const ce::Host& host) {
     uint32_t marker = 0;
     check(run(wb, lines, &marker, &ex) && marker == 1, "clwb ran and execution continued after it");
     std::printf("clwb: %s\n", path(host.clwb));
+    if (!host.clwb) {
+        // Both sites were rewritten at their first #UD: CLFLUSHOPT (reg field 7) or the same-length NOP.
+        const auto rewritten = [&](int at) {
+            return (wb.mem[at] == 0xAE && (wb.mem[at + 1] & 0x38) == 0x38) ||
+                   (wb.mem[at] == 0x1F && (wb.mem[at + 1] & 0x38) == 0);
+        };
+        check(rewritten(4) && rewritten(8), "clwb sites rewritten in place");
+        check(wb.mem[10] == 0x01 && wb.mem[11] == 0x08, "the rewritten clwb keeps its SIB and displacement");
+        marker = 0;
+        check(run(wb, lines, &marker, &ex) && marker == 1, "the rewritten code runs again");
+    }
 
     // A #UD the handler does not know stays an illegal-instruction exception: ud2; ret
     Code ud({0x0F, 0x0B, 0xC3});
