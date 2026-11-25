@@ -3149,9 +3149,9 @@ private:
         if (statistics_segments && can_resolve_occlusion) {
             if (!segment_pool(VK_QUERY_TYPE_PIPELINE_STATISTICS, statistics_segments, statistics))
                 return queue_unsupported(__LINE__);
-            for (const auto& list : prepared)
-                statistics->mesh.insert(statistics->mesh.end(), list.statistics_mesh.begin(),
-                                        list.statistics_mesh.end());
+            for (std::size_t i = 0; i < lists.size(); ++i)
+                statistics->mesh.insert(statistics->mesh.end(), prepared[i].statistics_mesh.begin(),
+                                        prepared[i].statistics_mesh.end());
             if (std::find(statistics->mesh.begin(), statistics->mesh.end(), 1) == statistics->mesh.end()) {
                 statistics->mesh.clear();
             } else {
@@ -3842,6 +3842,10 @@ private:
             if (slot.ticket > done) continue;
             slot.segments.clear();
             slot.geometry.clear();
+            slot.predicate.reset();
+            slot.predicated_copy.reset();
+            slot.counted_dispatch.reset();
+            slot.indirect_clamp.reset();
             recycle_khr_stages(slot.khr_instances);
             recycle_khr_as_queries(slot.khr_as_queries);
             for (VkEvent event : slot.events)
@@ -3899,10 +3903,6 @@ private:
         CommandSlot* reuse = recycle_finished();
         if (reuse) {
             if (context_.vk.vkResetCommandBuffer(reuse->buffer, 0) != VK_SUCCESS) return nullptr;
-            reuse->predicate.reset();
-            reuse->predicated_copy.reset();
-            reuse->counted_dispatch.reset();
-            reuse->indirect_clamp.reset();
             reuse->ticket = UINT64_MAX;  // in use until submitted
             return reuse;
         }

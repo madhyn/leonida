@@ -3895,25 +3895,27 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 if (!found) return unresolved_at(__LINE__);
                 if (pipeline->bindless_set && !vk.bind_descriptor_sets) return unsupported_at(__LINE__);
             }
-            if (ind->kind == IndirectKind::dispatch && vk.require_indirect_clamp) {
-                if (!ind->pipeline || !vk.dispatch_indirect || !vk.prepare_indirect_clamp || !vk.emit_indirect_clamp ||
-                    (statistics_active && !statistics_helpers) ||
-                    !vk.prepare_indirect_clamp(p.binding.buffer, p.binding.buffer_offset + ind->argument_offset,
-                        p.source.buffer, p.source.buffer_offset + ind->count_offset, indirect_clamp_dispatch,
-                        ind->stride, ind->max_count, p.indirect_clamp))
-                    return unsupported_at(__LINE__);
-                p.indirect_clamp.share_list_budget(indirect_list_budget);
-            } else if (ind->kind == IndirectKind::dispatch && (ind->count_buffer || indirect_group_budget())) {
-                // Vulkan lacks vkCmdDispatchIndirectCount. Copy the GPU-visible commands to private scratch
-                // and replace commands past min(count, max_count) with zero-group dispatches.
-                if (!ind->pipeline || !vk.dispatch_indirect || !vk.prepare_counted_dispatch ||
-                    !vk.emit_counted_dispatch || (statistics_active && !statistics_helpers) ||
-                    !vk.prepare_counted_dispatch(p.binding.buffer, p.binding.buffer_offset + ind->argument_offset,
-                                                 p.source.buffer, p.source.buffer_offset + ind->count_offset,
-                                                 ind->stride, ind->max_count, p.counted_dispatch))
-                    return unsupported_at(__LINE__);
-            } else if (ind->kind == IndirectKind::dispatch && !vk.dispatch_indirect) {
-                return unsupported_at(__LINE__);
+            if (ind->kind == IndirectKind::dispatch) {
+                if (!vk.dispatch_indirect) return unsupported_at(__LINE__);
+                if (!ind->max_count) continue;
+                if (vk.require_indirect_clamp) {
+                    if (!ind->pipeline || !vk.prepare_indirect_clamp || !vk.emit_indirect_clamp ||
+                        (statistics_active && !statistics_helpers) ||
+                        !vk.prepare_indirect_clamp(p.binding.buffer, p.binding.buffer_offset + ind->argument_offset,
+                            p.source.buffer, p.source.buffer_offset + ind->count_offset, indirect_clamp_dispatch,
+                            ind->stride, ind->max_count, p.indirect_clamp))
+                        return unsupported_at(__LINE__);
+                    p.indirect_clamp.share_list_budget(indirect_list_budget);
+                } else if (ind->count_buffer || indirect_group_budget()) {
+                    // Vulkan lacks vkCmdDispatchIndirectCount. Copy the GPU-visible commands to private scratch
+                    // and replace commands past min(count, max_count) with zero-group dispatches.
+                    if (!ind->pipeline || !vk.prepare_counted_dispatch ||
+                        !vk.emit_counted_dispatch || (statistics_active && !statistics_helpers) ||
+                        !vk.prepare_counted_dispatch(p.binding.buffer, p.binding.buffer_offset + ind->argument_offset,
+                                                     p.source.buffer, p.source.buffer_offset + ind->count_offset,
+                                                     ind->stride, ind->max_count, p.counted_dispatch))
+                        return unsupported_at(__LINE__);
+                }
             }
             // Legacy graphics IR carries no graphics state. Validate its resource ranges above,
             // but never emit it; stateful graphics indirects use Draw and its rendering scope.
@@ -4990,6 +4992,7 @@ inline void emit_commands(const PreparedList& prepared, VkCommandBuffer command_
                 indirect_stats::skip(indirect_stats::Event::replay_skip, indirect_stats::stateless);
                 continue;
             }
+            if (!ind->max_count) continue;
             if (ind->pipeline && !p.pipeline.pipeline && (p.pipeline.async_build || p.pipeline.skipped)) continue;
             if constexpr (Checkpoints)
                 checkpoints->dispatch(command_buffer, i, p.pipeline.pipeline, ind->pipeline, ind->user_data, {}, true,

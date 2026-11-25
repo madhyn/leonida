@@ -4338,6 +4338,13 @@ if(TARGET Vulkan::Headers)
       target_compile_definitions(replay_query_edges_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     endif()
     add_test(NAME replay_query_edges COMMAND replay_query_edges_test)
+    # VulkanQueue::recycle_finished() batch release, prepared_ statistics->mesh bounds, and zero-count indirect dispatch (no GPU).
+    add_executable(queue_recycle_and_stats_test test/queue_recycle_and_stats_test.cpp)
+    target_link_libraries(queue_recycle_and_stats_test PRIVATE Vulkan::Headers)
+    if(WIN32)
+      target_compile_definitions(queue_recycle_and_stats_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    endif()
+    add_test(NAME queue_recycle_and_stats COMMAND queue_recycle_and_stats_test)
     # GFX10 T#/S#/V# descriptor encoding and its Vulkan mappings (src/gfx10_descriptors.h).
     add_executable(gfx10_descriptors_test test/gfx10_descriptors_test.cpp)
     target_link_libraries(gfx10_descriptors_test PRIVATE Vulkan::Headers)
