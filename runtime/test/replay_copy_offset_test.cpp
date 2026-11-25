@@ -161,8 +161,22 @@ int main(int argc, char** argv) {
     ResourceBinding d32_img2 = d32_img;
     d32_img2.image = handle<VkImage>(8);
 
+    ResourceBinding d24s8_img = d32s8_img;  // D24_UNORM_S8_UINT, which the console's D16S8 is made as on NVIDIA
+    d24s8_img.image = handle<VkImage>(9);
+    d24s8_img.format = VK_FORMAT_D24_UNORM_S8_UINT;
+    ResourceBinding d16_img = d32_img;
+    d16_img.image = handle<VkImage>(10);
+    d16_img.format = VK_FORMAT_D16_UNORM;
+    ResourceBinding d32s8_ms = d32s8_img, d32_ms = d32_img;
+    d32s8_ms.image = handle<VkImage>(11);
+    d32_ms.image = handle<VkImage>(12);
+    d32s8_ms.samples = d32_ms.samples = 4;
     const auto resolve = [&](ResourceId id) -> const ResourceBinding* {
         switch (id) {
+        case 9: return &d24s8_img;
+        case 10: return &d16_img;
+        case 11: return &d32s8_ms;
+        case 12: return &d32_ms;
         case 1: return &src_buf;
         case 2: return &dst_buf;
         case 3: return &rgba_img;
@@ -547,6 +561,31 @@ int main(int argc, char** argv) {
         };
         staged_depth(7, 6, "D32_SFLOAT_S8_UINT depth plane into D32_SFLOAT");
         staged_depth(6, 7, "D32_SFLOAT into the depth plane of D32_SFLOAT_S8_UINT");
+
+        // Depth planes of different encodings, and a multisampled pair: no Vulkan copy makes them, so nothing is
+        // recorded for that one command and the list still replays.
+        const std::pair<ResourceId, ResourceId> left_out[] = {{10, 9}, {7, 9}, {10, 6}, {9, 7}, {12, 11}};
+        for (const auto& [dst, src] : left_out) {
+            const CopyLocation to{dst, false, 0, 0, 0, 0, 0, 0}, from{src, false, 0, 0, 0, 0, 0, 0};
+            CommandList list;
+            expect(list.copy_texture({to, 0, 0, 0, from, false, {}}) && list.close(), "record a depth conversion");
+            expect(run(list) == ReplayResult::success, "a depth copy that is left out does not fail the list");
+            expect(image_copies.empty() && i2b_copies.empty() && b2i_copies.empty(),
+                   "a depth copy between different encodings (or multisampled formats) records no copy");
+        }
+        // The stencil plane (subresource 1 of these single-mip images) is 8 bits in both formats.
+        {
+            const CopyLocation to{6, false, 1, 0, 0, 0, 0, 0}, from{9, false, 1, 0, 0, 0, 0, 0};
+            CommandList list;
+            expect(list.copy_texture({to, 0, 0, 0, from, false, {}}) && list.close(), "record a stencil plane copy");
+            expect(run(list) == ReplayResult::success, "D24S8 stencil into D32S8 stencil replays");
+            expect(image_copies.empty() && i2b_copies.size() == 1 && b2i_copies.size() == 1 &&
+                       i2b_copies[0].imageSubresource.aspectMask == VK_IMAGE_ASPECT_STENCIL_BIT &&
+                       b2i_copies[0].imageSubresource.aspectMask == VK_IMAGE_ASPECT_STENCIL_BIT,
+                   "a stencil plane copy between different formats is staged, stencil aspect on both sides");
+            expect(scratch_bytes >= VkDeviceSize(64) * 32 && scratch_bytes < VkDeviceSize(64) * 32 * 2,
+                   "the stencil scratch holds one byte a texel");
+        }
 
         const CopyLocation to{8, false, 0, 0, 0, 0, 0, 0}, from{7, false, 0, 0, 0, 0, 0, 0};
         CommandList same;

@@ -494,6 +494,10 @@ What is implemented (all of it testable without the game):
     depth/stencil formats to match exactly (`VUID-vkCmdCopyImage-srcImage-01548`), and an NVIDIA driver (RTX 4070
     Laptop, 621.40) handed the `D32_SFLOAT_S8_UINT` → `D32_SFLOAT` pair wrote past the end of the `D32_SFLOAT`
     image: the world-start `WRITE_INVALID` device loss, with the fault at the first byte after the image.
+  - The stencil plane between two depth-stencil formats (8 bits in each) is staged the same way. A depth plane whose
+    encodings differ (`D24_UNORM_S8_UINT` into `D16_UNORM` or `D32_SFLOAT`), or a multisampled pair, has no Vulkan copy:
+    that one copy is left out with a log line and the list replays (`depth_stencil_copy`). The layer can meet one,
+    since the console's D16S8 is made as D24S8 on NVIDIA; no title has been seen asking for it.
   - reserved resources and `GetResourceTiling` (section 4.2);
   - query heaps for occlusion, timestamps and pipeline statistics, and `GetTimestampFrequency` on the queue
     (section 4.6);
