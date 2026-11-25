@@ -276,11 +276,54 @@ title calls device slot 57 (`+0x1c8`) with `IID_ID3D12PipelineState` (`{765a30f3
   - `state blob`: `+0x000` version tag (`0x4005d800` in 15,632 records, `0x4005d808` in 9,159, `0x4005d810` in 6),
     `+0x004` family (`4` in 12,735 or `6` in 12,062), `+0x02c = 2`, `+0x07c` (`0xcc0010` / `0` / `0xcc0011`),
     `+0x0f4 = 5`, `+0x0f8 = 1`, `+0x0fc = 0x33333333` (`0.1f`), `+0x100..+0x11c` (`0x00060006` x8), `+0x150 = 0x40`,
-    `+0x158 = 0xffffffff`, `+0x17c = 0x10000a00`. Unidentified offsets are logged once per offset while safe default
-    raster/depth/blend state is used.
+    `+0x158 = 0xffffffff`, `+0x17c = 0x10000a00`. The colour-target registers are decoded (next paragraph); raster
+    and depth state are not, and keep the factory's defaults.
   - `stage blob`: `+0x00 = 2` (graphics stage blob), `+0x04` payload size (`196` in 208 B blobs), `+0x08 = 0x66`,
     `+0x0c = 0x40 | flags`, followed by records `0x41` (32 B input/output signature), `0x42` (32 B output signature)
     and `0x43` (20 B: tag + 16 B opaque digest).
+
+**State blob A: the colour-target registers (RT-SLOT57-BLEND-STATE).** Blob A is the console driver's serialized
+pipeline state, and its shared block holds context register values in the RDNA2 layout (Mesa's gfx10 register
+headers). Measured on 1.0.2.1 over all 5,680 distinct blobs, which the 25,471 graphics records reference:
+
+- **Shape:** 380 + 8k bytes (k = 0..5) for vertex-shader pipelines, and 464 + 8k (k = 0..7) for mesh pipelines. The
+  mesh pipelines' stage block is 84 bytes longer, so every offset after `+0x28` moves by 84 there; the offsets below
+  are the vertex ones. Word 0 is `0x4005d800` with bits 3 and 4 free in all 25,471 records.
+- **`+0x78` `CB_TARGET_MASK`:** four component bits (R, G, B, A, as in `D3D12_COLOR_WRITE_ENABLE`) per target:
+  `0xf` in 16,650 records, `0xff` in 2,805, `0xffffff` in 2,561. In 17,626 records the targets it enables are exactly
+  `0..rt_count-1` of blob B. In 1,937 it also enables target 1 of a one-target pipeline: those are the dual-source
+  pipelines below. The others leave a target with a format unwritten.
+- **`+0x7c` `CB_COLOR_CONTROL`:** ROP3 `0xcc` (copy) in every record, so no logic op.
+- **`+0xd0..+0xec` `CB_BLEND0..7_CONTROL`:** one word per target. There are 34 distinct values, every one an
+  in-range RDNA2 blend: factors 0 to 20 with neither `BOTH_*` value, `COMB_FCN` 0 to 4, `SEPARATE_ALPHA_BLEND` set
+  wherever `ENABLE` is, and `DISABLE_ROP3` set in all. By target 0: `0x80000000` (blending off) in 15,373 records,
+  `0xe5010504` (colour `SRC_ALPHA`/`INV_SRC_ALPHA`, alpha `ONE`/`INV_SRC_ALPHA`) in 3,456, `0xf1010f01` (colour
+  `ONE`/`SRC1_COLOR`, alpha `ONE`/`SRC1_ALPHA`) in 1,931, and `0xe5040504` in 1,387. 10,135 records blend on at least
+  one of their targets.
+- **`+0x100..+0x11c`:** eight more per-target words that follow `CB_BLENDn` (`0x06000600` where blending is off).
+  They fit `SX_MRTn_BLEND_OPT`, whose `COMB_FCN` 6 is "blend disabled". They aren't read.
+
+`runtime/src/native_pso.h` (`decode_state_a_blend`, `d3d12_blend`) maps each target's `CB_BLENDn_CONTROL` and
+`CB_TARGET_MASK` nibble to a `D3D12_RENDER_TARGET_BLEND_DESC`, and `fill_blend_state` in
+`runtime/shims/d3d12_xs_native_pso.h` uses it for every native PSO:
+
+- **Before:** every target had blending off and wrote every component, so the first-run pages after #939 drew glyph
+  quads solid, artwork hard-edged and composited backgrounds black.
+- **With the decoded state:** the pages, the legal screens and the loading slideshow draw as on console (RTX 4070
+  Laptop).
+- **Integer targets:** a target with a `UINT` or `SINT` format never blends, as the colour block bypasses blending
+  there and D3D12 refuses a PSO that asks for it. One library pipeline enables `MAX` on an `R8_UINT` target beside
+  two others.
+- **Stand-in targets:** where `B4G4R4A4_UNORM` is not renderable, the Vulkan layer draws it into an RGBA8 stand-in
+  and refuses blending there (`E_NOTIMPL`, the output is quantized before it). The factory then retries the pipeline
+  with blending off on those targets only (`shims/d3d12_xs_native_pso_fallback.h`), instead of leaving it to the PC
+  description path. On an RTX 4070 Laptop that is the same library pipeline (the first one the title creates). Only a
+  pipeline that blends a `B4G4R4A4` target is retried: `E_NOTIMPL` also stands for refusals unrelated to blending (a
+  rect list without its geometry stage, mesh limits, `FullyCovered`, a dual-source output that does not fit
+  `Location 0, Index 1`), and those keep the blend the title asked for.
+- **Kept on the defaults:** the 1,937 records that blend with the dual-source `SRC1` factors, because the translator
+  declares no second pixel-shader output. A blob of another shape, or a target with a factor this path does not
+  take, keeps the whole pipeline on the defaults and is logged.
 
 ## Translation status
 

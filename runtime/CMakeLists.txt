@@ -690,7 +690,8 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   endif()
   if(NOT (LEONIDA_SDL3 AND TARGET SDL3::SDL3-static))
     # Nothing served gameinput.dll in a build without SDL3, so the loader fell through to the host's gameinput.dll and
-    # that one answers GameInputCreate with a null interface the title dereferences. Keep the object identity honest.
+    # that one answers GameInputCreate with a null interface the title dereferences. Keep the object identity honest,
+    # and with LEONIDA_INPUT_SCRIPT serve one pad driven by the script (shims/gameinput_script.h, shared with SDL3's).
     target_sources(gta6rt PRIVATE shims/gameinput_no_sdl.cpp)
     add_executable(gameinput_no_sdl_test
       test/gameinput_no_sdl_test.cpp
@@ -1399,6 +1400,13 @@ if(BUILD_TESTING)
   add_test(NAME queue_holds COMMAND queue_holds_test)
   add_executable(shader_library_test test/shader_library_test.cpp)
   add_test(NAME shader_library COMMAND shader_library_test)
+  add_executable(native_pso_blend_test test/native_pso_blend_test.cpp)
+  add_test(NAME native_pso_blend COMMAND native_pso_blend_test)
+  if(WIN32)
+    # The slot 57 factory retries only a pipeline that blends a B4G4R4A4 stand-in target (d3d12.h types).
+    add_executable(native_pso_fallback_test test/native_pso_fallback_test.cpp)
+    add_test(NAME native_pso_fallback COMMAND native_pso_fallback_test)
+  endif()
   add_executable(spirv_f16_halves_test test/spirv_f16_halves_test.cpp)
   add_test(NAME spirv_f16_halves COMMAND spirv_f16_halves_test)
   # Optional: skips unless LEONIDA_SHADERS names a translated work folder (<work>/shaders/spirv).
@@ -1667,6 +1675,8 @@ if(BUILD_TESTING)
   add_test(NAME active_input COMMAND active_input_test)
   if(WIN32 AND TARGET gameinput_no_sdl_test)
     add_test(NAME gameinput_no_sdl COMMAND gameinput_no_sdl_test)
+    # LEONIDA_INPUT_SCRIPT without SDL3: the scripted pad, its device callbacks and its readings on a fake clock.
+    add_test(NAME gameinput_no_sdl_script COMMAND gameinput_no_sdl_test --input-script)
   endif()
   if(WIN32 AND TARGET gameinput_test)
     add_test(NAME gameinput COMMAND gameinput_test)

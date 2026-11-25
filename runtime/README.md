@@ -288,7 +288,9 @@ Current limits, by design:
   lightbar. Optional and CMake-only: built when an installed SDL3 is found,
   or with `-DLEONIDA_SDL3_FETCH=ON` to download the pinned release; nothing is downloaded otherwise, and the
   `scripts/build_runtime.ps1` cl.exe fallback never builds it. See [docs/gameinput.md](../docs/gameinput.md) for the mapping, the `LEONIDA_DS_*` settings and what is
-  unverified.
+  unverified. A build without SDL3 links `shims/gameinput_no_sdl.cpp` instead: no devices, or with
+  `LEONIDA_INPUT_SCRIPT` set one scripted pad driven by the script alone, so a headless or CI build can get past the
+  title's first prompt ([docs/gameinput.md](../docs/gameinput.md#scripted-input-without-sdl3)).
 
 ### What `xgameruntime.dll` reports: environment overrides
 
@@ -340,6 +342,7 @@ ones marked *diagnostic* only add log lines or exist to compare a run with and w
 | `LEONIDA_VOLUME_MIPS` | on | The XG layout of a 3D texture with mips or a block format is computed (`shims/xg_xs_layout.h`). `0` refuses it. |
 | `LEONIDA_TITLE_WATCHDOG` | unset (armed) | The title's own hang watchdog stays armed by default, as on the console: if the game's main loop does not report for 30 seconds, the title ends itself. `0` makes `gta6rt --run` keep it from firing while the game thread waits for the driver, for example on the first boot after a driver update (`src/main.cpp`), and only in the build the watchdog was measured in. |
 | `LEONIDA_PEEK_SECONDS` | `10` | *Diagnostic.* The period of the `LEONIDA_PEEK` thread (`src/main.cpp`), which prints 8-byte values of the title's image. |
+| `LEONIDA_INPUT_SCRIPT` | unset | Timed pad presses, `button@seconds` separated by commas (`a@70,a@85,start@120`), each held 300 ms; the clock starts with the shim. Works with and without SDL3: with SDL3 it drives the keyboard pad (`LEONIDA_KEYBOARD_PAD=always`), without SDL3 one scripted pad that is the only device. Controllers and the keyboard pad still need SDL3. Format and buttons in [docs/gameinput.md](../docs/gameinput.md#environment-variables). |
 | `LEONIDA_INPUT_LOG` | on | The GameInput shim logs every press in `LEONIDA_INPUT_SCRIPT`'s form (`name@seconds`), so a session played by hand can be replayed. `0` turns the lines off. |
 | `LEONIDA_LOG_ALLOCINFO` | unset | *Diagnostic.* `1` logs every device slot 25 call (`GetResourceAllocationInfo`) with its thread, description and sizes (`shims/d3d12_xs_device.cpp`). |
 | `LEONIDA_LOG_EXE_PIPELINES` | unset | *Diagnostic.* When set, one line per distinct graphics pipeline that uses a program translated from the executable's inline containers. |
@@ -454,6 +457,9 @@ SDK, or `-DLEONIDA_VULKAN_HEADERS_FETCH=ON` to download the pinned Khronos Vulka
 
 `gameinput_test` (only with SDL3; otherwise CTest lists `gameinput` as not run) drives the GameInput shim on SDL virtual joysticks (no controller needed): enumeration, readings
 and the button/axis mapping, rumble and trigger rumble, DualSense effect bytes, a dispatcher, and hot-plug.
+`gameinput_no_sdl_test` (only without SDL3) checks the shim a build without SDL3 links: `gameinput_no_sdl` the
+identity-only object, `gameinput_no_sdl_script` the scripted pad of `LEONIDA_INPUT_SCRIPT` on a fake clock (device
+callbacks, readings at chosen times, the reading history).
 `gameinput_probe [--seconds N] [--rumble] [--force-feedback]` is the manual check on a real pad: it prints live
 readings, plays each motor and trigger, and holds a constant force on a pad that reports a force-feedback motor.
 

@@ -13,11 +13,14 @@
 // The state and stage resolution are in native_pso.h. All stage bytecode handed to D3D12
 // comes from the user's carved DXBC containers and is translated by the normal Vulkan PSO path.
 #include "../src/native_pso.h"
+#include "d3d12_xs_native_pso_fallback.h"
 #include "d3d12_xs_pso_stream.h"
 #include "../src/shader_library.h"
 
 #include <d3d12.h>
+#include <atomic>
 #include <climits>
+#include <cstring>
 #include <cstdio>
 #include <exception>
 #include <filesystem>
@@ -30,8 +33,51 @@ namespace rt::d3d12_xs {
 namespace native_pipeline_detail {
 namespace np = leonida::native_pso;
 
+// The blend state of blob A's colour-target registers (RT-SLOT57-BLEND-STATE). Without it, or for a target this path
+// cannot express (np::d3d12_blend), every target keeps blending off and writes every component, as before.
+// Blending off and every component written on every target: the factory's state before blob A was read.
+inline void default_blend_state(D3D12_BLEND_DESC& out) {
+    for (auto& rt : out.RenderTarget) {
+        rt = {};
+        rt.SrcBlend = rt.SrcBlendAlpha = D3D12_BLEND_ONE;
+        rt.DestBlend = rt.DestBlendAlpha = D3D12_BLEND_ZERO;
+        rt.BlendOp = rt.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+        rt.LogicOp = D3D12_LOGIC_OP_NOOP;
+        rt.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    }
+    out.AlphaToCoverageEnable = FALSE;
+    out.IndependentBlendEnable = FALSE;
+}
+
+inline void fill_blend_state(const np::FixedState& s, D3D12_BLEND_DESC& out) {
+    default_blend_state(out);
+    const auto targets = s.blend ? np::d3d12_blend(*s.blend, s.rt_count, s.rtv_formats) : std::nullopt;
+    if (!targets) {
+        static std::atomic<int> logged{0};
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 4)
+            std::fprintf(stderr, "[rt] d3d12_xs: slot 57: %s, so this pipeline keeps blending off (CB_BLEND0 %08x)\n",
+                         s.blend ? "a target's blend state is not one this path builds (dual-source or unknown factor)"
+                                 : "blob A is absent or not the measured shape",
+                         s.blend ? static_cast<unsigned>(s.blend->blend[0]) : 0u);
+        return;
+    }
+    for (unsigned i = 0; i < s.rt_count; ++i) {
+        const np::TargetBlend& t = (*targets)[i];
+        D3D12_RENDER_TARGET_BLEND_DESC& rt = out.RenderTarget[i];
+        rt.BlendEnable = t.enable;
+        rt.SrcBlend = static_cast<D3D12_BLEND>(t.src);
+        rt.DestBlend = static_cast<D3D12_BLEND>(t.dst);
+        rt.BlendOp = static_cast<D3D12_BLEND_OP>(t.op);
+        rt.SrcBlendAlpha = static_cast<D3D12_BLEND>(t.src_alpha);
+        rt.DestBlendAlpha = static_cast<D3D12_BLEND>(t.dst_alpha);
+        rt.BlendOpAlpha = static_cast<D3D12_BLEND_OP>(t.op_alpha);
+        rt.RenderTargetWriteMask = t.write_mask;
+        if (i && std::memcmp(&rt, &out.RenderTarget[0], sizeof(rt)) != 0) out.IndependentBlendEnable = TRUE;
+    }
+}
+
 inline void fill_fixed_state(const np::FixedState& s, D3D12_GRAPHICS_PIPELINE_STATE_DESC& pc) {
-    for (auto& rt : pc.BlendState.RenderTarget) rt.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    fill_blend_state(s, pc.BlendState);
     pc.SampleMask = s.sample_mask ? s.sample_mask : UINT_MAX;
     pc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
     pc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
@@ -184,7 +230,25 @@ public:
                 else if (stage.shader->stage == "gs") pc.GS = view;
                 else mesh = view;  // plan() admits only VS/PS/GS or MS/PS.
             }
-            return create_pipeline(pc, mesh, code);
+            HRESULT hr = create_pipeline(pc, mesh, code);
+            // The decoded blend state can ask for something this device's layer does not do: blending a B4G4R4A4 target
+            // that is an RGBA8 stand-in (without_stand_in_blend). Only a pipeline that blends such a target is retried.
+            // E_NOTIMPL also stands for refusals that have nothing to do with blending (stream_unsupported: a rect list
+            // without its geometry stage, mesh limits, FullyCovered; a dual-source output that does not fit Location 0
+            // Index 1): those are returned as they are, never with a blend the title did not ask for.
+            if (hr == E_NOTIMPL && plan.state.blend) {
+                D3D12_GRAPHICS_PIPELINE_STATE_DESC retry = pc;
+                const HRESULT again = without_stand_in_blend(retry) ? create_pipeline(retry, mesh, code) : hr;
+                if (SUCCEEDED(again)) {
+                    hr = again;
+                    static std::atomic<int> logged{0};
+                    if (logged.fetch_add(1, std::memory_order_relaxed) < 4)
+                        std::fprintf(stderr, "[rt] d3d12_xs: slot 57: the device refused blending on this pipeline's "
+                                             "B4G4R4A4 stand-in targets, so it was built with blending off on those "
+                                             "targets\n");
+                }
+            }
+            return hr;
         } catch (const std::bad_alloc&) {
             return E_OUTOFMEMORY;
         } catch (const std::exception&) {
