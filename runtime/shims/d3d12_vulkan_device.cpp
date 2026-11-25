@@ -5787,13 +5787,13 @@ public:
         // Apply the same backing size rule to imports. The committed-range check and Vulkan bind requirements
         // below cover the padding as well. The import never initializes or writes the caller's padding.
         const VkDeviceSize backing_size = need_bda ? align_up(desc_.Width, sizeof(std::uint32_t)) : desc_.Width;
-        // The import starts at the page that holds `address`, and the buffer is bound at the offset inside it: the
-        // title places small buffers inside a page too (a 16-byte UAV at a 64-byte-aligned address on an RTX 5090,
-        // found in review), which an import of `address` itself would refuse.
+        // The import starts at the page that holds `address`, and so does the Vulkan buffer, with the D3D12 buffer at
+        // the offset inside it: the title places small buffers inside a page too (a 16-byte UAV at a 64-byte-aligned
+        // address on an RTX 5090, found in review), which an import of `address` itself would refuse.
         const std::uintptr_t base = start & ~static_cast<std::uintptr_t>(alignment - 1);
         void* const base_address = reinterpret_cast<void*>(base);
         const VkDeviceSize offset = start - base;
-        const VkDeviceSize bytes = align_up(offset + backing_size, alignment);
+        VkDeviceSize bytes = align_up(offset + backing_size, alignment);  // grows to the buffer's memory size below
         // An imported buffer's VA is its host address, and it joins the same BufferVaIndex as default-heap buffers,
         // whose VAs are offsets in [0, arena size). A host range that reaches into that window (low host addresses,
         // as under Wine) would shadow arena buffers in the index's nearest-start lookup, so it takes the fallback
@@ -5833,7 +5833,11 @@ public:
         VkExternalMemoryBufferCreateInfo external{VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO};
         external.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
         VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, &external};
-        info.size = backing_size;
+        // The Vulkan buffer starts at the page that holds `address` and the D3D12 buffer is `offset` bytes into it
+        // (ResourceBinding::buffer_offset), so the imported memory binds at 0 whatever the title's alignment: the
+        // retail title places small buffers 32 bytes apart (one at +0xc60 of a page), which a bind at `offset`
+        // refuses (an RTX 5080 asks 64).
+        info.size = offset + backing_size;
         info.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
                      VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
                      VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
@@ -5867,9 +5871,20 @@ public:
                                                 &host) != VK_SUCCESS)
             return decline(E_NOTIMPL);
         const std::uint32_t types = host.memoryTypeBits & requirements.memoryTypeBits;
-        // An offset off the buffer's own alignment cannot be bound: the fallback answers.
-        if (!types || (offset % requirements.alignment) || requirements.size > bytes - offset)
-            return decline(E_NOTIMPL);
+        // The buffer's memory can be larger than its pages hold (64 bytes for a 32-byte buffer at +0xfe0 of a page,
+        // measured on the retail boot): the import then takes the next pages too, when they are committed and
+        // writable as above, and the fallback answers when they are not.
+        const VkDeviceSize needed = align_up((std::max)(VkDeviceSize(info.size), requirements.size), alignment);
+        for (VkDeviceSize at = bytes; at < needed;) {
+            MEMORY_BASIC_INFORMATION region{};
+            if (!VirtualQuery(static_cast<const char*>(base_address) + at, &region, sizeof(region)) ||
+                region.State != MEM_COMMIT || (region.Protect & (PAGE_WRITECOMBINE | PAGE_NOCACHE | PAGE_GUARD)) ||
+                !(region.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE)))
+                return decline(E_NOTIMPL);
+            at = reinterpret_cast<std::uintptr_t>(region.BaseAddress) + region.RegionSize - base;
+        }
+        bytes = (std::max)(bytes, needed);
+        if (!types || requirements.size > bytes) return decline(E_NOTIMPL);
         VkImportMemoryHostPointerInfoEXT import{VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT};
         import.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
         import.pHostPointer = base_address;
@@ -5901,12 +5916,12 @@ public:
             if (memory_) break;
         }
         if (!memory_) return decline(E_OUTOFMEMORY);
-        if (vk.vkBindBufferMemory(device_.info.device, buffer_, memory_, offset) != VK_SUCCESS)
+        if (vk.vkBindBufferMemory(device_.info.device, buffer_, memory_, 0) != VK_SUCCESS)
             return decline(E_OUTOFMEMORY);
         if (need_bda && vk.vkGetBufferDeviceAddress) {
             VkBufferDeviceAddressInfo bda{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
             bda.buffer = buffer_;
-            buffer_va_ = vk.vkGetBufferDeviceAddress(device_.info.device, &bda);
+            buffer_va_ = vk.vkGetBufferDeviceAddress(device_.info.device, &bda) + offset;  // `address` itself
             gpu_va_ = buffer_va_;
         }
         // An import the driver put below the arena cannot be named by a V#: the V# keeps 48 bits of (device address
@@ -5944,6 +5959,7 @@ public:
         }
         leonida::ResourceBinding binding{};
         binding.buffer = buffer_;
+        binding.buffer_offset = offset;
         binding.indirect_arguments = (info.usage & VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT) != 0;
         binding.size = desc_.Width;
         binding.host = static_cast<const std::uint8_t*>(address);

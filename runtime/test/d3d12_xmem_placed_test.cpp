@@ -415,9 +415,26 @@ int run(ID3D12Device* real, void* device, bool eager) {
         for (UINT64 i = 0; i < size; ++i) window[i] = static_cast<std::uint8_t>(i * 131u + 7u);
         if (gpu_reads_cpu_writes(real, buffer.p, window, size)) return 1;
     }
-    rt::d3d12_xs::set_placed_at_va_pages_hook(nullptr);
     std::printf("%s: with commit_physical_range: %llu bytes committed, GPU VA is the window, a GPU copy reads the "
                 "CPU's writes\n", who, static_cast<unsigned long long>(size));
+
+    // A small buffer at a 32-byte-aligned address inside a page, as the retail title places one (+0xc60): the Vulkan
+    // buffer starts at the page and its memory binds there (a bind at the offset is refused off the buffer's
+    // alignment, 64 on an RTX 5080), so it is an import, not a shadow, and the GPU reads the CPU's writes.
+    {
+        auto piece = desc;
+        piece.Width = 0x40;
+        std::uint8_t* const at = window + 0xc60;
+        const std::uint64_t imports = rt::d3d12::title_host_imports(real);
+        Ref<ID3D12Resource> buffer;
+        EXPECT(place(device, at, piece, &buffer.p) == S_OK && buffer.p);
+        EXPECT(rt::d3d12::title_host_imports(real) == imports + 1);
+        EXPECT(buffer->GetGPUVirtualAddress() == reinterpret_cast<D3D12_GPU_VIRTUAL_ADDRESS>(at));
+        for (UINT64 i = 0; i < piece.Width; ++i) at[i] = static_cast<std::uint8_t>(i * 29u + 3u);
+        if (gpu_reads_cpu_writes(real, buffer.p, at, piece.Width)) return 1;
+    }
+    rt::d3d12_xs::set_placed_at_va_pages_hook(nullptr);
+    std::printf("%s: a 64-byte buffer at +0xc60 of a page is imported and the GPU reads the CPU's writes\n", who);
 
     EXPECT(map(window, kPages, nullptr) == window);
     EXPECT(free_pages(count, pages) == TRUE);

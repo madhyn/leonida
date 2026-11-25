@@ -296,8 +296,8 @@ int check_title_placed(ID3D12Device* device, const char* kind, void* pages, UINT
     EXPECT(FAILED(rt::d3d12::create_buffer_at_host_address(device, pages, too_many_mips, 0x6u,
                                                            IID_PPV_ARGS(&refused_texture.p))) &&
            refused_texture.p == nullptr);
-    // An address off the buffer alignment can't be bound inside the import: a shadow buffer answers, at the same VA
-    // (a driver whose buffer alignment is 1 imports it; the VA is the address either way).
+    // An address off the buffer alignment is imported from its page (the Vulkan buffer starts at the page and the
+    // D3D12 buffer is an offset into it); a driver that refuses the import gets the shadow buffer, at the same VA.
     Ref<ID3D12Resource> fallback;
     desc.Width = size - 1;
     EXPECT_HR(rt::d3d12::create_buffer_at_host_address(device, bytes + 1, desc, 0xFFFFFFFFu, IID_PPV_ARGS(&fallback.p)), S_OK);
