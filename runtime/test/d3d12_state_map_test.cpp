@@ -517,24 +517,27 @@ static int state_map_tests() {
     CHECK(separate.layout(1, 1) == VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);  // depth, mip 1
     CHECK(separate.layout(1, 4) == VK_IMAGE_LAYOUT_UNDEFINED);                         // no plane 2
     std::vector<LayoutPiece> pieces;
-    CHECK(separate.pieces(1, {depth_stencil.aspects, 0, 2, 0, 1}, pieces) && pieces.size() == 4);
+    CHECK(separate.pieces(1, {depth_stencil.aspects, 0, 2, 0, 1}, pieces) && pieces.size() == 3);
+    CHECK(pieces[0].range.aspectMask == VK_IMAGE_ASPECT_DEPTH_BIT && pieces[0].range.levelCount == 2);
     CHECK(separate.pieces(1, {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 2, 0, 1}, pieces) && pieces.size() == 1);
     CHECK(pieces[0].layout == VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL && pieces[0].range.levelCount == 2);
-    // LayoutPieces (what replay uses): the same pieces, inline for one or two, spilling to the heap for four, and
+    // LayoutPieces (what replay uses): the same pieces, inline for one or two, spilling to the heap for three, and
     // reused after clear() from either state.
     {
-        std::vector<LayoutPiece> four;
+        std::vector<LayoutPiece> mixed;
         LayoutPieces inline_pieces;
-        CHECK(separate.pieces(1, {depth_stencil.aspects, 0, 2, 0, 1}, four) && four.size() == 4);
-        CHECK(separate.pieces(1, {depth_stencil.aspects, 0, 2, 0, 1}, inline_pieces) && inline_pieces.size() == 4);
+        CHECK(separate.pieces(1, {depth_stencil.aspects, 0, 2, 0, 1}, mixed) && mixed.size() == 3);
+        CHECK(separate.pieces(1, {depth_stencil.aspects, 0, 2, 0, 1}, inline_pieces) && inline_pieces.size() == 3);
         bool same = true;
         std::size_t index = 0;
         for (const LayoutPiece& piece : inline_pieces) {
-            same = same && piece.layout == four[index].layout && piece.range.aspectMask == four[index].range.aspectMask &&
-                   piece.range.baseMipLevel == four[index].range.baseMipLevel;
+            same = same && piece.layout == mixed[index].layout &&
+                   piece.range.aspectMask == mixed[index].range.aspectMask &&
+                   piece.range.baseMipLevel == mixed[index].range.baseMipLevel &&
+                   piece.range.levelCount == mixed[index].range.levelCount;
             ++index;
         }
-        CHECK(same && index == 4);
+        CHECK(same && index == 3);
         CHECK(separate.pieces(1, {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 2, 0, 1}, inline_pieces) && inline_pieces.size() == 1);
         CHECK(inline_pieces[0].range.levelCount == 2 && inline_pieces.end() - inline_pieces.begin() == 1);
         inline_pieces.clear();
@@ -549,6 +552,26 @@ static int state_map_tests() {
     CHECK(!merged.pieces(2, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}, pieces));  // untracked
     merged.forget(1);
     CHECK(!merged.tracked(1));
+
+    // A mixed range merges the initialized rectangle across mips and layers, while all first-use
+    // cells keep individual pieces even when they are adjacent.
+    {
+        ResourceBinding layered = color;
+        layered.mip_levels = 4;
+        layered.array_layers = 4;
+        const VkImageSubresourceRange stripe{VK_IMAGE_ASPECT_COLOR_BIT, 0, 2, 1, 2};
+        LayoutTracker tracker(false);
+        tracker.track(3, layered, VK_IMAGE_LAYOUT_UNDEFINED);
+        tracker.set(3, stripe, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        CHECK(tracker.pieces(3, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 4, 1, 2}, pieces) && pieces.size() == 5);
+        CHECK(pieces[0].layout == VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL &&
+              pieces[0].range.baseMipLevel == 0 && pieces[0].range.levelCount == 2 &&
+              pieces[0].range.baseArrayLayer == 1 && pieces[0].range.layerCount == 2);
+        CHECK(std::count_if(pieces.begin(), pieces.end(), [](const auto& piece) {
+            return piece.layout == VK_IMAGE_LAYOUT_UNDEFINED && piece.range.levelCount == 1 &&
+                   piece.range.layerCount == 1;
+        }) == 4);
+    }
 
     // DiscardResource by subresource range (D3D-26), through prepare(): each listed subresource becomes one range,
     // and the command loop goes on to the next command after a discard's own loop.

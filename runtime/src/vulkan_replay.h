@@ -714,7 +714,7 @@ public:
         return e.layouts[(e.two_planes ? plane : 0) * per_plane + subresource % per_plane];  // merged planes share
     }
 
-    // The current layouts over a range: one piece when they all agree, else one per subresource.
+    // The current layouts over a range: one piece when they all agree, otherwise rectangles of equal layout.
     // Out is LayoutPieces or std::vector<LayoutPiece>.
     template<typename Out>
     bool pieces(ResourceId id, const VkImageSubresourceRange& range, Out& out) const {
@@ -722,21 +722,71 @@ public:
         if (it == entries_.end()) return false;
         const Entry& e = it->second;
         out.clear();
-        bool uniform = true;
         VkImageLayout first = VK_IMAGE_LAYOUT_UNDEFINED;
         bool any = false;
-        visit(e, range, [&](std::size_t index, VkImageAspectFlags, std::uint32_t, std::uint32_t) {
+        const bool uniform = visit(e, range, [&](std::size_t index, VkImageAspectFlags, std::uint32_t, std::uint32_t) {
             if (!any) first = e.layouts[index];
-            uniform = uniform && e.layouts[index] == first;
             any = true;
+            return e.layouts[index] == first;
         });
         if (uniform) {
             out.push_back({range, first});
             return true;
         }
+        // A mixed range with at most two cells cannot merge. Larger ranges need an initialized
+        // pair of neighbors in the same aspect before any rectangle can span more than one cell.
+        // If there is no horizontal pair, any vertical pair can merge as two width-one runs.
+        const std::uint64_t area = std::uint64_t(range.levelCount) * range.layerCount;
+        constexpr auto depth_stencil = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
+        const bool two_aspects = e.two_planes && (range.aspectMask & depth_stencil) == depth_stencil;
+        if (area <= (two_aspects ? 1u : 2u) ||
+            visit(e, range, [&](std::size_t index, VkImageAspectFlags, std::uint32_t mip, std::uint32_t layer) {
+                const auto layout = e.layouts[index];
+                return layout == VK_IMAGE_LAYOUT_UNDEFINED ||
+                       ((mip == range.baseMipLevel || e.layouts[index - 1] != layout) &&
+                        (layer == range.baseArrayLayer || e.layouts[index - e.mips] != layout));
+            })) {
+            visit(e, range, [&](std::size_t index, VkImageAspectFlags aspect, std::uint32_t mip, std::uint32_t layer) {
+                out.push_back({{aspect, mip, 1, layer, 1}, e.layouts[index]});
+                return true;
+            });
+            return true;
+        }
+        // A complete mip chain for a uint32_t extent has at most 32 levels. Keep the index plus one
+        // of the last rectangle starting at each mip, so repeated rows need no temporary heap storage.
+        std::array<std::size_t, std::numeric_limits<std::uint32_t>::digits> last_run{};
+        LayoutPiece run{};
+        const auto flush_run = [&] {
+            const auto mip = run.range.baseMipLevel;
+            if (run.layout != VK_IMAGE_LAYOUT_UNDEFINED && mip < last_run.size()) {
+                if (const auto slot = last_run[mip]) {
+                    auto& previous = out[slot - 1];
+                    auto& prev_range = previous.range;
+                    if (previous.layout == run.layout && prev_range.aspectMask == run.range.aspectMask &&
+                        prev_range.levelCount == run.range.levelCount &&
+                        prev_range.baseArrayLayer + prev_range.layerCount == run.range.baseArrayLayer) {
+                        ++prev_range.layerCount;
+                        return;
+                    }
+                }
+                last_run[mip] = out.size() + 1;
+            }
+            out.push_back(run);
+        };
         visit(e, range, [&](std::size_t index, VkImageAspectFlags aspect, std::uint32_t mip, std::uint32_t layer) {
-            out.push_back({{aspect, mip, 1, layer, 1}, e.layouts[index]});
+            const auto layout = e.layouts[index];
+            // First-use initialization can allocate transfer regions per piece. Keep its existing granularity.
+            if (run.range.levelCount && layout != VK_IMAGE_LAYOUT_UNDEFINED && run.layout == layout &&
+                run.range.aspectMask == aspect && run.range.baseArrayLayer == layer &&
+                run.range.baseMipLevel + run.range.levelCount == mip) {
+                ++run.range.levelCount;
+                return true;
+            }
+            if (run.range.levelCount) flush_run();
+            run = {{aspect, mip, 1, layer, 1}, layout};
+            return true;
         });
+        flush_run(); // nonuniform implies the visit produced at least one subresource
         return true;
     }
 
@@ -747,6 +797,7 @@ public:
         Entry& e = it->second;
         visit(e, range, [&](std::size_t index, VkImageAspectFlags, std::uint32_t, std::uint32_t) {
             e.layouts[index] = layout;
+            return true;
         });
     }
 
@@ -760,7 +811,7 @@ private:
     };
 
     template<typename F>
-    static void visit(const Entry& e, const VkImageSubresourceRange& range, F&& f) {
+    static bool visit(const Entry& e, const VkImageSubresourceRange& range, F&& f) {
         const std::uint32_t mip_end = range.levelCount == VK_REMAINING_MIP_LEVELS ? e.mips
                                                                                   : range.baseMipLevel + range.levelCount;
         const std::uint32_t layer_end = range.layerCount == VK_REMAINING_ARRAY_LAYERS
@@ -774,8 +825,9 @@ private:
             }
             for (std::uint32_t layer = range.baseArrayLayer; layer < std::min(layer_end, e.layers); ++layer)
                 for (std::uint32_t mip = range.baseMipLevel; mip < std::min(mip_end, e.mips); ++mip)
-                    f((std::size_t(plane) * e.layers + layer) * e.mips + mip, aspect, mip, layer);
+                    if (!f((std::size_t(plane) * e.layers + layer) * e.mips + mip, aspect, mip, layer)) return false;
         }
+        return true;
     }
 
     void save(ResourceId id) {
