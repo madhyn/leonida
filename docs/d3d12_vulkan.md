@@ -2867,8 +2867,19 @@ submitting thread; at the maintainers' decision it was replaced by this one when
   about 800 KB, and that with `LEONIDA_COMPILE_GATE=0` the same boot reached game state 3); and a PSO has one build
   running at a time, so
   `after_running` and the teardown rules hold as they were. `LEONIDA_COMPILE_THREADS=1` is the layout before the pool:
-  one general worker and the graphics-only one. A submission still waits at the compile gate for every create in
-  flight, so more workers do not shorten that wait (`SubmitMutex::CompileTurn`; `LEONIDA_COMPILE_GATE=0` turns it off).
+  one general worker and the graphics-only one.
+- **Warm-ups do not hold the compile gate** (RT-COMPILE-GATE-WARMUP-FREE). A submission waits at the compile gate
+  (`SubmitMutex::CompileTurn`) only for the demanded creates in the driver, not for a warm-up's: a create made by a
+  compile worker's speculative job (a warm-up, a prewarm, the checkpoint; `compile_job_speculative`) passes the gate
+  as speculative. Its pipeline is simply not ready yet; whoever needs it builds or waits for it as before. A warm-up
+  still never enters the driver while a submission is in it or waits at the gate, and at most
+  `LEONIDA_COMPILE_GATE_WARMUP_MAX` warm-ups (default 1) are in the driver at once, so the creates beside a submission
+  stay bounded: the pool's demanded builds plus that many warm-ups, and the pool starts no warm-up while a demanded
+  build runs. Why: on HasiKe's RTX 2070 SUPER (#2233) a cold boot crawled at about one submission a second behind
+  290 s of serial warm-ups with the gate on, and ran at about 100 frames a second with `LEONIDA_COMPILE_GATE=0`;
+  MoonEyes measured 142 s of submission waits behind warm-ups (#1608). The gate stays for demanded creates, which the
+  title waits for anyway. `LEONIDA_COMPILE_GATE_WARMUPS=1` makes warm-ups hold the gate again, as before;
+  `LEONIDA_COMPILE_GATE=0` still turns the whole gate off.
 - **Warm-ups while the title submits.** A compute warm-up holds the compile gate for its whole create, and every
   submission waits behind it: a native boot's submissions waited 140 s in all at the gate behind compute warm-ups, and
   past the story load the worker went through 694 warm-ups of modules over 128 KiB (those over 640 KiB take 4-25 s

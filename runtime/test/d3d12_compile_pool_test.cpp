@@ -6,6 +6,7 @@
 //   - demanded jobs go first, in the order they came, then warm-ups by size, and a checkpoint only when nothing runs;
 //   - a checkpoint's second look sees a demanded build that started on another worker meanwhile;
 //   - one job of a PSO at a time;
+//   - a warm-up's and the checkpoint's creates pass the compile gate as speculative, a demanded build's do not;
 //   - the last release with jobs running and queued: the queued ones are dropped, the running ones finish, the
 //     workers are joined; a device's cancel waits for its running jobs; stop_for_exit does not wait past its limit.
 #include "../shims/d3d12_pipeline_compile.h"
@@ -18,6 +19,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <utility>
 #include <thread>
 #include <vector>
 
@@ -351,6 +353,40 @@ void test_a_checkpoint_sees_a_demand_that_started_during_it() {
     pool.release();
 }
 
+// What a job's pipeline creates tell the compile gate (DriverTurn, compile_job_speculative): a warm-up and the checkpoint
+// are speculative and do not hold submissions; a demanded build is not, also on a worker that ran a warm-up before.
+void test_jobs_tell_the_gate_whether_they_are_speculative() {
+    for (const unsigned threads : {1u, 3u}) {
+        auto& pool = make_pool(threads, threads > 1 ? threads - 1 : 1);
+        Log log;
+        std::mutex mutex;
+        std::vector<std::pair<std::string, bool>> seen;
+        Owners owner;
+        const auto job = [&](const void* who, const std::string& name, std::size_t priority) {
+            EXPECT(pool.submit(who, device, priority, [&, name] {
+                std::lock_guard lock(mutex);
+                seen.emplace_back(name, rt::d3d12::compile_job_speculative);
+                log.start(name, false);
+                log.finish(name, false);
+            }));
+        };
+        job(owner[0], "warm", 100);
+        EXPECT(log.wait_finished(1));
+        job(owner[1], "demand", 0);
+        EXPECT(log.wait_finished(2));
+        job(device, "checkpoint", SIZE_MAX);
+        EXPECT(log.wait_finished(3));
+        job(owner[2], "demand again", 0);
+        EXPECT(log.wait_finished(4));
+        EXPECT(!rt::d3d12::compile_job_speculative);  // this thread is no worker
+        std::lock_guard lock(mutex);
+        const std::vector<std::pair<std::string, bool>> want{
+            {"warm", true}, {"demand", false}, {"checkpoint", true}, {"demand again", false}};
+        EXPECT(seen == want);
+        pool.release();
+    }
+}
+
 void test_one_job_of_a_pso_at_a_time() {
     auto& pool = make_pool(4, 3);
     Log log;
@@ -486,6 +522,7 @@ int main() {
     test_order();
     test_a_checkpoint_sees_a_demand_that_started_during_it();
     test_one_job_of_a_pso_at_a_time();
+    test_jobs_tell_the_gate_whether_they_are_speculative();
     test_a_finished_job_wakes_the_idle_workers();
     test_release_with_jobs_running_and_queued();
     test_cancel_waits_for_a_devices_running_jobs();
