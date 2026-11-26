@@ -4,6 +4,7 @@
 //   - a long large build does not hold up a small build a submission waits for (with one worker it still does);
 //   - large builds keep within the heavy count, and large and speculative ones together leave one worker free;
 //   - demanded jobs go first, in the order they came, then warm-ups by size, and a checkpoint only when nothing runs;
+//   - a checkpoint's second look sees a demanded build that started on another worker meanwhile;
 //   - one job of a PSO at a time;
 //   - the last release with jobs running and queued: the queued ones are dropped, the running ones finish, the
 //     workers are joined; a device's cancel waits for its running jobs; stop_for_exit does not wait past its limit.
@@ -321,6 +322,35 @@ void test_order() {
     pool.release();
 }
 
+// The checkpoint starts only when nothing runs, but a demanded build can start on another worker while the checkpoint
+// asks the driver for the cache size. Its second look (save_session_pipeline_cache) must see that build running, or it
+// goes on to read the cache blob while the build holds the driver.
+void test_a_checkpoint_sees_a_demand_that_started_during_it() {
+    auto& pool = make_pool(2, 1);
+    Log log;
+    Gate query;
+    Owners owner;
+    std::atomic<int> second_look{-1};
+    EXPECT(pool.submit(device, device, SIZE_MAX, [&] {
+        log.start("checkpoint", false);
+        EXPECT(!pool.has_compile_waiter());  // the first look: nothing else queued or running
+        query.wait();                         // the size query
+        second_look = pool.has_compile_waiter();
+        log.finish("checkpoint", false);
+    }));
+    EXPECT(log.wait_started(1));
+    Gate build;
+    submit(pool, log, &build, owner[0], "demand");
+    EXPECT(log.wait_started(2));  // on the second worker, while the checkpoint runs
+    query.release();
+    EXPECT(log.wait_finished(1));
+    EXPECT(second_look == 1);
+    build.release();
+    EXPECT(log.wait_finished(2));
+    EXPECT(!pool.has_compile_waiter());
+    pool.release();
+}
+
 void test_one_job_of_a_pso_at_a_time() {
     auto& pool = make_pool(4, 3);
     Log log;
@@ -454,6 +484,7 @@ int main() {
     test_demanded_builds_go_before_warm_ups();
     test_a_warm_up_and_a_large_build_leave_a_worker_free();
     test_order();
+    test_a_checkpoint_sees_a_demand_that_started_during_it();
     test_one_job_of_a_pso_at_a_time();
     test_a_finished_job_wakes_the_idle_workers();
     test_release_with_jobs_running_and_queued();

@@ -342,9 +342,14 @@ public:
     // Lock-free: replay asks at every draw and dispatch whose pipeline is not built yet.
     bool closed() const { return closed_flag_.load(std::memory_order_acquire); }
 
+    // True while a build other than the checkpoint is queued, or a demanded build runs. The checkpoint asks twice: before
+    // and after the size query, during which a demanded build can start on another worker (no warm-up can: one runs
+    // only when no other speculative job does, and the checkpoint counts as one).
     bool has_compile_waiter() {
         std::lock_guard lock(mutex_);
-        return !jobs_.empty() && jobs_.begin()->first != SIZE_MAX;
+        if (!jobs_.empty() && jobs_.begin()->first != SIZE_MAX) return true;
+        return std::any_of(running_.begin(), running_.end(),
+                           [](const Running& r) { return !r.speculative && !r.finished; });
     }
     // Returns when no job is queued or running. A job owns its pipeline state, and through it the device, until it
     // finishes; a caller that counts references (rt::d3d12_xs::device_proxy_ref_count) waits here first.
