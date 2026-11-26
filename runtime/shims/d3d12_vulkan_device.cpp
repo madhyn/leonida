@@ -2653,19 +2653,42 @@ struct DeviceState {
                                 forget_geometry_alias);
     }
     // ExecuteCommandLists replays in progress, for GeometryViews::kAfterExecutes (see drain_geometry_releases).
-    static std::vector<std::uint64_t>& geometry_execute_serials() {
-        thread_local std::vector<std::uint64_t> serials;
+    // A plain aggregate on purpose: a C++ thread_local with a destructor in gta6rt.exe adds TLS callbacks to the image
+    // the loader's TLS index-0 move must not have (pe_loader.cpp reserve_tls_index0; VulkanContext::stage_xdxr_table
+    // keeps its range list a member for the same reason). A std::vector here made the title's CRT abort at startup.
+    struct GeometryExecuteSerials {
+        static constexpr unsigned kCapacity = 32;  // a replay has not been seen nested this deep
+        std::uint64_t serials[kCapacity]{};
+        unsigned count{};
+        unsigned skipped{};  // replays begun while the stack was full: the innermost, ended first
+    };
+    static GeometryExecuteSerials& geometry_execute_serials() {
+        thread_local GeometryExecuteSerials serials;
         return serials;
     }
     void geometry_execute_begin() {
         if (!geometry.cap()) return;
-        geometry_execute_serials().push_back(geometry.execute_begin());
+        auto& serials = geometry_execute_serials();
+        if (serials.count == GeometryExecuteSerials::kCapacity) {
+            static std::atomic<bool> logged{false};
+            if (!logged.exchange(true))
+                std::fprintf(stderr, "[rt] d3d12: ExecuteCommandLists nested more than %u deep; a geometry view retired "
+                                     "in the extra replay is not deferred to it\n",
+                             GeometryExecuteSerials::kCapacity);
+            ++serials.skipped;
+            return;
+        }
+        serials.serials[serials.count++] = geometry.execute_begin();
     }
     void geometry_execute_end() {
+        if (!geometry.cap()) return;
         auto& serials = geometry_execute_serials();
-        if (!geometry.cap() || serials.empty()) return;
-        const std::uint64_t serial = serials.back();
-        serials.pop_back();
+        if (serials.skipped != 0) {
+            --serials.skipped;
+            return;
+        }
+        if (serials.count == 0) return;
+        const std::uint64_t serial = serials.serials[--serials.count];
         geometry.execute_end(serial, [this] { return context->submitted_retire_ticket(); });
     }
     static rt::d3d12::GeometryCopy copy_geometry(std::uint8_t* to, const std::uint8_t* from, std::size_t size) {
