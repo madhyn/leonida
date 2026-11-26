@@ -342,7 +342,8 @@ static BOOL WINAPI stop_compiles_on_console_exit(DWORD event) {
 }
 
 // A run that ends in an exception nothing handles (a fault in the title or one of its DLLs, the int3 after a device
-// loss) would otherwise keep none of the pipelines it compiled, and the next boot builds them all again. The device is
+// loss) would otherwise keep none of the pipelines it compiled, and the next boot builds them all again: this prints
+// the fault and the threads' call chains (rt::print_fault_stacks) and saves them. The device is
 // left alone apart from that write; the exception then goes on as before (the previous filter, or Windows' own
 // handling), so the exit code is the exception's. Not for a stack overflow: no stack is left to write with.
 static LPTOP_LEVEL_EXCEPTION_FILTER previous_fatal_filter = nullptr;
@@ -362,9 +363,12 @@ static LONG WINAPI save_caches_on_fatal_exception(EXCEPTION_POINTERS* info) {
         // Several title threads can fault at once (measured: eight within a second). The first writes; the others
         // wait here for it, so none of them reaches the title's filter, which may end the process, mid-write.
         static std::once_flag once;
-        std::call_once(once, [code] {
+        std::call_once(once, [info, code] {
             std::fprintf(stderr, "[rt] unhandled exception 0x%08lx: writing the session pipeline cache before the "
                                  "process ends\n", static_cast<unsigned long>(code));
+            // Before the waits below, while the faulting thread's stack is still the one we are running on.
+            rt::print_fault_stacks(info ? info->ExceptionRecord : nullptr, info ? info->ContextRecord : nullptr,
+                                   "fatal");
             rt::d3d12::stop_pipeline_compiles(kExitCompileWaitMs);
             rt::d3d12::save_pipeline_caches_at_exit(kExitCacheWaitMs);
             std::fflush(stderr);
