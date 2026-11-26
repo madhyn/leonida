@@ -1590,19 +1590,24 @@ BOOL WINAPI get_disk_free_space_ex_w(LPCWSTR directory_name,
     const Roots r = roots();
     size_t prefix_length = 0;
     const Drive drive = console_drive(directory_name, prefix_length);
-    std::filesystem::path host_dir;
-    if (drive == Drive::Scratch) {
-        host_dir = r.overlay.empty() ? std::filesystem::path() : (r.overlay / kScratchDir);
-    } else {
-        host_dir = r.game.empty() ? r.overlay : r.game;
+
+    if (!r.game.empty() || !r.overlay.empty()) {
+        const View v = view(r, parts);
+        if (v.kind != Kind::Directory) {
+            return fail_bool(ERROR_PATH_NOT_FOUND);
+        }
+        std::filesystem::path host_dir;
+        if (drive == Drive::Scratch || v.in_overlay) {
+            host_dir = disk_path(r.overlay, parts);
+        } else {
+            host_dir = disk_path(r.game, parts);
+        }
+        return ::GetDiskFreeSpaceExW(win32_io_path(host_dir).c_str(), free_bytes_available_to_caller,
+                                     total_number_of_bytes, total_number_of_free_bytes);
     }
 
-    if (!host_dir.empty()) {
-        std::error_code ec;
-        if (std::filesystem::exists(host_dir, ec)) {
-            return ::GetDiskFreeSpaceExW(win32_io_path(host_dir).c_str(), free_bytes_available_to_caller,
-                                         total_number_of_bytes, total_number_of_free_bytes);
-        }
+    if (!drive_root(directory_name, parts)) {
+        return fail_bool(ERROR_PATH_NOT_FOUND);
     }
 
     constexpr ULONGLONG kDefaultFree = 500ULL * 1024 * 1024 * 1024;
@@ -1647,27 +1652,30 @@ BOOL WINAPI get_disk_free_space_w(LPCWSTR root_path_name,
     const Roots r = roots();
     size_t prefix_length = 0;
     const Drive drive = console_drive(root_path_name, prefix_length);
-    std::filesystem::path host_dir;
-    if (drive == Drive::Scratch) {
-        host_dir = r.overlay.empty() ? std::filesystem::path() : (r.overlay / kScratchDir);
-    } else {
-        host_dir = r.game.empty() ? r.overlay : r.game;
+
+    if (!r.game.empty() || !r.overlay.empty()) {
+        const View v = view(r, parts);
+        if (v.kind != Kind::Directory) {
+            return fail_bool(ERROR_PATH_NOT_FOUND);
+        }
+        std::filesystem::path host_dir;
+        if (drive == Drive::Scratch || v.in_overlay) {
+            host_dir = disk_path(r.overlay, parts);
+        } else {
+            host_dir = disk_path(r.game, parts);
+        }
+        std::filesystem::path root_path = host_dir.root_path();
+        if (root_path.empty()) root_path = host_dir;
+        std::wstring root_str = root_path.wstring();
+        if (!root_str.empty() && root_str.back() != L'\\' && root_str.back() != L'/') {
+            root_str += L'\\';
+        }
+        return ::GetDiskFreeSpaceW(win32_io_path(root_str).c_str(), sectors_per_cluster, bytes_per_sector,
+                                   number_of_free_clusters, total_number_of_clusters);
     }
 
-    if (!host_dir.empty()) {
-        std::error_code ec;
-        if (std::filesystem::exists(host_dir, ec)) {
-            std::filesystem::path root_path = host_dir.root_path();
-            if (root_path.empty()) root_path = host_dir;
-            std::wstring root_str = root_path.wstring();
-            if (!root_str.empty() && root_str.back() != L'\\' && root_str.back() != L'/') {
-                root_str += L'\\';
-            }
-            if (::GetDiskFreeSpaceW(root_str.c_str(), sectors_per_cluster, bytes_per_sector,
-                                    number_of_free_clusters, total_number_of_clusters)) {
-                return TRUE;
-            }
-        }
+    if (!drive_root(root_path_name, parts)) {
+        return fail_bool(ERROR_PATH_NOT_FOUND);
     }
 
     if (sectors_per_cluster) *sectors_per_cluster = 8;
