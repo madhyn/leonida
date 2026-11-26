@@ -4131,7 +4131,13 @@ struct DeviceState {
             if (budget_us && !heap.fix_over && !(++heap.fix_count & 15) &&
                 std::chrono::steady_clock::now() - heap.fix_start >= std::chrono::microseconds(budget_us))
                 heap.fix_over = true;
-            if (heap.fix_over) {
+            // Buffer V#s (!(w3 >> 30)) only rebase address offsets, so they are fast and must never be
+            // deferred or nulled: at the first world frame lib_cs_01144 reads its loop bound from a buffer
+            // slot; nulling it causes an infinite loop and device loss. Only image T#s are deferred past budget.
+            std::uint32_t w3 = 0;
+            std::memcpy(&w3, heap.previous + at + 12, sizeof(w3));
+            const bool is_buffer_vsharp = !(w3 >> 30);
+            if (heap.fix_over && !is_buffer_vsharp) {
                 std::memset(heap.copy + at, 0, kDescriptorSize);
                 heap.live_vsharps.clear(slot);
                 ++heap.deferred_fixes;
