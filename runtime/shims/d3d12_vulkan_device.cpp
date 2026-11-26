@@ -10855,6 +10855,25 @@ public:
         std::vector<char>().swap(file_.data);  // the driver has its own copy
     }
 
+    // In the build's driver turn, after a create against a seeded cache that missed. Measured on NVIDIA (RTX 3080,
+    // 610.88): such a cache can keep its data exactly as loaded, without the pipeline just compiled, so the rewrite
+    // gave the same file and the same miss on every boot. When the cache's data is still the loaded size, it is
+    // swapped for an empty one for one more create (the driver still has the pipeline: tens of milliseconds).
+    bool restart_empty() {
+        if (!cache || !seeded) return false;
+        const auto& vk = device_.context->vk;
+        std::size_t size = 0;
+        if (vk.vkGetPipelineCacheData(device_.info.device, cache, &size, nullptr) != VK_SUCCESS || size != file_.bytes)
+            return false;  // it took the pipeline (or cannot say): rewritten from it as before
+        vk.vkDestroyPipelineCache(device_.info.device, cache, nullptr);
+        cache = VK_NULL_HANDLE;
+        seeded = false;
+        const VkPipelineCacheCreateInfo info{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
+        if (vk.vkCreatePipelineCache(device_.info.device, &info, nullptr, &cache) == VK_SUCCESS) return true;
+        cache = VK_NULL_HANDLE;
+        return false;
+    }
+
     // In the build's driver turn, after the create against `cache`. `built`: that create made the pipeline; `hit`:
     // its creation feedback; `driver_ms`: the vkCreateComputePipelines call alone.
     void finish(bool built, int hit, std::uint64_t driver_ms) {
@@ -11150,6 +11169,23 @@ ComputeBuild build_compute_pipeline(DeviceState& device, const leonida::ShaderEn
             const ULONGLONG at = GetTickCount64();
             created = vk.vkCreateComputePipelines(dev, cache, 1, &pipeline_info, nullptr, &built);
             driver_ms = GetTickCount64() - at;
+            // A seeded miss the cache did not take: built once more against an empty cache, so the file is rewritten
+            // with this pipeline instead of as it was read.
+            if (created == VK_SUCCESS && built && journal.seeded &&
+                leonida::pipeline_journal::should_write(true, trace.hit(), driver_ms) && journal.restart_empty()) {
+                VkPipeline again = VK_NULL_HANDLE;
+                const ULONGLONG at_again = GetTickCount64();
+                const VkResult again_result = vk.vkCreateComputePipelines(dev, journal.cache, 1, &pipeline_info, nullptr, &again);
+                const ULONGLONG again_ms = GetTickCount64() - at_again;
+                if (again_result == VK_SUCCESS && again) {
+                    vk.vkDestroyPipeline(dev, built, nullptr);
+                    built = again;
+                }
+                std::fprintf(stderr, "[rt] d3d12: pipeline journal: %s missed its journal file (%llu ms); built again "
+                                     "against an empty cache in %llu ms (VkResult %d) to rewrite it\n",
+                             entry->name.c_str(), static_cast<unsigned long long>(driver_ms),
+                             static_cast<unsigned long long>(again_ms), int(again_result));
+            }
         }
         compiling.name.store(nullptr, std::memory_order_release);
         vk.vkDestroyShaderModule(dev, module, nullptr);  // Vulkan lets a module go once the pipeline exists
