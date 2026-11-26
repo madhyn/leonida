@@ -5,9 +5,10 @@
 // or garbage record makes a dispatch of billions of groups or a draw of four billion vertices run until the host
 // resets the display driver (TDR, device loss). So, just before the indirect command, one tiny compute pass copies
 // the active records into device-local scratch with their values bounded - 2^24 vertices or indices, 2^26 vertex
-// instances, 65 535 groups per dimension, 2^20 groups per dispatch, and a 2^27-unit work budget per command
-// list (the shader is indirect_clamp.comp) - and the indirect command reads that scratch. The application's argument
-// and count buffers are left untouched, so values within the limits replay bit-identically.
+// instances, the device's maxComputeWorkGroupCount per dimension (65 535 for a mesh dispatch), 2^20 groups per
+// dispatch, and a 2^27-unit work budget per command list (the shader is indirect_clamp.comp) - and the indirect
+// command reads that scratch. The application's argument and count buffers are left untouched, so values within the
+// limits replay bit-identically.
 //
 // One pass covers all four argument kinds the layer can emit (draw, draw indexed, dispatch, mesh dispatch) and the
 // counted variants, whose count is clamped to max_command_count as well (a *Count draw then reads a count the scratch
@@ -62,9 +63,20 @@ inline constexpr std::uint32_t indirect_clamp_mesh = 3;
 // What the pass bounds, as indirect_clamp.comp states them.
 inline constexpr std::uint32_t indirect_clamp_max_vertices = 1u << 24;
 inline constexpr std::uint32_t indirect_clamp_max_vertex_instances = 1u << 26;
+// Groups in a mesh dispatch's x. A compute dispatch is bounded by the device's maxComputeWorkGroupCount instead
+// (indirect_clamp_dispatch_limit), which on NVIDIA, for one, is far above Vulkan's guaranteed 65 535 in x.
 inline constexpr std::uint32_t indirect_clamp_max_group_dimension = 65535u;
 inline constexpr std::uint32_t indirect_clamp_max_groups = 1u << 20;
 inline constexpr std::uint32_t indirect_clamp_budget = 1u << 27;
+
+// What the pass lets a dispatch record ask for in x, y and z: the device's own maxComputeWorkGroupCount. A fixed
+// 65 535 cut a dispatch of more groups in x short on a device that runs them, and the groups past the cut never wrote
+// their output (blocky patches; the idea is from codec-d/cool_fox docs/findings.md). A limit the device reports as 0
+// is taken as Vulkan's guaranteed minimum.
+inline std::uint32_t indirect_clamp_dispatch_limit(const VkPhysicalDeviceLimits& limits, int axis) {
+    const std::uint32_t limit = limits.maxComputeWorkGroupCount[axis];
+    return limit ? limit : indirect_clamp_max_group_dimension;
+}
 
 // The largest scratch allocation accepted for one ExecuteIndirect call.
 inline constexpr std::uint64_t indirect_clamp_max_scratch_bytes = std::uint64_t(64) << 20;
@@ -269,7 +281,7 @@ private:
 
 namespace detail {
 
-// One clamp pass's push-constant block. The shader's block is the same: five device addresses, then the six words.
+// One clamp pass's push-constant block. The shader's block is the same: six device addresses, then the ten words.
 struct IndirectClampPush {
     VkDeviceAddress arguments;
     VkDeviceAddress count;
@@ -283,8 +295,12 @@ struct IndirectClampPush {
     std::uint32_t first_record;
     std::uint32_t max_records;
     std::uint32_t flags;
+    std::uint32_t max_x;  // indirect_clamp_dispatch_limit per axis
+    std::uint32_t max_y;
+    std::uint32_t max_z;
+    std::uint32_t reserved;
 };
-static_assert(sizeof(IndirectClampPush) == 72);
+static_assert(sizeof(IndirectClampPush) == 88);
 
 inline constexpr VkBufferUsageFlags indirect_clamp_scratch_usage =
     VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT |
@@ -615,7 +631,11 @@ inline void IndirectArgumentClamp::emit(VkCommandBuffer cb, const ClampedIndirec
                                                   std::uint32_t(first),
                                                   job.max_records,
                                                   (job.kind == indirect_clamp_dispatch ? indirect_group_budget() << 1 : 0u) |
-                                                      (job.counted ? 1u : 0u)};
+                                                      (job.counted ? 1u : 0u),
+                                                  indirect_clamp_dispatch_limit(limits_, 0),
+                                                  indirect_clamp_dispatch_limit(limits_, 1),
+                                                  indirect_clamp_dispatch_limit(limits_, 2),
+                                                  0u};
         push(cb, layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(constants), &constants);
         dispatch(cb, (records - 1u) / 64u + 1u, 1, 1);
         first += records;

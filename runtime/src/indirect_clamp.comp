@@ -10,8 +10,13 @@
 // an atomic CAS, so thousands of garbage records cannot run for seconds either.
 //
 // The bounds cut legitimate work beyond them, so they are generous: 2^24 vertices (or indices), 2^26 vertex instances,
-// 65 535 groups per dimension, 2^20 groups per dispatch, and mesh dispatches charged 128 threads per group. The
-// console's mesh dispatch is one-dimensional; the output uses one group in y and z.
+// the device's own maxComputeWorkGroupCount per dimension for a dispatch (65 535 for a mesh dispatch), 2^20 groups per
+// dispatch, and mesh dispatches charged 128 threads per group. The console's mesh dispatch is one-dimensional; the
+// output uses one group in y and z.
+//
+// A dispatch is bounded by the device's limit, not by Vulkan's guaranteed minimum of 65 535: NVIDIA, for one, allows
+// 2^31 - 1 groups in x, and a fixed 65 535 cut a one-dimensional dispatch of more groups short, so the groups
+// past it never ran and their output stayed stale (blocky patches; idea from codec-d/cool_fox docs/findings.md).
 #version 460
 #extension GL_EXT_buffer_reference : require
 layout(local_size_x = 64) in;
@@ -35,12 +40,16 @@ layout(push_constant) uniform Params {
     uint first_record;   // the record index this chunk starts at
     uint max_records;    // max_command_count of the ExecuteIndirect call
     uint flags;          // bit 0: counted; bits 1..16: optional per-dispatch group budget
+    uint max_x;          // the device's maxComputeWorkGroupCount: a dispatch's x, y and z run up to these
+    uint max_y;          // (three words, not a uvec3, whose 16-byte alignment would move it past the C++ struct)
+    uint max_z;
+    uint reserved;
 } p;
 
 // One ExecuteIndirect batch's limits. A record that asks for more runs empty instead of for seconds.
 const uint max_vertices = 1u << 24u;          // vertices or indices in one draw
 const uint max_vertex_instances = 1u << 26u;  // vertex (or index) count times instance count
-const uint max_group_dimension = 65535u;      // groups in x, y or z
+const uint max_mesh_dimension = 65535u;       // groups in a mesh dispatch's x (dispatches: p.max_x, y, z)
 const uint max_groups = 1u << 20u;            // groups in one dispatch or mesh dispatch
 const uint budget = 1u << 27u;                // work in the whole command list: vertices, indices, or groups * 64
 
@@ -112,8 +121,8 @@ void main() {
         words[3] = p.arguments.data[src + 3u];
         if (p.kind == 1u) words[4] = p.arguments.data[src + 4u];
     } else {
-        // A dispatch or a mesh dispatch: three group counts. x * y fits 32 bits (each is at most 65 535); the whole
-        // group count may not, so an oversized product runs empty.
+        // A dispatch or a mesh dispatch: three group counts, each bounded by the device's limit. A product past
+        // max_groups runs empty; it is checked by division, because x alone may be up to 2^32 - 1.
         const uint asked_x = p.arguments.data[src];
         const uint asked_y = p.arguments.data[src + 1u];
         const uint asked_z = p.arguments.data[src + 2u];
@@ -127,9 +136,10 @@ void main() {
                 atomicMax(p.stats.data[11], asked_z);
             }
         }
-        uint x = min(asked_x, max_group_dimension);
-        uint y = min(asked_y, max_group_dimension);
-        uint z = min(asked_z, max_group_dimension);
+        const uvec3 limit = p.kind == 3u ? uvec3(max_mesh_dimension, 1u, 1u) : max(uvec3(p.max_x, p.max_y, p.max_z), uvec3(1u));
+        uint x = min(asked_x, limit.x);
+        uint y = min(asked_y, limit.y);
+        uint z = min(asked_z, limit.z);
         if (p.kind == 3u) { y = 1u; z = 1u; }
         const uint groups = p.flags >> 1u;
         if (groups != 0u && x != 0u && y != 0u && z != 0u) {
@@ -137,7 +147,7 @@ void main() {
             y = min(y, groups / x);
             z = min(z, groups / x / y);
         }
-        if (z != 0u && x * y > max_groups / z) {
+        if (x != 0u && y != 0u && z != 0u && (x > max_groups || y > max_groups / x || z > max_groups / x / y)) {
             x = 0u;
             y = 0u;
             z = 0u;

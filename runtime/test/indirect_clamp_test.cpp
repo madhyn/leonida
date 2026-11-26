@@ -6,7 +6,11 @@
 //     dispatch) instead of asking for billions of groups;
 //   - a counted batch clamps the count to max_command_count and empties the records past it;
 //   - a batch whose records fit but whose total work passes the 2^27 budget runs all but the records that no longer
-//     fit, so thousands of garbage records cannot run for seconds.
+//     fit, so thousands of garbage records cannot run for seconds;
+//   - a dispatch is bounded by the device's own maxComputeWorkGroupCount, not by Vulkan's minimum of 65 535: a real
+//     indirect dispatch of 70 000 x 1 x 1 groups (and of 65 535 in x or y, the old limit) through the clamped scratch
+//     runs every group exactly once (cs_group_marker.comp marks each one). The idea is from codec-d/cool_fox
+//     docs/findings.md ("blocky patches: indirect dispatches cut at 65,535 groups"); no code of theirs is used.
 //
 // A record that asks for billions of groups or vertices would run until the host resets the driver, so this test is
 // about the values the pass writes, never about running such a dispatch here: every case ends in a copy of the
@@ -17,6 +21,7 @@
 #include "vk_test_device.h"
 
 #include "../src/vulkan_indirect_clamp.h"
+#include "cs_group_marker_spv.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -241,16 +246,32 @@ int main() {
         CHECK(out.counters.records_clamped == 1);
     }
 
-    // 6b. A dispatch over the per-dimension limit is cut there, and one over 2^20 groups in all runs empty.
+    // 6b. A dispatch over the device's per-dimension limit is cut there (y here; a device whose y limit is above 2^20
+    //     runs it empty instead, as more than 2^20 groups), and one over 2^20 groups in all runs empty.
     {
-        const std::uint32_t values[3 * 2] = {0x10000000u, 1, 1, 65535, 65535, 1};
+        const std::uint32_t max_y = leonida::indirect_clamp_dispatch_limit(properties.limits, 1);
+        const std::uint32_t values[3 * 2] = {1, 0x10000000u, 1, 65535, 65535, 1};
         Clamped out{};
         CHECK(env.run(leonida::indirect_clamp_dispatch, 12, 2, 3, values, nullptr, out));
         const auto per_dimension = record(out, 0, 3);
-        CHECK(per_dimension[0] == leonida::indirect_clamp_max_group_dimension && per_dimension[1] == 1 &&
-              per_dimension[2] == 1);
+        if (max_y <= leonida::indirect_clamp_max_groups)
+            CHECK(per_dimension[0] == 1 && per_dimension[1] == max_y && per_dimension[2] == 1);
+        else
+            CHECK(all_zero(per_dimension));
         CHECK(all_zero(record(out, 1, 3)));
         CHECK(out.counters.records_clamped == 2);
+    }
+
+    // 6c. x within the device's limit is not cut at 65 535: 70 000 groups (fewer than 2^20) come back as asked on a
+    //     device that runs them, and are cut at its limit on one that does not.
+    {
+        const std::uint32_t max_x = leonida::indirect_clamp_dispatch_limit(properties.limits, 0);
+        const std::uint32_t values[3] = {70000, 1, 1};
+        Clamped out{};
+        CHECK(env.run(leonida::indirect_clamp_dispatch, 12, 1, 3, values, nullptr, out));
+        const auto words = record(out, 0, 3);
+        CHECK(words[0] == std::min<std::uint32_t>(70000, max_x) && words[1] == 1 && words[2] == 1);
+        CHECK(out.counters.records_clamped == (max_x >= 70000 ? 0u : 1u));
     }
 
     // 7. A console mesh dispatch uses only x.
@@ -366,6 +387,104 @@ int main() {
         }
         clamp.retire(VK_NULL_HANDLE, 0);
         clamp.collect();
+    }
+
+    // 10. Real indirect dispatches through the clamped scratch: every group runs exactly once. 70 000 x 1 x 1 is past
+    //     the old fixed 65 535 (the groups past it never ran, leaving their output stale); 65 535 in x and in y are
+    //     exactly at it. A size past this device's own limit is skipped: the clamp cuts it there by design.
+    {
+        const auto vkfn = [&](const char* name) { return device.device_proc(device.device, name); };
+        VkShaderModuleCreateInfo module_info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        module_info.codeSize = sizeof(leonida::cs_group_marker_spirv);
+        module_info.pCode = leonida::cs_group_marker_spirv;
+        VkShaderModule module = VK_NULL_HANDLE;
+        CHECK(reinterpret_cast<PFN_vkCreateShaderModule>(vkfn("vkCreateShaderModule"))(device.device, &module_info,
+                                                                                       nullptr, &module) == VK_SUCCESS);
+        struct MarkerPush {
+            VkDeviceAddress marks;
+            std::uint32_t groups;
+            std::uint32_t pad;
+        };
+        const VkPushConstantRange range{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(MarkerPush)};
+        VkPipelineLayoutCreateInfo layout_info{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        layout_info.pushConstantRangeCount = 1;
+        layout_info.pPushConstantRanges = &range;
+        VkPipelineLayout layout = VK_NULL_HANDLE;
+        CHECK(reinterpret_cast<PFN_vkCreatePipelineLayout>(vkfn("vkCreatePipelineLayout"))(
+                  device.device, &layout_info, nullptr, &layout) == VK_SUCCESS);
+        VkComputePipelineCreateInfo pipeline_info{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        pipeline_info.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+        pipeline_info.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        pipeline_info.stage.module = module;
+        pipeline_info.stage.pName = "main";
+        pipeline_info.layout = layout;
+        VkPipeline pipeline = VK_NULL_HANDLE;
+        CHECK(reinterpret_cast<PFN_vkCreateComputePipelines>(vkfn("vkCreateComputePipelines"))(
+                  device.device, VK_NULL_HANDLE, 1, &pipeline_info, nullptr, &pipeline) == VK_SUCCESS);
+
+        constexpr std::uint32_t kMostGroups = 70000;
+        void* marks_map = nullptr;
+        const VkBuffer marks = device.buffer(VkDeviceSize(kMostGroups + 1) * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                                             &marks_map);
+        CHECK(marks && marks_map && pipeline);
+        struct Case {
+            std::uint32_t x, y, z;
+        };
+        const Case cases[] = {{70000, 1, 1}, {65535, 1, 1}, {1, 65535, 1}};
+        for (const Case& c : cases) {
+            if (!marks || !pipeline) break;
+            const std::uint32_t groups = c.x * c.y * c.z;
+            if (c.x > leonida::indirect_clamp_dispatch_limit(properties.limits, 0) ||
+                c.y > leonida::indirect_clamp_dispatch_limit(properties.limits, 1) ||
+                c.z > leonida::indirect_clamp_dispatch_limit(properties.limits, 2)) {
+                std::printf("indirect_clamp_test: %u x %u x %u is past this device's maxComputeWorkGroupCount; "
+                            "skipped\n", c.x, c.y, c.z);
+                continue;
+            }
+            const std::uint32_t args[3] = {c.x, c.y, c.z};
+            std::memset(env.arguments_map, 0, size_t(env.argument_bytes));
+            std::memcpy(env.arguments_map, args, sizeof args);
+            std::memset(marks_map, 0, size_t(kMostGroups + 1) * 4);
+            {
+                auto batch = clamp.batch();
+                leonida::ClampedIndirect job{};
+                CHECK(batch->prepare(env.arguments, 0, VK_NULL_HANDLE, 0, leonida::indirect_clamp_dispatch, 12, 1,
+                                     job));
+                const MarkerPush push{device.device_address(marks), groups, 0};
+                CHECK(device.run([&](VkCommandBuffer cb) {
+                    clamp.emit(cb, job);  // its last barrier orders the records before the indirect read
+                    reinterpret_cast<PFN_vkCmdBindPipeline>(vkfn("vkCmdBindPipeline"))(
+                        cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+                    reinterpret_cast<PFN_vkCmdPushConstants>(vkfn("vkCmdPushConstants"))(
+                        cb, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof push, &push);
+                    reinterpret_cast<PFN_vkCmdDispatchIndirect>(vkfn("vkCmdDispatchIndirect"))(cb, job.buffer,
+                                                                                                job.offset);
+                    VkMemoryBarrier host{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+                    host.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+                    host.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+                    device.fn<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(
+                        cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &host, 0, nullptr,
+                        0, nullptr);
+                    return true;
+                }));
+            }
+            clamp.retire(VK_NULL_HANDLE, 0);
+            clamp.collect();
+            const auto* m = static_cast<const std::uint32_t*>(marks_map);
+            std::uint32_t once = 0, never = 0, twice = 0;
+            for (std::uint32_t g = 0; g < groups; ++g) {
+                if (m[g] == 1) ++once;
+                else if (m[g] == 0) ++never;
+                else ++twice;
+            }
+            if (once != groups || m[groups] != 0)
+                std::fprintf(stderr, "indirect_clamp_test: %u x %u x %u: %u group(s) ran once, %u never, %u more than "
+                             "once, %u past the end\n", c.x, c.y, c.z, once, never, twice, m[groups]);
+            CHECK(once == groups && never == 0 && twice == 0 && m[groups] == 0);
+        }
+        reinterpret_cast<PFN_vkDestroyPipeline>(vkfn("vkDestroyPipeline"))(device.device, pipeline, nullptr);
+        reinterpret_cast<PFN_vkDestroyPipelineLayout>(vkfn("vkDestroyPipelineLayout"))(device.device, layout, nullptr);
+        reinterpret_cast<PFN_vkDestroyShaderModule>(vkfn("vkDestroyShaderModule"))(device.device, module, nullptr);
     }
 
     // Every case above ran under validation when LEONIDA_VK_VALIDATION=1.
