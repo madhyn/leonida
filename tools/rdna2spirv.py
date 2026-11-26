@@ -17874,7 +17874,8 @@ def translate(path):
                 while pos in bad and not same_encoding(blob[pos:pos + len(enc)], enc, op, operand_count):
                     pos += 4
                 window = blob[pos:pos + len(enc)]
-                if not same_encoding(window, enc, op, operand_count):
+                if not same_encoding(window, enc, op, operand_count) and \
+                        not restore_dot4_inline_sel(ins, window, enc):
                     literal = mix_literal(window, enc, base_op(op))
                     if literal is not None:
                         restore_mix_literal(ins, window, literal)

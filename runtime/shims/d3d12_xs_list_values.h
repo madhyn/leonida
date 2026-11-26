@@ -602,7 +602,10 @@ private:
             stall_logged_ = false;
             return;
         }
-        const std::uint64_t ms = GetTickCount64() - since;
+        // release_loop stores the start with its low bit set, so on an even tick it is 1 ms ahead of the clock: read
+        // in that millisecond, the difference would wrap to 2^64 - 1 and report a stall that has not happened.
+        const std::uint64_t now = GetTickCount64();
+        const std::uint64_t ms = now > since ? now - since : 0;
         if (ms < kStallMs || stall_logged_) return;
         stall_logged_ = true;
         bump(counters().release_stalls);

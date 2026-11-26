@@ -68,8 +68,8 @@ public:
         std::unique_lock lock(mutex_);
         const auto it = ranges_.find(title_va);
         if (it != ranges_.end() && it->second.shader_va == shader_va) {
+            record_invalidation(it->first, it->second.end);
             ranges_.erase(it);
-            invalidations_.fetch_add(1, std::memory_order_release);
         }
         count_.store(ranges_.size(), std::memory_order_release);
     }
@@ -314,6 +314,19 @@ public:
 
     std::size_t size() const { return count_.load(std::memory_order_acquire); }
     std::uint64_t invalidations() const { return invalidations_.load(std::memory_order_acquire); }
+    bool invalidated_ranges_since(std::uint64_t since, std::uint64_t& current,
+                                  std::vector<std::pair<std::uint64_t, std::uint64_t>>& out) const {
+        out.clear();
+        current = invalidations_.load(std::memory_order_acquire);
+        if (current == since) return true;
+        std::shared_lock lock(mutex_);
+        current = invalidations_.load(std::memory_order_relaxed);
+        if (current == since) return true;
+        if (current - since > kInvalidRingSize) return false;
+        out.reserve(std::size_t(current - since));
+        for (std::uint64_t s = since; s < current; ++s) out.push_back(invalid_ring_[s % kInvalidRingSize]);
+        return true;
+    }
     void note_translation(Kind kind) { translated_[kind].fetch_add(1, std::memory_order_relaxed); }
     std::uint64_t translated(Kind kind) const { return translated_[kind].load(std::memory_order_relaxed); }
     std::uint64_t untranslated(Kind kind) const { return untranslated_[kind].load(std::memory_order_relaxed); }
@@ -323,6 +336,13 @@ private:
         std::uint64_t end;        // exclusive
         std::uint64_t shader_va;  // what the range's first byte becomes
     };
+    static constexpr std::size_t kInvalidRingSize = 512;
+
+    void record_invalidation(std::uint64_t lo, std::uint64_t hi) {
+        const auto seq = invalidations_.load(std::memory_order_relaxed);
+        invalid_ring_[seq % kInvalidRingSize] = {lo, hi};
+        invalidations_.store(seq + 1, std::memory_order_release);
+    }
 
     void erase_overlapping(std::uint64_t begin, std::uint64_t end) {
         auto it = ranges_.lower_bound(begin);
@@ -330,14 +350,17 @@ private:
             auto previous = std::prev(it);
             if (previous->second.end > begin) it = previous;
         }
-        if (it != ranges_.end() && it->first < end) invalidations_.fetch_add(1, std::memory_order_release);
-        while (it != ranges_.end() && it->first < end) it = ranges_.erase(it);
+        while (it != ranges_.end() && it->first < end) {
+            record_invalidation(it->first, it->second.end);
+            it = ranges_.erase(it);
+        }
     }
 
     mutable std::shared_mutex mutex_;
     std::map<std::uint64_t, Range> ranges_;  // by title VA
     std::atomic<std::size_t> count_{0};
     std::atomic<std::uint64_t> invalidations_{};
+    std::array<std::pair<std::uint64_t, std::uint64_t>, kInvalidRingSize> invalid_ring_{};
     std::mutex hook_mutex_;
     void* hook_context_ = nullptr;
     void* maker_context_ = nullptr;

@@ -2857,16 +2857,34 @@ struct DeviceState {
     }
 
     // Indexed by actual Vulkan address, never by a placed buffer's CPU address.
+    static constexpr std::size_t kReleasedRingSize = 512;
     std::atomic<uint64_t> released_backings{};
     std::mutex backing_mutex;
     leonida::BufferVaIndex<uint64_t> gpu_backings;
+    std::array<std::pair<std::uint64_t, std::uint64_t>, kReleasedRingSize> released_ranges_{};
     void backing(VkDeviceAddress address, uint64_t bytes, uint64_t id, bool add) {
         std::lock_guard lock(backing_mutex);
         if (add) gpu_backings.insert(address, bytes, id);
         else {
             gpu_backings.erase(address, id);
-            released_backings.fetch_add(1, std::memory_order_release);
+            const auto seq = released_backings.load(std::memory_order_relaxed);
+            const auto end = bytes <= UINT64_MAX - address ? address + bytes : UINT64_MAX;
+            released_ranges_[seq % kReleasedRingSize] = {address, end};
+            released_backings.store(seq + 1, std::memory_order_release);
         }
+    }
+    bool released_ranges_since(std::uint64_t since, std::uint64_t& current,
+                               std::vector<std::pair<std::uint64_t, std::uint64_t>>& out) {
+        out.clear();
+        current = released_backings.load(std::memory_order_acquire);
+        if (current == since) return true;
+        std::lock_guard lock(backing_mutex);
+        current = released_backings.load(std::memory_order_relaxed);
+        if (current == since) return true;
+        if (current - since > kReleasedRingSize) return false;
+        out.reserve(std::size_t(current - since));
+        for (std::uint64_t s = since; s < current; ++s) out.push_back(released_ranges_[s % kReleasedRingSize]);
+        return true;
     }
 
     enum class VsharpPath { table, shadow, scratch };
@@ -2923,7 +2941,13 @@ struct DeviceState {
         return 0;
     }
 
-    VsharpResult fix_vsharp(uint32_t* w, VsharpPath path) {
+    struct VsharpResolved {
+        std::uint64_t title_lo = 0, title_hi = 0;
+        std::uint64_t cpu_lo = 0, cpu_hi = 0;
+        std::uint64_t bda_lo = 0, bda_hi = 0;
+    };
+
+    VsharpResult fix_vsharp(uint32_t* w, VsharpPath path, VsharpResolved* resolved = nullptr) {
         if ((w[3] >> 30) || !w[2]) return VsharpResult::unchanged; // image, empty slot or raw pointer
         const uint64_t base = uint64_t(w[0]) | (uint64_t(w[1] & 0xffff) << 32);
         const uint32_t stride = (w[1] >> 16) & 0x3fffu;
@@ -2944,6 +2968,18 @@ struct DeviceState {
             }
             w[0] = w[1] = w[2] = 0;
             return VsharpResult::empty;
+        }
+        if (resolved) {
+            resolved->title_lo = base;
+            resolved->title_hi = span <= UINT64_MAX - base ? base + span : UINT64_MAX;
+            const std::uint64_t cpu = leonida::title_gpu_views::to_cpu(base, span);
+            if (cpu != base) {
+                resolved->cpu_lo = cpu;
+                resolved->cpu_hi = span <= UINT64_MAX - cpu ? cpu + span : UINT64_MAX;
+            }
+            const std::uint64_t bda = arena.address + to;
+            resolved->bda_lo = bda;
+            resolved->bda_hi = span <= UINT64_MAX - bda ? bda + span : UINT64_MAX;
         }
         if ((to & ((1ull << 48) - 1)) == base) return VsharpResult::unchanged;
         w[0] = uint32_t(to);
@@ -3216,8 +3252,13 @@ struct DeviceState {
         std::vector<std::uint8_t> made;    // the title's bytes each arena slot was last made from
         std::vector<std::uint8_t> retry;   // per slot: not settled yet (fix_console_slot), in `retries`
         std::vector<std::uint32_t> retries;
-        std::vector<std::uint8_t> live_vsharp;  // per slot: buffer V# tracked in `live_vsharp_slots`
-        std::vector<std::uint32_t> live_vsharp_slots;
+        struct LiveVsharp {
+            std::uint32_t slot = 0;
+            std::uint32_t pad = 0;
+            VsharpResolved halves[2]{};
+        };
+        std::vector<std::uint32_t> live_vsharp_pos;  // per slot: index in `live_vsharps`, or UINT32_MAX
+        std::vector<LiveVsharp> live_vsharps;
         std::set<std::uint32_t> empty_slots;
         std::uint32_t next_empty = 0;
         std::size_t retry_at = 0;  // where retry_console_slots goes on
@@ -3262,16 +3303,81 @@ struct DeviceState {
         return true;
     }
 
+    static void clear_live_vsharp(ConsoleHeap& heap, std::size_t slot) {
+        if (slot >= heap.live_vsharp_pos.size()) return;
+        const std::uint32_t pos = heap.live_vsharp_pos[slot];
+        if (pos == UINT32_MAX) return;
+        const std::size_t last = heap.live_vsharps.size() - 1;
+        if (pos != last) {
+            const auto moved = heap.live_vsharps[last];
+            heap.live_vsharps[pos] = moved;
+            heap.live_vsharp_pos[moved.slot] = pos;
+        }
+        heap.live_vsharps.pop_back();
+        heap.live_vsharp_pos[slot] = UINT32_MAX;
+    }
+
+    static void set_live_vsharp(ConsoleHeap& heap, std::size_t slot, const VsharpResolved (&halves)[2]) {
+        if (slot >= heap.live_vsharp_pos.size()) return;
+        ConsoleHeap::LiveVsharp entry{std::uint32_t(slot), 0, {halves[0], halves[1]}};
+        const std::uint32_t pos = heap.live_vsharp_pos[slot];
+        if (pos == UINT32_MAX) {
+            heap.live_vsharp_pos[slot] = std::uint32_t(heap.live_vsharps.size());
+            heap.live_vsharps.push_back(entry);
+        } else {
+            heap.live_vsharps[pos] = entry;
+        }
+    }
+
+    static void sort_merge_ranges(std::vector<std::pair<std::uint64_t, std::uint64_t>>& r) {
+        if (r.size() <= 1) return;
+        std::sort(r.begin(), r.end());
+        std::size_t out = 0;
+        for (std::size_t i = 1; i < r.size(); ++i) {
+            if (r[i].first <= r[out].second) r[out].second = std::max(r[out].second, r[i].second);
+            else r[++out] = r[i];
+        }
+        r.resize(out + 1);
+    }
+
+    static bool ranges_overlap(const std::vector<std::pair<std::uint64_t, std::uint64_t>>& sorted,
+                               std::uint64_t lo, std::uint64_t hi) {
+        if (sorted.empty() || lo >= hi || hi <= sorted.front().first || lo >= sorted.back().second) return false;
+        if (sorted.size() <= 8) {
+            for (const auto& [a, b] : sorted)
+                if (lo < b && hi > a) return true;
+            return false;
+        }
+        auto it = std::upper_bound(sorted.begin(), sorted.end(), lo,
+                                   [](std::uint64_t val, const auto& p) { return val < p.first; });
+        if (it != sorted.end() && it->first < hi) return true;
+        if (it != sorted.begin() && std::prev(it)->second > lo) return true;
+        return false;
+    }
+
+    static bool live_vsharp_affected(const ConsoleHeap::LiveVsharp& e,
+                                     const std::vector<std::pair<std::uint64_t, std::uint64_t>>& rel,
+                                     const std::vector<std::pair<std::uint64_t, std::uint64_t>>& ali) {
+        for (const auto& h : e.halves) {
+            if (!h.title_hi) continue;
+            if (ranges_overlap(rel, h.bda_lo, h.bda_hi)) return true;
+            if (ranges_overlap(ali, h.title_lo, h.title_hi)) return true;
+            if (h.cpu_hi && ranges_overlap(ali, h.cpu_lo, h.cpu_hi)) return true;
+        }
+        return false;
+    }
+
     // Slot `slot` of a heap copy, as the title wrote it, fixed up as described above. True when it is settled: not a
     // T# whose texture is still to come, nor a V# into the title's memory that got no copy.
     bool fix_console_slot(ConsoleHeap& heap, std::size_t slot) {
         std::uint32_t w[kDescriptorSize / 4];
         std::memcpy(w, heap.previous + slot * kDescriptorSize, kDescriptorSize);
         bool settled = true, empty = false;
+        VsharpResolved halves[2]{};
         if (!(w[3] >> 30)) {
             const auto path = heap.scratch ? VsharpPath::scratch : VsharpPath::shadow;
-            const auto result = fix_vsharp(w, path);
-            const auto counter = fix_vsharp(w + 4, path);
+            const auto result = fix_vsharp(w, path, &halves[0]);
+            const auto counter = fix_vsharp(w + 4, path, &halves[1]);
             if (result == VsharpResult::rebased) ++heap.vsharps;
             if (result == VsharpResult::empty || counter == VsharpResult::empty) {
                 ++heap.unbacked;
@@ -3299,7 +3405,7 @@ struct DeviceState {
             }
             if (fix_second_half && !(w[7] >> 30) && w[6]) {
                 const auto path = heap.scratch ? VsharpPath::scratch : VsharpPath::shadow;
-                const auto counter = fix_vsharp(w + 4, path);
+                const auto counter = fix_vsharp(w + 4, path, &halves[1]);
                 if (counter == VsharpResult::rebased) ++heap.vsharps;
                 if (counter == VsharpResult::empty) {
                     ++heap.unbacked;
@@ -3309,15 +3415,9 @@ struct DeviceState {
         }
         if (empty) heap.empty_slots.insert(std::uint32_t(slot));
         else if (!heap.empty_slots.empty()) heap.empty_slots.erase(std::uint32_t(slot));
-        const bool track_vsharp = heap.resource_heap && !(w[3] >> 30) && (w[2] || w[6]);
-        if (slot < heap.live_vsharp.size()) {
-            if (track_vsharp && !heap.live_vsharp[slot]) {
-                heap.live_vsharp[slot] = 1;
-                heap.live_vsharp_slots.push_back(std::uint32_t(slot));
-            } else if (!track_vsharp) {
-                heap.live_vsharp[slot] = 0;
-            }
-        }
+        const bool track_vsharp = heap.resource_heap && !(w[3] >> 30) && (halves[0].title_hi || halves[1].title_hi);
+        if (track_vsharp) set_live_vsharp(heap, slot, halves);
+        else clear_live_vsharp(heap, slot);
         std::memcpy(heap.copy + slot * kDescriptorSize, w, kDescriptorSize);
         return settled;
     }
@@ -3348,7 +3448,7 @@ struct DeviceState {
                 std::chrono::steady_clock::now() - heap.fix_start >= std::chrono::microseconds(budget_us))
                 heap.fix_over = true;
             if (heap.fix_over) {
-                if (slot < heap.live_vsharp.size()) heap.live_vsharp[slot] = 0;
+                clear_live_vsharp(heap, slot);
                 std::memset(heap.copy + at, 0, kDescriptorSize);
                 ++heap.deferred_fixes;
                 if (!heap.retry[slot]) {
@@ -3436,7 +3536,7 @@ struct DeviceState {
             heap.empty_slots.erase(heap.empty_slots.lower_bound(first), heap.empty_slots.lower_bound(end));
             for (auto slot = first; slot < end; ++slot) {
                 heap.retry[slot] = 0;
-                heap.live_vsharp[slot] = 0;
+                clear_live_vsharp(heap, slot);
             }
         });
         const auto t1 = clock::now();
@@ -3444,32 +3544,38 @@ struct DeviceState {
         heap.fix_over = false;
         heap.fix_count = 0;
         heap.pages->for_each_copied([&](std::size_t offset, std::size_t bytes) { fix_console_slots(heap, offset, bytes); });
-        const auto generation = released_backings.load(std::memory_order_acquire);
-        const auto alias_generation = leonida::title_va_aliases().invalidations();
-        if (heap.resource_heap && (generation != heap.checked_generation || alias_generation != heap.alias_generation)) {
-            heap.alias_generation = alias_generation;
+        std::uint64_t generation = heap.checked_generation;
+        std::uint64_t alias_generation = heap.alias_generation;
+        if (heap.resource_heap && !heap.live_vsharps.empty()) {
+            thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>> rel_ranges;
+            thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>> ali_ranges;
+            const bool rel_ok = released_ranges_since(heap.checked_generation, generation, rel_ranges);
+            const bool ali_ok = leonida::title_va_aliases().invalidated_ranges_since(heap.alias_generation, alias_generation, ali_ranges);
             heap.checked_generation = generation;
-            // Even an unchanged title slot may name a buffer released since the last submission.
-            // Scan only active buffer V# slots via fix_console_slot() (which reads cached `heap.previous`)
-            // instead of walking all slots in WC-VRAM `heap.copy`.
-            for (std::size_t i = 0; i < heap.live_vsharp_slots.size();) {
-                const auto slot = heap.live_vsharp_slots[i];
-                if (!heap.live_vsharp[slot]) {
-                    heap.live_vsharp_slots[i] = heap.live_vsharp_slots.back();
-                    heap.live_vsharp_slots.pop_back();
-                    continue;
+            heap.alias_generation = alias_generation;
+            const bool full_rescan = !rel_ok || !ali_ok;
+            if (full_rescan || !rel_ranges.empty() || !ali_ranges.empty()) {
+                if (!full_rescan) {
+                    sort_merge_ranges(rel_ranges);
+                    sort_merge_ranges(ali_ranges);
                 }
-                if (!fix_console_slot(heap, slot) && !heap.retry[slot]) {
-                    heap.retry[slot] = 1;
-                    heap.retries.push_back(uint32_t(slot));
+                for (std::size_t i = 0; i < heap.live_vsharps.size();) {
+                    const auto& entry = heap.live_vsharps[i];
+                    if (!full_rescan && !live_vsharp_affected(entry, rel_ranges, ali_ranges)) {
+                        ++i;
+                        continue;
+                    }
+                    const auto slot = entry.slot;
+                    if (!fix_console_slot(heap, slot) && !heap.retry[slot]) {
+                        heap.retry[slot] = 1;
+                        heap.retries.push_back(slot);
+                    }
+                    if (i < heap.live_vsharps.size() && heap.live_vsharps[i].slot == slot) ++i;
                 }
-                if (!heap.live_vsharp[slot]) {
-                    heap.live_vsharp_slots[i] = heap.live_vsharp_slots.back();
-                    heap.live_vsharp_slots.pop_back();
-                    continue;
-                }
-                ++i;
             }
+        } else {
+            heap.checked_generation = released_backings.load(std::memory_order_acquire);
+            heap.alias_generation = leonida::title_va_aliases().invalidations();
         }
         const auto t2 = clock::now();
         // A settled zero can acquire GPU backing without a CPU map event. Probe at most eight in
@@ -3687,7 +3793,7 @@ struct DeviceState {
                 heap->previous = heap->made.data();
             }
             heap->retry.assign(std::size_t(bytes / kDescriptorSize), 0);
-            heap->live_vsharp.assign(std::size_t(bytes / kDescriptorSize), 0);
+            heap->live_vsharp_pos.assign(std::size_t(bytes / kDescriptorSize), UINT32_MAX);
             heap->pages = make_shadow_pages(reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(console_va)),
                                             heap->input, std::size_t(bytes));
         }
@@ -9223,13 +9329,17 @@ private:
         bool queued = false;
         try {
             queued = PipelineCompiler::instance().submit(state, state, SIZE_MAX, [state, cache] {
+                bool saved = true;
                 try {
-                    if (!state->active_compiles.load() && !PipelineCompiler::instance().has_compile_waiter())
+                    if (PipelineCompiler::instance().has_compile_waiter()) {
+                        saved = false;
+                    } else {
                         save_session_pipeline_cache(state->context->vk, state->info.device, cache, true);
+                    }
                 } catch (const std::exception& e) {
                     std::fprintf(stderr, "[rt] pipeline cache checkpoint failed: %s\n", e.what());
                 }
-                state->next_checkpoint.store(GetTickCount64() + 15000);
+                state->next_checkpoint.store(GetTickCount64() + (saved ? 15000 : 2000));
             });
         } catch (...) {
         }
@@ -17982,16 +18092,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     std::vector<VkQueueFamilyProperties> families(family_count);
     vkGetPhysicalDeviceQueueFamilyProperties(info.physical, &family_count, families.data());
     const std::uint32_t queue_cap = max_queues_per_family(queue_test_settings);
-    const std::uint32_t command_queue_count = std::min(queue_cap, families[info.queue_family].queueCount);
     std::vector<float> priorities(16, 1.0f);
-    std::vector<VkDeviceQueueCreateInfo> queue_infos;
-    {
-        VkDeviceQueueCreateInfo q{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
-        q.queueFamilyIndex = info.queue_family;
-        q.queueCount = command_queue_count;
-        q.pQueuePriorities = priorities.data();
-        queue_infos.push_back(q);
-    }
     const auto preferred = leonida::pick_queue_families(families, info.queue_family);
     // D3D12 permits UpdateTileMappings on DIRECT, COMPUTE and COPY queues. Vulkan requires
     // VK_QUEUE_SPARSE_BINDING_BIT on the VkQueue passed to vkQueueBindSparse. A dedicated
@@ -18002,27 +18103,40 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
                                 chosen_features.sparseResidencyAliased;
     auto picked = leonida::sparse_capable_queue_families(families, preferred, sparse_buffers);
     if (graphics_family_only(queue_test_settings)) picked = {info.queue_family, info.queue_family, info.queue_family};
-    std::uint32_t compute_count = 0, copy_count = 0;
-    if (picked.compute != info.queue_family) {
-        info.compute_family = picked.compute;
-        compute_count = std::min(queue_cap, families[picked.compute].queueCount);
-        VkDeviceQueueCreateInfo q{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
-        q.queueFamilyIndex = picked.compute;
-        q.queueCount = compute_count;
-        q.pQueuePriorities = priorities.data();
-        queue_infos.push_back(q);
-    }
-    if (picked.copy != info.queue_family) {
-        info.copy_family = picked.copy;
-        if (picked.copy != picked.compute) {
-            copy_count = std::min(queue_cap, families[picked.copy].queueCount);
+    if (picked.compute != info.queue_family) info.compute_family = picked.compute;
+    if (picked.copy != info.queue_family) info.copy_family = picked.copy;
+    std::uint32_t command_queue_count = 0, compute_count = 0, copy_count = 0;
+    std::vector<VkDeviceQueueCreateInfo> queue_infos;
+    const auto build_queues = [&](std::uint32_t cap) {
+        queue_infos.clear();
+        command_queue_count = std::min(cap, families[info.queue_family].queueCount);
+        {
+            VkDeviceQueueCreateInfo q{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
+            q.queueFamilyIndex = info.queue_family;
+            q.queueCount = command_queue_count;
+            q.pQueuePriorities = priorities.data();
+            queue_infos.push_back(q);
+        }
+        compute_count = 0;
+        copy_count = 0;
+        if (picked.compute != info.queue_family) {
+            compute_count = std::min(cap, families[picked.compute].queueCount);
+            VkDeviceQueueCreateInfo q{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
+            q.queueFamilyIndex = picked.compute;
+            q.queueCount = compute_count;
+            q.pQueuePriorities = priorities.data();
+            queue_infos.push_back(q);
+        }
+        if (picked.copy != info.queue_family && picked.copy != picked.compute) {
+            copy_count = std::min(cap, families[picked.copy].queueCount);
             VkDeviceQueueCreateInfo q{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
             q.queueFamilyIndex = picked.copy;
             q.queueCount = copy_count;
             q.pQueuePriorities = priorities.data();
             queue_infos.push_back(q);
         }
-    }
+    };
+    build_queues(queue_cap);
     VkPhysicalDeviceFeatures enable{};
     enable.sparseBinding = chosen_features.sparseBinding;
     enable.sparseResidencyBuffer = chosen_features.sparseResidencyBuffer;
@@ -18456,8 +18570,16 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
                              "debug info, resource tracking or checkpoints\n");
     device_info.enabledExtensionCount = std::uint32_t(device_extensions.size());
     device_info.ppEnabledExtensionNames = device_extensions.empty() ? nullptr : device_extensions.data();
-    if (vkCreateDevice(info.physical, &device_info, nullptr, &owned.device) != VK_SUCCESS)
-        return fail("vkCreateDevice failed");
+    VkResult create_res = vkCreateDevice(info.physical, &device_info, nullptr, &owned.device);
+    for (std::uint32_t cap = queue_cap / 2; create_res != VK_SUCCESS && cap >= 1; cap /= 2) {
+        build_queues(cap);
+        device_info.queueCreateInfoCount = std::uint32_t(queue_infos.size());
+        device_info.pQueueCreateInfos = queue_infos.data();
+        create_res = vkCreateDevice(info.physical, &device_info, nullptr, &owned.device);
+        if (create_res == VK_SUCCESS)
+            std::fprintf(stderr, "[rt] d3d12: vkCreateDevice succeeded after capping queues per family to %u\n", cap);
+    }
+    if (create_res != VK_SUCCESS) return fail("vkCreateDevice failed");
     info.device = owned.device;
     owned.destroy_device = reinterpret_cast<PFN_vkDestroyDevice>(vkGetDeviceProcAddr(owned.device, "vkDestroyDevice"));
     info.command_queues.resize(command_queue_count);
