@@ -7,6 +7,7 @@
 #include "../shims/d3d12_com.h"
 #include <d3d12sdklayers.h>
 #include <dxgi1_4.h>
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <vector>
@@ -72,8 +73,9 @@ unsigned char upload_byte(UINT64 index) {
     return static_cast<unsigned char>(index * 7 + 3);
 }
 
-// Pack the destination footprint rows for the copied mip, or every mip for CopyResource.
-bool run(ID3D12Device* dev, const Case& c, std::vector<unsigned char>& out, HRESULT& close_hr) {
+// Pack the destination footprint rows for the copied subresource, or every mip and layer for CopyResource.
+bool run(ID3D12Device* dev, const Case& c, std::vector<unsigned char>& out, HRESULT& close_hr,
+         const std::vector<unsigned char>& packed_upload = {}, bool check_replay = false) {
     D3D12_COMMAND_QUEUE_DESC qd{};
     Ref<ID3D12CommandQueue> q;
     Ref<ID3D12CommandAllocator> a;
@@ -84,14 +86,19 @@ bool run(ID3D12Device* dev, const Case& c, std::vector<unsigned char>& out, HRES
         FAILED(dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, a.p, nullptr, IID_PPV_ARGS(&l.p))) ||
         FAILED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence.p))))
         return false;
-    // One array layer. Upload every source mip so both copy calls have initialized input.
-    const UINT ns = c.src.MipLevels, nd = c.dst.MipLevels;
-    D3D12_PLACED_SUBRESOURCE_FOOTPRINT sf[16]{}, df[16]{};
-    UINT rows[16]{};
-    UINT64 row_bytes[16]{};
+    const UINT ns = UINT(c.src.MipLevels) * c.src.DepthOrArraySize, nd = UINT(c.dst.MipLevels) * c.dst.DepthOrArraySize;
+    std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> sf(ns), df(nd);
+    std::vector<UINT> source_rows(ns), rows(nd);
+    std::vector<UINT64> source_row_bytes(ns), row_bytes(nd);
     UINT64 sbytes = 0, dbytes = 0;
-    dev->GetCopyableFootprints(&c.src, 0, ns, 0, sf, nullptr, nullptr, &sbytes);
-    dev->GetCopyableFootprints(&c.dst, 0, nd, 0, df, rows, row_bytes, &dbytes);
+    dev->GetCopyableFootprints(&c.src, 0, ns, 0, sf.data(), source_rows.data(), source_row_bytes.data(), &sbytes);
+    dev->GetCopyableFootprints(&c.dst, 0, nd, 0, df.data(), rows.data(), row_bytes.data(), &dbytes);
+    if (!packed_upload.empty()) {
+        UINT64 payload = 0;
+        if (source_rows != rows || source_row_bytes != row_bytes) return false;
+        for (UINT i = 0; i < ns; ++i) payload += source_rows[i] * source_row_bytes[i];
+        if (payload != packed_upload.size()) return false;
+    }
     D3D12_HEAP_PROPERTIES def{D3D12_HEAP_TYPE_DEFAULT}, up{D3D12_HEAP_TYPE_UPLOAD}, rb{D3D12_HEAP_TYPE_READBACK};
     Ref<ID3D12Resource> src, dst, upload, readback;
     const D3D12_RESOURCE_DESC ub = buf(sbytes), rbd = buf(dbytes);
@@ -121,6 +128,16 @@ bool run(ID3D12Device* dev, const Case& c, std::vector<unsigned char>& out, HRES
             for (UINT64 x = 0; x < bytes_per_row; ++x) row[x] = upload_byte(y * bytes_per_row + x);
         }
     }
+    if (!packed_upload.empty()) {
+        const unsigned char* input = packed_upload.data();
+        for (UINT i = 0; i < ns; ++i) {
+            for (UINT y = 0; y < source_rows[i]; ++y) {
+                auto* row = p + sf[i].Offset + UINT64(y) * sf[i].Footprint.RowPitch;
+                std::memcpy(row, input, size_t(source_row_bytes[i]));
+                input += source_row_bytes[i];
+            }
+        }
+    }
     upload->Unmap(0, nullptr);
     if (FAILED(readback->Map(0, nullptr, reinterpret_cast<void**>(&p)))) return false;
     std::memset(p, 0xcd, size_t(dbytes));
@@ -143,8 +160,8 @@ bool run(ID3D12Device* dev, const Case& c, std::vector<unsigned char>& out, HRES
     }
     b = transition(dst.p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
     l->ResourceBarrier(1, &b);
-    const UINT first_mip = c.whole ? 0 : c.dst_mip, end_mip = c.whole ? nd : c.dst_mip + 1;
-    for (UINT i = first_mip; i < end_mip; ++i) {
+    const UINT first = c.whole ? 0 : c.dst_mip, end = c.whole ? nd : c.dst_mip + 1;
+    for (UINT i = first; i < end; ++i) {
         D3D12_TEXTURE_COPY_LOCATION rs{dst.p}, rd{readback.p, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
         rs.SubresourceIndex = i;
         rd.PlacedFootprint = df[i];
@@ -154,15 +171,24 @@ bool run(ID3D12Device* dev, const Case& c, std::vector<unsigned char>& out, HRES
     if (FAILED(close_hr)) return false;
     ID3D12CommandList* lists[] = {l.p};
     q->ExecuteCommandLists(1, lists);
-    q->Signal(fence.p, 1);
+    if (check_replay) {
+        const auto result = rt::d3d12::last_execute_result(q.p);
+        if (result != leonida::ReplayResult::success) {
+            std::fprintf(stderr, "%s: Vulkan replay returned %s (%d)\n", c.name,
+                         result == leonida::ReplayResult::invalid_copy ? "invalid_copy" : "error", static_cast<int>(result));
+            return false;
+        }
+    }
+    if (FAILED(q->Signal(fence.p, 1))) return false;
     HANDLE e = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    fence->SetEventOnCompletion(1, e);
-    WaitForSingleObject(e, 10000);
+    if (!e) return false;
+    const bool complete = SUCCEEDED(fence->SetEventOnCompletion(1, e)) && WaitForSingleObject(e, 10000) == WAIT_OBJECT_0;
     CloseHandle(e);
+    if (!complete || fence->GetCompletedValue() != 1 || FAILED(dev->GetDeviceRemovedReason())) return false;
     if (FAILED(readback->Map(0, nullptr, reinterpret_cast<void**>(&p)))) return false;
     // Compare the bytes inside the rows and leave footprint padding out.
     out.clear();
-    for (UINT i = first_mip; i < end_mip; ++i)
+    for (UINT i = first; i < end; ++i)
         for (UINT r = 0; r < rows[i]; ++r) {
             const unsigned char* row = p + df[i].Offset + r * df[i].Footprint.RowPitch;
             out.insert(out.end(), row, row + row_bytes[i]);
@@ -184,11 +210,72 @@ void drain(ID3D12Device* host) {
     }
     iq->ClearStoredMessages();
 }
+
+bool check_bc_mip_tails(ID3D12Device* ours, IDXGIFactory4* factory) {
+    Ref<IDXGIAdapter> adapter;
+    Ref<ID3D12Device> warp;
+    if (FAILED(factory->EnumWarpAdapter(IID_PPV_ARGS(&adapter.p))) ||
+        FAILED(D3D12CreateDevice(adapter.p, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&warp.p)))) {
+        std::fprintf(stderr, "BC mip tails require a native D3D12 WARP device\n");
+        return false;
+    }
+    const auto adapter_name = hostadapter::description(adapter.p);
+    struct Format { const char* name; DXGI_FORMAT src, dst; UINT texel_bytes; };
+    const Format formats[] = {
+        {"BC1", DXGI_FORMAT_R32G32_UINT, DXGI_FORMAT_BC1_UNORM, 8},
+        {"BC7", DXGI_FORMAT_R32G32B32A32_UINT, DXGI_FORMAT_BC7_UNORM, 16},
+    };
+    constexpr UINT16 levels = 4;
+    unsigned matched = 0, subresources = 0;
+    size_t bytes = 0;
+    for (const auto& format : formats) {
+        for (const UINT width : {8u, 1u}) {
+            const UINT height = width == 8 ? 1 : 8;
+            for (UINT16 layers = 1; layers <= 2; ++layers) {
+                Case c{format.name, mips(tex(format.src, width, height), levels),
+                       mips(tex(format.dst, 4 * width, 4 * height), levels), true, false};
+                c.src.DepthOrArraySize = c.dst.DepthOrArraySize = layers;
+                // One source texel becomes one BC block. Build the expected packed rows from the source
+                // dimensions alone, in D3D12 subresource order. Mips, layers and rows have distinct data.
+                std::vector<unsigned char> expected;
+                const UINT count = UINT(levels) * layers;
+                for (UINT sub = 0; sub < count; ++sub) {
+                    const UINT mip = sub % levels;
+                    const UINT row_bytes = std::max(1u, width >> mip) * format.texel_bytes;
+                    for (UINT row = 0; row < std::max(1u, height >> mip); ++row)
+                        for (UINT x = 0; x < row_bytes; ++x)
+                            expected.push_back(static_cast<unsigned char>(13 + sub * 43 + row * 91 + x * 19 + (x >> 2) * 7));
+                }
+                std::vector<unsigned char> native, vulkan;
+                HRESULT wh = E_FAIL, vh = E_FAIL;
+                const bool warp_ok = run(warp.p, c, native, wh, expected) && native == expected;
+                const bool vk_ok = run(ours, c, vulkan, vh, expected, true) && vulkan == expected;
+                if (!warp_ok || !vk_ok) {
+                    std::fprintf(stderr, "%s %ux%u, %u layers: expected %zu bytes; WARP (%s) %s (%zu bytes, "
+                                 "Close 0x%08lx), Vulkan %s (%zu bytes, Close 0x%08lx)\n", format.name, width, height,
+                                 UINT(layers), expected.size(), adapter_name.c_str(), warp_ok ? "matches" : "failed",
+                                 native.size(), static_cast<unsigned long>(wh), vk_ok ? "matches" : "failed",
+                                 vulkan.size(), static_cast<unsigned long>(vh));
+                    drain(warp.p);
+                    continue;
+                }
+                ++matched;
+                subresources += count;
+                bytes += expected.size();
+            }
+        }
+    }
+    std::printf("BC mip tails: %u/8 cases, %u subresources, %zu bytes match WARP (%s) and the upload\n",
+                matched, subresources, bytes, adapter_name.c_str());
+    return matched == 8;
+}
 }  // namespace
 
 int main() {
     vktest::Device vk;
-    if (!vk.create()) return 77;
+    const auto status = vk.initialize();
+    if (status == vktest::DeviceStatus::unavailable) return 77;
+    if (status != vktest::DeviceStatus::ready) return 1;
     Ref<ID3D12Debug> debug;
     const bool debug_on = SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debug.p)));
     if (debug_on) debug->EnableDebugLayer();
@@ -245,6 +332,7 @@ int main() {
     if (hostwine::host_is_wine()) return 77;  // vkd3d runs copies WARP refuses, so the controls can't hold
     Ref<IDXGIFactory4> factory;
     if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory.p)))) return 1;
+    const bool mip_tails_ok = check_bc_mip_tails(ours.p, factory.p);
     unsigned differ = 0, differ_depth = 0, compared = 0;
     for (const bool warp : {false, true}) {
         for (const Case& c : cases) {
@@ -307,5 +395,5 @@ int main() {
         std::printf("%u Vulkan validation errors\n", vk.validation_errors());
         return 1;
     }
-    return differ || differ_depth ? 1 : 0;
+    return !mip_tails_ok || differ || differ_depth ? 1 : 0;
 }

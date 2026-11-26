@@ -557,6 +557,144 @@ int main(int argc, char** argv) {
         vk.copy_scratch = {};
     }
 
+    // 8. Whole-resource reinterpret copies. One uncompressed texel is one BC block. The physical
+    // destination can end partway through that block on a lower mip, while the scratch holds all of its bytes.
+    {
+        ResourceBinding src = rgba_img, dst = rgba_img;
+        src.format = VK_FORMAT_R32G32B32A32_UINT;
+        dst.format = VK_FORMAT_BC7_UNORM_BLOCK;
+        dst.image = handle<VkImage>(9);
+        src.width = 8; src.height = 1;
+        dst.width = 32; dst.height = 4;
+        src.mip_levels = dst.mip_levels = 4;
+        src.array_layers = dst.array_layers = 2;
+        const auto resolve_bc = [&](ResourceId id) -> const ResourceBinding* {
+            if (id == 1) return &src;
+            if (id == 2) return &dst;
+            return id == 3 ? &src_buf : nullptr;
+        };
+        CommandList copy;
+        expect(copy.copy_resource({2, 1}) && copy.close(), "record BC CopyResource");
+        ReplayFunctions bc = vk;
+        const auto scratch = handle<VkBuffer>(0x9200);
+        VkBuffer supplied = scratch;
+        VkDeviceSize base = (UINT64_C(1) << 33) + 256, allocated = 0;
+        bool allocation_ok = true;
+        unsigned allocations = 0;
+        bc.copy_scratch = [&](VkDeviceSize bytes, VkBuffer& buffer, VkDeviceSize& offset) {
+            ++allocations;
+            allocated = bytes;
+            buffer = supplied;
+            offset = base;
+            return allocation_ok;
+        };
+        static bool scratch_dependency;
+        bc.pipeline_barrier = [](VkCommandBuffer, VkPipelineStageFlags from, VkPipelineStageFlags to, VkDependencyFlags,
+                                 std::uint32_t count, const VkMemoryBarrier* barriers, std::uint32_t,
+                                 const VkBufferMemoryBarrier*, std::uint32_t, const VkImageMemoryBarrier*) {
+            if (i2b_copies.empty() || !b2i_copies.empty() || !(from & VK_PIPELINE_STAGE_TRANSFER_BIT) ||
+                !(to & VK_PIPELINE_STAGE_TRANSFER_BIT)) return;
+            for (std::uint32_t i = 0; i < count; ++i)
+                if ((barriers[i].srcAccessMask & VK_ACCESS_TRANSFER_WRITE_BIT) &&
+                    (barriers[i].dstAccessMask & VK_ACCESS_TRANSFER_READ_BIT)) scratch_dependency = true;
+        };
+        const auto copy_bc = [&] {
+            image_copies.clear();
+            i2b_copies.clear();
+            b2i_copies.clear();
+            allocations = 0;
+            allocated = 0;
+            scratch_dependency = false;
+            return replay(copy, VK_NULL_HANDLE, resolve_bc, bc);
+        };
+        expect(copy_bc() == ReplayResult::success, "stage BC7 CopyResource with four mips and two layers");
+        expect(allocations == 1 && allocated == 480, "four BC7 mips in two layers need 480 scratch bytes");
+        expect(scratch_dependency, "scratch transfer writes are visible before the BC destination copy");
+        expect(image_copies.empty() && i2b_copies.size() == 4 && b2i_copies.size() == 4,
+               "all four mips stage, including the full-block first mip");
+        if (i2b_copies.size() == 4 && b2i_copies.size() == 4) {
+            const VkDeviceSize offsets[] = {0, 256, 384, 448};
+            const std::uint32_t bc_heights[] = {4, 2, 1, 1};
+            for (std::uint32_t mip = 0; mip < 4; ++mip) {
+                const auto& read = i2b_copies[mip];
+                const auto& write = b2i_copies[mip];
+                expect(read.imageExtent.width == (8u >> mip) && read.imageExtent.height == 1 &&
+                           write.imageExtent.width == (32u >> mip) && write.imageExtent.height == bc_heights[mip],
+                       "each copy uses its own physical mip extent");
+                for (const auto* region : {&read, &write}) {
+                    const auto& sub = region->imageSubresource;
+                    expect(sub.aspectMask == VK_IMAGE_ASPECT_COLOR_BIT && sub.mipLevel == mip &&
+                               sub.baseArrayLayer == 0 && sub.layerCount == 2 && region->imageExtent.depth == 1,
+                           "each mip includes both array layers");
+                    expect(region->bufferOffset == base + offsets[mip] && region->bufferRowLength == 0 &&
+                               region->bufferImageHeight == 0 && region->imageOffset.x == 0 &&
+                               region->imageOffset.y == 0 && region->imageOffset.z == 0,
+                           "mips use distinct tightly packed scratch ranges from the allocator's 64-bit base");
+                }
+            }
+        }
+
+        // Image transfers keep the existing whole-image predication policy, including the diagnostic count.
+        CommandList predicated;
+        expect(predicated.set_predication({3, 0, d3d12_predication::equal_zero}) &&
+                   predicated.copy_resource({2, 1}) && predicated.close(), "record predicated BC CopyResource");
+        bc.begin_conditional_rendering = [](VkCommandBuffer, const VkConditionalRenderingBeginInfoEXT*) {};
+        bc.end_conditional_rendering = [](VkCommandBuffer) {};
+        bc.prepare_predicate = [&](VkBuffer buffer, VkDeviceSize offset, PredicateCapture& out) {
+            out = {buffer, offset, scratch, 0, VK_NULL_HANDLE};
+            return true;
+        };
+        bc.capture_predicate = [](VkCommandBuffer, const PredicateCapture&) {};
+        PreparedList prepared;
+        expect(prepare(predicated, resolve_bc, bc, prepared) == ReplayResult::success &&
+                   prepared.unpredicated_copies == 1, "predicated staged image CopyResource counts once");
+
+        const auto rejected = [&](ReplayResult result, const char* reason) {
+            expect(copy_bc() == result && image_copies.empty() && i2b_copies.empty() && b2i_copies.empty(), reason);
+        };
+        const auto barrier = bc.pipeline_barrier;
+        bc.pipeline_barrier = nullptr;
+        rejected(ReplayResult::unsupported, "staging needs a transfer barrier between the two copies");
+        expect(allocations == 0, "reject a missing barrier before allocating scratch");
+        bc.pipeline_barrier = barrier;
+        allocation_ok = false;
+        rejected(ReplayResult::unsupported, "failed scratch allocation emits no BC copy");
+        allocation_ok = true;
+        supplied = VK_NULL_HANDLE;
+        rejected(ReplayResult::unsupported, "a null scratch handle emits no BC copy");
+        supplied = scratch;
+        base = 8;
+        rejected(ReplayResult::unsupported, "4-byte aligned scratch is insufficient for a 16-byte BC7 block");
+        base = UINT64_MAX - 15;
+        rejected(ReplayResult::unsupported, "aligned scratch base plus total byte count cannot wrap");
+        base = 256;
+        src.width = 1u << 29; dst.width = 1u << 31;
+        src.array_layers = dst.array_layers = 1u << 31;
+        rejected(ReplayResult::unsupported, "scratch byte count across array layers cannot wrap");
+        expect(allocations == 0, "reject an overflowing mip before allocating scratch");
+        src.width = 1u << 28; dst.width = 1u << 30;
+        src.array_layers = dst.array_layers = 0xc0000000u;
+        rejected(ReplayResult::unsupported, "scratch byte sum across individually representable mips cannot wrap");
+        expect(allocations == 0, "reject an overflowing mip sum before allocating scratch");
+
+        src.array_layers = dst.array_layers = 1;
+        src.width = src.height = 8;
+        dst.width = dst.height = 32;
+        expect(copy_bc() == ReplayResult::success && allocations == 0 && image_copies.size() == 4 &&
+                   i2b_copies.empty() && b2i_copies.empty(), "full-block mips keep direct vkCmdCopyImage");
+        src.width = 3; src.height = 1;
+        dst.width = 12; dst.height = 4;
+        src.mip_levels = dst.mip_levels = 2;
+        expect(copy_bc() == ReplayResult::success && b2i_copies.size() == 2 &&
+                   b2i_copies[1].imageExtent.width == 4 && b2i_copies[1].imageExtent.height == 2,
+               "stage partial BC edges while preserving unused destination blocks");
+        CommandList reverse;
+        expect(reverse.copy_resource({1, 2}) && reverse.close(), "record oversized reverse BC CopyResource");
+        allocations = 0;
+        expect(replay(reverse, VK_NULL_HANDLE, resolve_bc, bc) == ReplayResult::invalid_copy && allocations == 0,
+               "reject extra source blocks at mip 1 before allocating scratch");
+    }
+
     if (failures) return 1;
     std::printf("replay_copy_offset: CopyResource and CopyTexture apply ResourceBinding::buffer_offset\n");
     return 0;

@@ -2396,8 +2396,44 @@ inline bool stage_unaligned_tile(const ReplayFunctions& vk, Prepared& p, const R
     return true;
 }
 
+// Each uncompressed source texel supplies one BC block. Buffer-image copies can name the two
+// physical extents separately when the last destination block ends at a partial edge.
+inline ReplayResult stage_bc_resource_copy(Prepared& p, const ReplayFunctions& vk, BlockFormat dst_format) {
+    if (p.source.samples != 1) return ReplayResult::invalid_copy;
+    if (!vk.pipeline_barrier) return unsupported_at(__LINE__);
+    VkDeviceSize total = 0;
+    for (const VkImageCopy& copy : p.image_copies) {
+        const auto& extent = copy.extent;
+        const VkDeviceSize pixels = VkDeviceSize(extent.width) * extent.height;
+        const VkDeviceSize slices = VkDeviceSize(extent.depth) * copy.srcSubresource.layerCount;
+        if (!slices || pixels > (UINT64_MAX - total) / dst_format.bytes / slices)
+            return unsupported_at(__LINE__);
+        VkBufferImageCopy region{};
+        region.bufferOffset = total;
+        region.imageSubresource = copy.srcSubresource;
+        region.imageExtent = extent;
+        p.staged_reads.push_back(region);
+        const auto dst = mip_extent(p.binding, copy.dstSubresource.mipLevel);
+        region.imageSubresource = copy.dstSubresource;
+        region.imageExtent.width =
+            std::uint32_t(std::min<VkDeviceSize>(dst.width, VkDeviceSize(extent.width) * dst_format.block));
+        region.imageExtent.height =
+            std::uint32_t(std::min<VkDeviceSize>(dst.height, VkDeviceSize(extent.height) * dst_format.block));
+        p.staged_writes.push_back(region);
+        total += pixels * slices * dst_format.bytes;
+    }
+    VkDeviceSize base = 0;
+    if (!vk.copy_scratch || !vk.copy_scratch(total, p.staged, base) || !p.staged ||
+        base % dst_format.bytes || base > UINT64_MAX - total)
+        return unsupported_at(__LINE__);
+    for (auto& read : p.staged_reads) read.bufferOffset += base;
+    for (auto& write : p.staged_writes) write.bufferOffset += base;
+    p.image_copies.clear();
+    return ReplayResult::success;
+}
+
 // CopyResource: the whole buffer, or every subresource of two textures of the same shape.
-inline ReplayResult prepare_resource_copy(Prepared& p) {
+inline ReplayResult prepare_resource_copy(Prepared& p, const ReplayFunctions& vk) {
     if (p.binding.buffer && p.source.buffer) {
         if (p.binding.size != p.source.size || !p.source.size) return ReplayResult::invalid_copy;
         if (p.source.size > UINT64_MAX - p.source.buffer_offset ||
@@ -2414,8 +2450,9 @@ inline ReplayResult prepare_resource_copy(Prepared& p) {
     // A BC texture and one of its uncompressed equivalent match block for texel ("Format Conversion using
     // Direct3D 10.1"); the Vulkan extent is in source texels.
     const std::uint32_t sb = block_format(src.format, VK_IMAGE_ASPECT_COLOR_BIT).block;
-    const std::uint32_t db = block_format(dst.format, VK_IMAGE_ASPECT_COLOR_BIT).block;
-    const auto blocks = [](std::uint32_t size, std::uint32_t b) { return (size + b - 1) / b; };
+    const BlockFormat dst_format = block_format(dst.format, VK_IMAGE_ASPECT_COLOR_BIT);
+    const std::uint32_t db = dst_format.block;
+    const auto blocks = [](std::uint32_t size, std::uint32_t b) { return size / b + (size % b != 0); };
     const bool same_shape = sb == db ? dst.width == src.width && dst.height == src.height
                                      : blocks(dst.width, db) == blocks(src.width, sb) &&
                                            blocks(dst.height, db) == blocks(src.height, sb);
@@ -2423,28 +2460,30 @@ inline ReplayResult prepare_resource_copy(Prepared& p) {
         dst.depth != src.depth || dst.volume != src.volume || dst.mip_levels != src.mip_levels ||
         dst.array_layers != src.array_layers || (dst.aspects != src.aspects && !depth_colour_pair(dst, src)) ||
         dst.samples != src.samples || dst.rgb96 != src.rgb96 ||
-        block_format(dst.format, VK_IMAGE_ASPECT_COLOR_BIT).bytes != block_format(src.format, VK_IMAGE_ASPECT_COLOR_BIT).bytes)
+        dst_format.bytes != block_format(src.format, VK_IMAGE_ASPECT_COLOR_BIT).bytes)
         return ReplayResult::invalid_copy;
     // A depth <-> colour pair has one aspect on each side; the copies name each side's own (staged by the caller).
     const bool cross = dst.aspects != src.aspects;
+    bool stage_bc = false;
     for (const VkImageAspectFlags aspect : {VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_ASPECT_DEPTH_BIT, VK_IMAGE_ASPECT_STENCIL_BIT}) {
         if (!(dst.aspects & aspect)) continue;
         const VkImageAspectFlags src_aspect = cross ? src.aspects : aspect;
         for (std::uint32_t mip = 0; mip < dst.mip_levels; ++mip) {
             const VkExtent2D extent = mip_extent(src, mip), to = mip_extent(dst, mip);
-            // Lower mips can differ in blocks (BC 12x8 mip 1 is 2x1 blocks, R32G32 3x2 mip 1 is 1x1): more source
-            // blocks than the destination holds is refused, as by WARP. shortcut: a BC destination mip with a partial
-            // edge block cannot take a whole uncompressed texel per block in one vkCmdCopyImage; refused until such
-            // a copy is staged through a buffer.
-            if (sb != db && (blocks(extent.width, sb) * db > to.width || blocks(extent.height, sb) * db > to.height))
-                return ReplayResult::invalid_copy;
+            if (sb != db) {
+                // A lower mip may leave destination blocks untouched, but every source block must fit.
+                if (blocks(extent.width, sb) > blocks(to.width, db) || blocks(extent.height, sb) > blocks(to.height, db))
+                    return ReplayResult::invalid_copy;
+                // The direct extent is in source texels. If it maps past a physical BC edge, stage the full command.
+                if (db > 1 && (extent.width > to.width / db || extent.height > to.height / db)) stage_bc = true;
+            }
             p.image_copies.push_back({{src_aspect, mip, 0, dst.array_layers}, {0, 0, 0}, {aspect, mip, 0, dst.array_layers},
                                       {0, 0, 0}, {extent.width, extent.height, std::max(1u, src.depth >> mip)}});
         }
     }
     p.range = {dst.aspects, 0, dst.mip_levels, 0, dst.array_layers};
     p.source_range = {src.aspects, 0, src.mip_levels, 0, src.array_layers};
-    return ReplayResult::success;
+    return stage_bc ? stage_bc_resource_copy(p, vk, dst_format) : ReplayResult::success;
 }
 
 // Resolve a multisampled colour image into a single-sampled image of the same format, or (a region) one plane of a
@@ -3866,7 +3905,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                     p.has_depth24 = true;
                 }
             } else {
-                result = detail::prepare_resource_copy(p);
+                result = detail::prepare_resource_copy(p, vk);
             }
             if (result == ReplayResult::success && !p.image_copies.empty() &&
                 (p.image_copies[0].srcSubresource.aspectMask != p.image_copies[0].dstSubresource.aspectMask ||

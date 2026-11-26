@@ -240,6 +240,9 @@ What is implemented (all of it testable without the game):
   A same-subresource `CopyTextureRegion` uses `GENERAL` for both sides; preparation rejects overlapping regions.
   Cross-format `CopyTextureRegion` from an uncompressed texture into a partial BC edge block also uses transfer
   scratch. Each source texel supplies one block, and the destination's write extent stops at the actual mip edge.
+  For a whole-resource reinterpret copy into BC, a mip whose final block extends past its physical width or
+  height sends the entire copy through scratch. The source and destination name their own extents at each mip,
+  across every array layer. When all the copied blocks fit without clipping, `CopyResource` uses `vkCmdCopyImage`.
   A 3D mip is one subresource. Boxed volume transfers preserve the full footprint's row and slice strides.
   Whole-resource depth/stencil copies issue one `vkCmdCopyImage` per aspect, with a transfer write-to-read/write
   dependency between them; all mips and layers stay batched within each aspect. This avoids stencil corruption
