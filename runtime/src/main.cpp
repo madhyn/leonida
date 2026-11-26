@@ -10,7 +10,7 @@
 //       The same mapping, then each loaded DLL's TLS callbacks and DllMain(DLL_PROCESS_ATTACH) are run.
 //
 //   gta6rt --precompile-pipelines [--threads N] [--big-threads N] [--big-bytes N] [--all] [--smallest-first]
-//          [--limit N] [--min-bytes N] [--max-bytes N] [--filter PART]... [--list]
+//          [--limit N] [--min-bytes N] [--max-bytes N] [--filter PART]... [--list | --verify]
 //       No game: creates the Vulkan device as --run does and builds every compute pipeline of the shader library
 //       (LEONIDA_SHADERS) into the pipeline journal and the driver's cache, so a title's first dispatch of a large one
 //       does not stall it. Resumable: entries already journaled are skipped (--all: built anyway). See
@@ -262,7 +262,7 @@ int usage() {
                  "       gta6rt --init <image> [--game-dir DIR] [--overlay DIR] [--mods DIR] [--archetype-lookup RVA[,ARG]] [--view-mode-getter RVA] [--trace-d3d12] [--trace FILE]\n"
                  "       gta6rt --first-run-ui <exe> [--game-dir DIR] [--overlay DIR] [--trace FILE]\n"
                  "       gta6rt --run <exe> [--game-dir DIR] [--overlay DIR] [--mods DIR] [--archetype-lookup RVA[,ARG]] [--view-mode-getter RVA] [--trace-d3d12] [--trace FILE] [-- game arguments...]\n"
-                 "       gta6rt --precompile-pipelines [--threads N] [--big-threads N] [--big-bytes N] [--all] [--smallest-first] [--limit N] [--min-bytes N] [--max-bytes N] [--filter PART]... [--list] [--via-helper]\n"
+                 "       gta6rt --precompile-pipelines [--threads N] [--big-threads N] [--big-bytes N] [--all] [--smallest-first] [--limit N] [--min-bytes N] [--max-bytes N] [--filter PART]... [--list | --verify] [--via-helper]\n"
                  "       gta6rt --compile-server [--parent PID] [--threads N] [--idle-threads N] [--idle-exit SECONDS]\n");
     return 2;
 }
@@ -291,6 +291,7 @@ int precompile_main(int argc, wchar_t** argv) {
         else if (a == L"--all") options.rebuild = true;
         else if (a == L"--smallest-first") options.smallest_first = true;
         else if (a == L"--list") options.dry_run = true;
+        else if (a == L"--verify") options.verify = true;
         else if (a == L"--via-helper") options.via_helper = true;
         else if (a == L"--filter" && i + 1 < argc) {
             const std::wstring part = argv[++i];
@@ -298,6 +299,7 @@ int precompile_main(int argc, wchar_t** argv) {
         } else ok = false;
         if (!ok) return usage();
     }
+    if (options.verify && (options.dry_run || options.rebuild || options.via_helper)) return usage();
     return rt::d3d12::precompile_compute_pipelines(options);
 }
 

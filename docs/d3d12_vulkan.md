@@ -2482,6 +2482,19 @@ Pipeline creation:
   4 threads: modules of 3.6-5.8 MB took 46-145 s each, 12 in 312 s, about 3.5 GB of host memory each while in the
   driver (14.5 GB peak for four). Graphics pipelines are not covered: they are built at a title's draw from its PSO
   description and the bound formats, and take milliseconds.
+  After precompiling, run `gta6rt --precompile-pipelines --verify` in a fresh process with the same environment
+  and selection flags. It reads each selected compute pipeline's local journal file into a separate Vulkan cache
+  and asks the driver to create that pipeline with `FAIL_ON_PIPELINE_COMPILE_REQUIRED`. A verified entry requires a
+  successful creation and valid, pipeline-level `APPLICATION_PIPELINE_CACHE_HIT` feedback for that cache. A driver
+  may return a pipeline without confirming a hit. That entry counts as unverified, as does a response that
+  compilation is required. [Vulkan pipeline creation feedback](https://docs.vulkan.org/refpages/latest/refpages/source/VkPipelineCreationFeedbackFlagBits.html)
+  The verifier makes one probe per selected entry with a usable local file, bypassing the shared and external seed
+  caches, helpers, journal writes, LRU touches and eviction. It exits 0 for a nonempty selection of verified
+  entries, 2 for an empty selection or any missing, unusable, unverified or failed entry, and 1 when setup fails
+  (including disabled journaling or unavailable cache control). A name-matching entry with a missing or empty
+  module counts as an input error before size filters and leaves the `--limit` slots available for buildable
+  entries. The summary includes the filtered and unbuildable counts. To test on generated inputs, run
+  `python -I scripts/check_precompile_verify.py <path-to-gta6rt.exe> --require-hit`.
   `LEONIDA_COMPILE_HELPER=1` (`shims/d3d12_compile_helper.h`) keeps first-ever compiles out of the title's process:
   the driver's locks, which a long `vkCreateComputePipelines` holds and a `vkQueueSubmit` of the same process waits
   for, are per process. A compute build of `LEONIDA_COMPILE_HELPER_MIN_BYTES` or more (128 KiB) with no journal file
