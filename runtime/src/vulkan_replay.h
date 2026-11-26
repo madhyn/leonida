@@ -1618,6 +1618,7 @@ inline VkClearColorValue render_target_clear_color(VkFormat format, const ClearC
         is_integer = false;
         unorm = {0, 0, 0, 255};
         break;
+    case VK_FORMAT_R5G6B5_UNORM_PACK16: is_integer = false; unorm = {31, 63, 31, 0}; break;
     case VK_FORMAT_A2B10G10R10_UNORM_PACK32: is_integer = false; unorm = {1023, 1023, 1023, 3}; break;
     case VK_FORMAT_R16_UNORM:
     case VK_FORMAT_R16G16_UNORM:
