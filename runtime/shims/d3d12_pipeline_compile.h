@@ -138,9 +138,14 @@ inline bool compile_worker_trigger(const char* trigger) {
 //     behind it go first, and does so before its vkCreateShaderModule and vkDestroyShaderModule too; a title thread
 //     waits only for the holder, and only before a pipeline create (it may wait out a vkDeviceWaitIdle or a present:
 //     waits of 50 ms or more are logged).
-//   - a pipeline create passes the compile gate (SubmitMutex::CompileTurn) for the length of the call.
+//   - a pipeline create passes the compile gate (SubmitMutex::CompileTurn) for the length of the call; as speculative,
+//     not holding submissions, when a compile worker runs it for a speculative job (compile_job_speculative).
 //   - the compile worker, which runs below normal priority, runs the call at normal priority, so a preempted worker
 //     does not sit on a driver lock a submit waits for.
+// True on a compile worker while it runs a speculative job (a warm-up, a prewarm, the checkpoint; PipelineCompiler::run):
+// its pipeline creates pass the compile gate as warm-ups, which do not hold submissions (SubmitMutex::CompileTurn).
+inline thread_local bool compile_job_speculative = false;
+
 class DriverTurn {
 public:
     DriverTurn(leonida::SubmitMutex& submits, const char* trigger, const char* call, bool pipeline,
@@ -160,7 +165,7 @@ public:
             if (waited >= 50) note("waited for the submit lock", trigger, call, name, waited);
         }
         if (pipeline) {
-            gate_.emplace(submits);
+            gate_.emplace(submits, compile_job_speculative);
             if (gate_->waited_ms() >= 50) note("waited at the compile gate", trigger, call, name, gate_->waited_ms());
         }
     }
@@ -570,12 +575,14 @@ private:
             stats_.most_running = (std::max)(stats_.most_running, running_.size());
             const auto probe = probe_;
             lock.unlock();
+            compile_job_speculative = speculative;  // its creates do not hold submissions (DriverTurn)
             try {
                 if (probe) probe(job.owner);
                 job.work();
             } catch (...) {
                 std::fprintf(stderr, "[rt] pipeline compile worker: a job threw\n");
             }
+            compile_job_speculative = false;
             job.work = nullptr;  // its captures go before the job counts as done
             lock.lock();
             ++stats_.completed;

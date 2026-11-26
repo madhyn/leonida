@@ -399,16 +399,25 @@ public:
     // the driver. A long compile then stalls the submitting thread here, in our code, instead of in the driver.
     // No deadlock: a create holds the gate only across its vkCreate*Pipelines and a submission only across its
     // vkQueueSubmit, and neither driver call waits for anything of ours. LEONIDA_COMPILE_GATE=0 turns it off.
+    // A speculative create (a warm-up: nobody waits for its pipeline yet) does not hold submissions: they wait only for
+    // the demanded creates in the driver. It still never enters while a submission is in the driver or waits there, and
+    // at most warmup_max of them are in the driver at once, so the creates beside a submission stay bounded (HasiKe and
+    // MoonEyes, #2233 / #1608: a cold boot crawled at about one submission a second behind 290 s of warm-ups).
+    // LEONIDA_COMPILE_GATE_WARMUPS=1: warm-ups hold the gate as demanded creates do (the behaviour before).
     class CompileTurn {  // around vkCreate*Pipelines
     public:
-        explicit CompileTurn(SubmitMutex& gate) : gate_(gate), waited_(gate.enter_compile()) {}
-        ~CompileTurn() { gate_.leave_compile(); }
+        explicit CompileTurn(SubmitMutex& gate, bool speculative = false)
+            : gate_(gate), speculative_(speculative && gate.warmups_free()), waited_(gate.enter_compile(speculative_)) {}
+        ~CompileTurn() { gate_.leave_compile(speculative_); }
         CompileTurn(const CompileTurn&) = delete;
         CompileTurn& operator=(const CompileTurn&) = delete;
         std::int64_t waited_ms() const { return waited_; }
 
+        bool speculative() const { return speculative_; }
+
     private:
         SubmitMutex& gate_;
+        bool speculative_;
         std::int64_t waited_;
     };
     class SubmitTurn {  // around vkQueueSubmit, with the submit lock held
@@ -430,6 +439,38 @@ public:
         return on;
     }
 
+    // Whether warm-ups pass the gate without holding submissions, and how many may be in the driver at once.
+    // LEONIDA_COMPILE_GATE_WARMUPS=1: they hold it as demanded creates do. LEONIDA_COMPILE_GATE_WARMUP_MAX=<n>: n at
+    // once (default 1). Read once; a test sets them per gate (set_warmup_policy).
+    struct WarmupPolicy {
+        bool free = true;
+        unsigned max = 1;
+    };
+    static WarmupPolicy warmup_policy_from_environment() {
+        WarmupPolicy policy;
+        const char* hold = std::getenv("LEONIDA_COMPILE_GATE_WARMUPS");
+        policy.free = !(hold && !std::strcmp(hold, "1"));
+        if (const char* max = std::getenv("LEONIDA_COMPILE_GATE_WARMUP_MAX")) {
+            char* end = nullptr;
+            const unsigned long n = std::strtoul(max, &end, 10);
+            if (end != max && !*end && n >= 1 && n <= 64) policy.max = unsigned(n);
+        }
+        return policy;
+    }
+    void set_warmup_policy(WarmupPolicy policy) {
+        std::lock_guard lock(gate_mutex_);
+        policy_ = policy;
+    }
+    bool warmups_free() {
+        std::lock_guard lock(gate_mutex_);
+        return policy_.free;
+    }
+    // Speculative creates in the driver now (they are not counted in what a submission waits for).
+    unsigned speculative_compiles() {
+        std::lock_guard lock(gate_mutex_);
+        return speculative_;
+    }
+
     // The thread waiting in enter_submit for creates to leave the driver, or 0.
     std::uint32_t gate_waiter() const { return gate_waiter_.load(std::memory_order_relaxed); }
 
@@ -444,25 +485,33 @@ public:
         return stats_;
     }
 
-    std::int64_t enter_compile() {
+    // `speculative`: a warm-up that does not hold submissions (CompileTurn); it also waits for a free place among the
+    // warmup_max speculative ones.
+    std::int64_t enter_compile(bool speculative = false) {
         if (!compile_gate_enabled()) return 0;
         std::unique_lock lock(gate_mutex_);
         std::int64_t waited = 0;
-        if (submits_) {
+        const auto blocked = [&] { return submits_ != 0 || (speculative && speculative_ >= policy_.max); };
+        if (blocked()) {
             const std::int64_t start = diagnostic_ms();
-            gate_changed_.wait(lock, [&] { return submits_ == 0; });
+            gate_changed_.wait(lock, [&] { return !blocked(); });
             waited = diagnostic_ms() - start;
             ++stats_.creates;
             stats_.create_ms += waited;
             stats_.create_max_ms = (std::max)(stats_.create_max_ms, waited);
         }
-        ++compiles_;
+        ++(speculative ? speculative_ : compiles_);
         return waited;
     }
-    void leave_compile() {
+    void leave_compile(bool speculative = false) {
         if (!compile_gate_enabled()) return;
         std::lock_guard lock(gate_mutex_);
-        if (--compiles_ == 0 && submits_) gate_changed_.notify_all();
+        if (speculative) {
+            --speculative_;
+            gate_changed_.notify_all();  // a warm-up waiting for a place
+        } else if (--compiles_ == 0 && submits_) {
+            gate_changed_.notify_all();
+        }
     }
 
     std::int64_t enter_submit() {
@@ -548,7 +597,9 @@ private:
 
     std::mutex gate_mutex_;  // leaf: guards the gate counts and stats
     std::condition_variable gate_changed_;
-    std::uint32_t compiles_ = 0;  // creates in the driver
+    std::uint32_t compiles_ = 0;  // demanded creates in the driver: what a submission waits for
+    unsigned speculative_ = 0;    // warm-up creates in the driver, while warm-ups are free (policy_)
+    WarmupPolicy policy_ = warmup_policy_from_environment();
     std::uint32_t submits_ = 0;   // submissions waiting for them or in the driver
     std::atomic<std::uint32_t> gate_waiter_{0};
     GateStats stats_;

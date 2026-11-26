@@ -1,7 +1,7 @@
 // leonida::SubmitMutex (src/vulkan_device_fault.h), on the CPU: the submit lock's owner and hold tracking, its waiter
 // count, let_submit_finish (the handoff a pipeline create makes to submits before entering the driver) and the
-// compile gate between pipeline creates and queue submissions. Windows only: the owner is a Win32 thread id. No GPU,
-// no game data.
+// compile gate between pipeline creates and queue submissions, with warm-up creates that do not hold submissions
+// (RT-COMPILE-GATE-WARMUP-FREE). Windows only: the owner is a Win32 thread id. No GPU, no game data.
 #include "../src/vulkan_device_fault.h"
 
 #include <windows.h>
@@ -9,14 +9,22 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <mutex>
 #include <thread>
+#include <vector>
 
 #define EXPECT(condition) do { \
     if (!(condition)) { std::fprintf(stderr, "line %d: %s\n", __LINE__, #condition); return 1; } \
 } while (0)
 
 namespace {
+
+// For checks inside threads, where EXPECT's return would leave the thread, not the test.
+std::atomic<bool> failed_void{false};
+#define EXPECT_VOID(condition) do { \
+    if (!(condition)) { std::fprintf(stderr, "line %d: %s\n", __LINE__, #condition); failed_void = true; } \
+} while (0)
 
 using leonida::SubmitMutex;
 using namespace std::chrono_literals;
@@ -197,12 +205,163 @@ int compile_gate() {
     return 0;
 }
 
+// Warm-up creates (CompileTurn speculative) do not hold submissions; demanded ones still do; at most warmup_max warm-ups
+// are in the driver at once; none enters while a submission waits or is in the driver; with warm-ups held
+// (LEONIDA_COMPILE_GATE_WARMUPS=1) a submission waits for them as before.
+int warmups_do_not_hold_the_gate() {
+    if (!SubmitMutex::compile_gate_enabled()) {
+        std::printf("warm-up gate: compile gate off (LEONIDA_COMPILE_GATE=0): not checked\n");
+        return 0;
+    }
+    SubmitMutex m;
+    m.set_warmup_policy({true, 1});
+    // A submission is not held by a warm-up in the driver.
+    {
+        std::atomic<bool> in{false}, release{false};
+        std::thread warm([&] {
+            const SubmitMutex::CompileTurn turn(m, true);
+            in = true;
+            while (!release) std::this_thread::sleep_for(1ms);
+        });
+        EXPECT(eventually([&] { return in.load(); }));
+        EXPECT(m.speculative_compiles() == 1);
+        const std::int64_t start = now_ms();
+        {
+            const SubmitMutex::SubmitTurn turn(m);
+        }
+        EXPECT(now_ms() - start < 50);
+        release = true;
+        warm.join();
+        EXPECT(m.speculative_compiles() == 0);
+    }
+    // A demanded create is still waited for, also beside a warm-up: the submission waits for the demanded one only.
+    {
+        std::atomic<bool> warm_in{false}, demand_in{false}, release_warm{false};
+        std::atomic<std::int64_t> demand_left{0}, submitted{0};
+        std::thread warm([&] {
+            const SubmitMutex::CompileTurn turn(m, true);
+            warm_in = true;
+            while (!release_warm) std::this_thread::sleep_for(1ms);
+        });
+        std::thread demand([&] {
+            const SubmitMutex::CompileTurn turn(m);
+            demand_in = true;
+            std::this_thread::sleep_for(200ms);
+            demand_left = now_ms();
+        });
+        EXPECT(eventually([&] { return warm_in.load() && demand_in.load(); }));
+        std::thread submit([&] {
+            const SubmitMutex::SubmitTurn turn(m);
+            submitted = now_ms();
+        });
+        submit.join();
+        demand.join();
+        EXPECT(submitted.load() >= demand_left.load());  // waited for the demanded create
+        EXPECT(warm_in.load() && !release_warm.load());  // and not for the warm-up, still in the driver
+        release_warm = true;
+        warm.join();
+    }
+    // At most warmup_max warm-ups in the driver; a demanded create does not wait for them.
+    for (const unsigned max : {1u, 2u}) {
+        m.set_warmup_policy({true, max});
+        std::atomic<int> inside{0}, most{0};
+        std::atomic<bool> release{false};
+        std::vector<std::thread> warms;
+        for (int i = 0; i < 4; ++i)
+            warms.emplace_back([&] {
+                const SubmitMutex::CompileTurn turn(m, true);
+                const int now = ++inside;
+                int seen = most.load();
+                while (now > seen && !most.compare_exchange_weak(seen, now)) {
+                }
+                while (!release) std::this_thread::sleep_for(1ms);
+                --inside;
+            });
+        EXPECT(eventually([&] { return inside.load() == int(max); }));
+        std::this_thread::sleep_for(100ms);
+        EXPECT(inside.load() == int(max));  // the others wait for a place
+        std::atomic<std::int64_t> demand_waited{-1};
+        std::thread demand([&] {
+            const SubmitMutex::CompileTurn turn(m);
+            demand_waited = turn.waited_ms();
+        });
+        demand.join();
+        EXPECT(demand_waited.load() == 0);
+        release = true;
+        for (auto& t : warms) t.join();
+        EXPECT(most.load() == int(max));
+        EXPECT(m.speculative_compiles() == 0);
+    }
+    m.set_warmup_policy({true, 1});
+    // A warm-up never enters while a submission is in the driver.
+    {
+        std::atomic<bool> submitting{false}, release{false};
+        std::atomic<std::int64_t> submit_left{0}, warm_entered{0};
+        std::thread submit([&] {
+            const SubmitMutex::SubmitTurn turn(m);
+            submitting = true;
+            while (!release) std::this_thread::sleep_for(1ms);
+            submit_left = now_ms();
+        });
+        EXPECT(eventually([&] { return submitting.load(); }));
+        std::thread warm([&] {
+            const SubmitMutex::CompileTurn turn(m, true);
+            warm_entered = now_ms();
+        });
+        std::this_thread::sleep_for(100ms);
+        EXPECT(warm_entered.load() == 0);
+        release = true;
+        submit.join();
+        warm.join();
+        EXPECT(warm_entered.load() >= submit_left.load());
+    }
+    // LEONIDA_COMPILE_GATE_WARMUPS=1: a warm-up holds submissions as a demanded create does.
+    {
+        m.set_warmup_policy({false, 1});
+        std::atomic<bool> in{false};
+        std::atomic<std::int64_t> warm_left{0}, submitted{0};
+        std::thread warm([&] {
+            const SubmitMutex::CompileTurn turn(m, true);
+            EXPECT_VOID(!turn.speculative());
+            in = true;
+            std::this_thread::sleep_for(150ms);
+            warm_left = now_ms();
+        });
+        EXPECT(eventually([&] { return in.load(); }));
+        EXPECT(m.speculative_compiles() == 0);
+        {
+            const SubmitMutex::SubmitTurn turn(m);
+            submitted = now_ms();
+        }
+        warm.join();
+        EXPECT(submitted.load() >= warm_left.load());
+    }
+    // The settings.
+    _putenv_s("LEONIDA_COMPILE_GATE_WARMUPS", "1");
+    _putenv_s("LEONIDA_COMPILE_GATE_WARMUP_MAX", "3");
+    auto policy = SubmitMutex::warmup_policy_from_environment();
+    EXPECT(!policy.free && policy.max == 3);
+    _putenv_s("LEONIDA_COMPILE_GATE_WARMUPS", "0");
+    _putenv_s("LEONIDA_COMPILE_GATE_WARMUP_MAX", "0");
+    policy = SubmitMutex::warmup_policy_from_environment();
+    EXPECT(policy.free && policy.max == 1);
+    _putenv_s("LEONIDA_COMPILE_GATE_WARMUP_MAX", "x");
+    EXPECT(SubmitMutex::warmup_policy_from_environment().max == 1);
+    _putenv_s("LEONIDA_COMPILE_GATE_WARMUPS", "");
+    _putenv_s("LEONIDA_COMPILE_GATE_WARMUP_MAX", "");
+    policy = SubmitMutex::warmup_policy_from_environment();
+    EXPECT(policy.free && policy.max == 1);
+    if (failed_void) return 1;
+    std::printf("warm-up gate: submissions pass a warm-up, wait for demanded creates; warm-ups capped\n");
+    return 0;
+}
+
 }  // namespace
 
 int main() {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     if (owner_tracking() || waits_for_holder() || waits_for_queued_submitter() || handoff_is_capped() ||
-        compile_gate())
+        compile_gate() || warmups_do_not_hold_the_gate())
         return 1;
     std::printf("submit_mutex_test: all passed\n");
     return 0;
