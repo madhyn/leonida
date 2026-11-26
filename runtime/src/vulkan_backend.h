@@ -2493,18 +2493,14 @@ public:
         if (value == UINT64_MAX) {
             // A lost device can show itself here first: measured on NVIDIA 621.24 and reported on 617.14, the counter
             // query succeeds with UINT64_MAX (and vkWaitSemaphores with a zero timeout succeeds too) before any call
-            // has returned VK_ERROR_DEVICE_LOST. vkDeviceWaitIdle is what then says so, and it is also what a driver
-            // needs to have returned before vkGetDeviceFaultInfoEXT answers (LEONIDA_DEVICE_FAULT=1). When
-            // vkDeviceWaitIdle succeeds, nothing is recorded and the value is returned as the driver gave it.
-            VkResult idle = VK_SUCCESS;
-            {
-                std::lock_guard lock(context_.submit_mutex());
-                idle = context_.observe_result(context_.vk.vkDeviceWaitIdle(context_.device()),
-                                               "vkDeviceWaitIdle (a fence counter of UINT64_MAX)");
-            }
-            if (idle == VK_ERROR_DEVICE_LOST)
-                context_.mark_device_lost(
-                    "a fence's counter read UINT64_MAX and vkDeviceWaitIdle then returned VK_ERROR_DEVICE_LOST");
+            // has returned VK_ERROR_DEVICE_LOST. The fence's record says whether anyone asked for that value: its
+            // initial value, a CPU Signal or a submitted one (QueueHolds::submitted_value). Asked for, the reading is
+            // the value and nothing is recorded. Not asked for, no Signal can have produced it, so the device is lost.
+            // That is decided without vkDeviceWaitIdle: under the submit lock it can block for minutes on such a
+            // device (measured 270 s on NVIDIA 616.56), and meanwhile the releaser cannot submit the held batch a
+            // queue's Wait may be waiting for, so the title froze and the loss was reported minutes late.
+            if (context_.holds().submitted_value(semaphore_) != UINT64_MAX)
+                context_.mark_device_lost("a fence's counter read UINT64_MAX, a value no Signal asked for");
         }
         return value;
     }
