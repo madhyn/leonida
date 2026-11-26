@@ -1,11 +1,16 @@
 // rt::StackSampler (runtime/src/thread_stacks.cpp, LEONIDA_STACKS): the call chain of a thread blocked in a known
-// function, and of a thread whose stack keeps changing while it is sampled. No game data.
+// function, of a thread whose stack keeps changing while it is sampled, and of the thread a fatal fault happens on
+// (rt::print_fault_stacks). No game data.
 #include <windows.h>
 #include <intrin.h>
+#include <io.h>
+#include <fcntl.h>
 
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
+#include <fstream>
+#include <string>
 #include <vector>
 
 #include "../src/thread_stacks.h"
@@ -147,6 +152,100 @@ void moving_thread() {
     check(reached + deep == sampled, "every chain of a moving stack unwinds to its thread function");
 }
 
+// rt::print_fault_stacks: the fault it was called for and the call chain of the thread it happened on. The function
+// writes to stderr, so the capture points fd 2 at a file for the duration of the fault and the file is read back.
+std::atomic<DWORD64> g_fault_fn{0}, g_fault_caller_fn{0};
+
+__declspec(noinline) int fault_here() {
+    g_fault_fn = here();
+    volatile const int* none = nullptr;
+    return none[3];  // a read of 0xc
+}
+
+LONG WINAPI fault_filter(EXCEPTION_POINTERS* info) {
+    rt::print_fault_stacks(info->ExceptionRecord, info->ContextRecord, "test");
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
+// The __try in a function of its own: MSVC refuses __try in a function whose own objects need unwinding.
+__declspec(noinline) int run_fault() {
+    int value = 0;
+    __try {
+        value = fault_here();
+    } __except (fault_filter(GetExceptionInformation())) {
+        value = -1;
+    }
+    return value;
+}
+
+// "thread_stacks_test.exe+0x1a2b" -> 0x1a2b, or -1 for a line naming another module (a host DLL frame).
+long long frame_rva(const std::string& line) {
+    const std::string name = "thread_stacks_test.exe+0x";
+    const size_t at = line.find(name);
+    if (at == std::string::npos) return -1;
+    return std::stoll(line.substr(at + name.size()), nullptr, 16);
+}
+
+void fault_stacks() {
+    char dir[MAX_PATH] = {};
+    const DWORD len = GetTempPathA(sizeof dir, dir);
+    check(len > 0 && len < sizeof dir, "the temp path resolves");
+    if (!len) return;
+    const std::string path = std::string(dir) + "leonida_thread_stacks_fault_" + std::to_string(GetCurrentProcessId()) +
+                             ".log";
+    HANDLE file = CreateFileA(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    check(file != INVALID_HANDLE_VALUE, "the fault capture's file opens");
+    if (file == INVALID_HANDLE_VALUE) return;
+    const int saved = _dup(_fileno(stderr));
+    // Binary: the capture must hold the bytes the diagnostics wrote, with their own line endings.
+    const int fd = _open_osfhandle(reinterpret_cast<intptr_t>(file), _O_BINARY);
+    _dup2(fd, _fileno(stderr));
+    g_fault_caller_fn = here();  // fault_stacks itself: the chain must reach it above the fault
+    const int value = run_fault();
+    _dup2(saved, _fileno(stderr));
+    _close(saved);
+    _close(fd);  // the last CRT reference to `file`, so this closes the handle
+    check(value == -1, "the guarded call ended in its handler");
+
+    std::ifstream in(path, std::ios::binary);
+    const std::string capture{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+    in.close();
+    std::remove(path.c_str());
+    if (capture.size() < 40) std::printf("   capture: [%s]\n", capture.c_str());
+    check(capture.find("[rt] fault test: read of 0xc at thread_stacks_test.exe+0x") != std::string::npos ||
+              capture.find("[rt] fault test: read of 0xc at host:thread_stacks_test.exe+0x") != std::string::npos,
+          "the fault names the access and the instruction");
+
+    // The chain of the faulting thread starts at the faulting instruction itself and unwinds out to the caller.
+    const size_t chain = capture.find("(faulting thread):\n");
+    check(chain != std::string::npos, "the capture holds the faulting thread's chain");
+    if (chain == std::string::npos) std::printf("   capture (%zu bytes):\n%s\n", capture.size(), capture.c_str());
+    if (chain == std::string::npos) return;
+    const size_t fault_line = capture.find("[rt] fault test:");
+    const size_t at = fault_line != std::string::npos ? capture.find(" at ", fault_line) : std::string::npos;
+    const std::string where =
+        at != std::string::npos ? capture.substr(at + 4, capture.find('\n', at) - at - 4) : std::string();
+    check(!where.empty() && capture.find("#0 " + where, chain) != std::string::npos,
+          "frame #0 is the faulting instruction the fault line names");
+
+    const DWORD64 base = reinterpret_cast<DWORD64>(GetModuleHandleW(nullptr));
+    int in_fault_here = -1, in_caller = -1, frame = 0;
+    size_t pos = chain;
+    while ((pos = capture.find("   #", pos)) != std::string::npos) {
+        const size_t end = capture.find('\n', pos);
+        if (const long long rva = frame_rva(capture.substr(pos, end - pos)); rva >= 0) {
+            const DWORD64 function = function_of(base + static_cast<DWORD64>(rva));
+            if (function == g_fault_fn && in_fault_here < 0) in_fault_here = frame;
+            if (function == g_fault_caller_fn && in_caller < 0) in_caller = frame;
+            ++frame;
+        }
+        pos = end == std::string::npos ? capture.size() : end;
+    }
+    check(in_fault_here >= 0, "the chain reaches the function the fault happened in");
+    check(in_caller > in_fault_here, "and unwinds out of it to the function that called it");
+    check(capture.find("[rt] stacks test: ") != std::string::npos, "the other threads are snapshotted too");
+}
+
 void parse() {
     std::vector<unsigned> t;
     check(rt::parse_stack_times("90,180", t) && t == std::vector<unsigned>{90, 180}, "parse 90,180");
@@ -163,6 +262,7 @@ int main() {
     parse();
     blocked_thread();
     moving_thread();
+    fault_stacks();
     std::printf("%d checks, %d failures\n", g_checks, g_failures);
     return g_failures ? 1 : 0;
 }

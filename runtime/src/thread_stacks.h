@@ -1,5 +1,7 @@
 #pragma once
 
+#include <windows.h>
+
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -38,5 +40,10 @@ std::jthread start_thread_stacks();
 // The call chain of thread `tid` now, or of every other thread when `tid` is 0, printed as LEONIDA_STACKS does under
 // the tag `why`. One call at a time; the device-loss diagnostics call it (vulkan_device_fault.h thread_stack_hook).
 void print_thread_stacks_now(std::uint32_t tid, const char* why) noexcept;
+
+// A fatal exception nothing handled: the fault (access and address for an access violation) and the faulting thread's
+// own call chain, walked directly from the exception's context (the filter runs on that thread, whose stack is
+// live), then a LEONIDA_STACKS snapshot of the other threads. From a top-level exception filter only.
+void print_fault_stacks(const EXCEPTION_RECORD* record, const CONTEXT* context, const char* why) noexcept;
 
 }  // namespace rt

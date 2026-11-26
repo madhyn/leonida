@@ -223,6 +223,56 @@ void print_thread_stacks_now(std::uint32_t tid, const char* why) noexcept {
     }
 }
 
+void print_fault_stacks(const EXCEPTION_RECORD* record, const CONTEXT* context, const char* why) noexcept {
+    static std::mutex mutex;
+    try {
+        const std::lock_guard lock(mutex);
+        const char* tag = why ? why : "fatal";
+        if (record) {
+            // ExceptionAddress is where the faulting instruction is, which for a fault raised by an instruction in a
+            // leaf without unwind data can name nothing; the chain below says what called it either way.
+            const std::string at = record->ExceptionAddress
+                                       ? shims::module_offset(reinterpret_cast<uint64_t>(record->ExceptionAddress))
+                                       : std::string("unknown");
+            if (record->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && record->NumberParameters >= 2) {
+                const char* access = record->ExceptionInformation[0] == 0 ? "read"
+                                   : record->ExceptionInformation[0] == 1 ? "write" : "execute";
+                std::fprintf(stderr, "[rt] fault %s: %s of 0x%llx at %s\n", tag, access,
+                             static_cast<unsigned long long>(record->ExceptionInformation[1]), at.c_str());
+            } else {
+                std::fprintf(stderr, "[rt] fault %s: exception 0x%08lx at %s\n", tag,
+                             static_cast<unsigned long>(record->ExceptionCode), at.c_str());
+            }
+        }
+        // The filter runs on the faulting thread and its stack is live under us, so unlike a sampled thread this one
+        // unwinds directly, with no copy (the same frames the suspended thread's own unwinder would walk).
+        if (context && context->Rip) {
+            CONTEXT walk = *context;
+            std::array<std::uint64_t, StackSampler::kMaxFrames> frames{};
+            std::size_t count = 0;
+            while (walk.Rip && count < frames.size()) {
+                frames[count++] = walk.Rip;
+                if (!unwind_frame(walk)) break;
+            }
+            std::string out = "[rt] stacks " + std::string(tag) + " thread " + std::to_string(GetCurrentThreadId()) +
+                              " (faulting thread):\n";
+            if (!count) out += "   stack unavailable\n";
+            else
+                for (std::size_t i = 0; i < count; ++i)
+                    out += "   #" + std::to_string(i) + " " + shims::module_offset(frames[i]) + "\n";
+            std::fputs(out.c_str(), stderr);
+            std::fflush(stderr);
+        }
+        static StackSampler sampler;
+        const auto describe = reinterpret_cast<GetDescription>(reinterpret_cast<void*>(
+            GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "GetThreadDescription")));
+        const auto query = reinterpret_cast<QueryThread>(reinterpret_cast<void*>(
+            GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationThread")));
+        snapshot_threads(tag, sampler, describe, query, 0);
+    } catch (...) {
+    }
+}
+
 std::jthread start_thread_stacks() {
     const auto start = Clock::now();
     char spec[1024];
