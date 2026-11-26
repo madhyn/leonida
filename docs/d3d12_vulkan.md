@@ -1708,7 +1708,8 @@ The copies:
   64 MiB a submission (a V# has no read/write bit, so a read-only view costs a copy too; past the caps the ranges are
   left behind, logged once). `LEONIDA_TITLE_WRITEBACK=0` turns it off. A batch is fenced: it is kept with the ticket
   of the submission that will use it and copied back only when the context reports that ticket retired, so a range
-  another submission is still writing is never read half done.
+  another submission is still writing is never read half done. A queue held deep (console ordering) can leave batches
+  waiting: past 64 of them the oldest go back without their ticket, logged once.
 - A **window that is refused** (the budget is spent, the arena is full, or the pages are not committed yet) is backed
   by a persistent geometry copy of exactly the requested range (`LEONIDA_GEOMETRY_MB`) instead; when no copy can be
   made either, the view is written with **no base and no records** — loads return 0 and stores are dropped. A raw
