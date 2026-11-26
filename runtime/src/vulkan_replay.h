@@ -572,6 +572,23 @@ inline bool depth_format_pair(VkFormat a, VkFormat b) {
     return a != b && encoding(a) && encoding(a) == encoding(b);
 }
 
+// What becomes of an image copy that keeps its aspect and has a depth-stencil format on both sides. vkCmdCopyImage takes
+// it only between equal formats, whichever aspect it names (VUID-vkCmdCopyImage-srcImage-01548). Between different ones
+// a depth plane of one encoding (depth_format_pair) and the stencil plane (8 bits in every format) have one texel layout
+// in a buffer and are staged. Any other pair is left out: D24_UNORM_S8_UINT into D16_UNORM or D32_SFLOAT would be a
+// conversion, which a D3D12 copy never is, and a multisampled image has no buffer copy.
+enum class DepthStencilCopy { direct, staged, left_out };
+inline DepthStencilCopy depth_stencil_copy(const ResourceBinding& source, const ResourceBinding& destination,
+                                           VkImageAspectFlags aspects) {
+    constexpr VkImageAspectFlags depth_stencil = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
+    if (!(aspects & depth_stencil) || source.format == destination.format) return DepthStencilCopy::direct;
+    const bool one_layout = aspects == VK_IMAGE_ASPECT_STENCIL_BIT ||
+                            (aspects == VK_IMAGE_ASPECT_DEPTH_BIT &&
+                             depth_format_pair(source.format, destination.format));
+    return one_layout && source.samples == 1 && destination.samples == 1 ? DepthStencilCopy::staged
+                                                                         : DepthStencilCopy::left_out;
+}
+
 inline bool depth_colour_pair(const ResourceBinding& a, const ResourceBinding& b) {
     const auto family = [](VkFormat format) -> int {
         switch (format) {
@@ -1417,6 +1434,7 @@ struct Prepared {
     std::vector<VkBufferCopy> tile_rows;
     std::vector<VkImageCopy> image_copies;
     bool same_copy_subresource = false;
+    bool copy_left_out = false;  // an image copy no Vulkan command can make (depth_stencil_copy)
     VkImageResolve resolve{};  // resolves
     // Depth or stencil resolves: the mode, and the destination view (`view` is the source's).
     VkResolveModeFlagBits resolve_mode = VK_RESOLVE_MODE_NONE;
@@ -3813,10 +3831,27 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             } else {
                 result = detail::prepare_resource_copy(p);
             }
+            p.copy_left_out = false;
+            auto depth_copy = DepthStencilCopy::direct;
+            if (result == ReplayResult::success && !p.image_copies.empty() &&
+                p.image_copies[0].srcSubresource.aspectMask == p.image_copies[0].dstSubresource.aspectMask) {
+                VkImageAspectFlags aspects = 0;
+                for (const VkImageCopy& c : p.image_copies) aspects |= c.srcSubresource.aspectMask;
+                depth_copy = depth_stencil_copy(p.source, p.binding, aspects);
+            }
+            if (depth_copy == DepthStencilCopy::left_out) {
+                static std::atomic<unsigned> logged{0};
+                if (logged.fetch_add(1, std::memory_order_relaxed) < 8)
+                    std::fprintf(stderr, "[rt] replay: a copy from depth-stencil VkFormat %d into %d (%u and %u samples) "
+                                         "was left out: no Vulkan copy makes it\n",
+                                 int(p.source.format), int(p.binding.format), unsigned(p.source.samples),
+                                 unsigned(p.binding.samples));
+                p.image_copies.clear();
+                p.copy_left_out = true;
+            }
             if (result == ReplayResult::success && !p.image_copies.empty() &&
                 (p.image_copies[0].srcSubresource.aspectMask != p.image_copies[0].dstSubresource.aspectMask ||
-                 a8_mixed_backing(p.source.format, p.binding.format) ||
-                 depth_format_pair(p.source.format, p.binding.format))) {
+                 a8_mixed_backing(p.source.format, p.binding.format) || depth_copy == DepthStencilCopy::staged)) {
                 // Depth <-> colour: vkCmdCopyImage cannot mix aspects, so each region goes image -> scratch -> image,
                 // tightly packed. Depth aspects want 4-byte buffer offsets; 16 covers every texel size here. The two
                 // backings of A8_UNORM take the same route: one byte per texel on both sides, but Vulkan does not
@@ -4049,6 +4084,10 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                           ? (ind->count_buffer ? vk.draw_indirect_count != nullptr : vk.draw_indirect != nullptr)
                           : (ind->count_buffer ? vk.draw_indexed_indirect_count != nullptr
                                                : vk.draw_indexed_indirect != nullptr);
+            if (ind->kind == IndirectKind::dispatch && !ind->max_count) {
+                if (!vk.dispatch_indirect) return unsupported_at(__LINE__);
+                continue;
+            }
             const bool clamped =
                 leonida::indirect_clamp_enabled() && vk.prepare_indirect_clamp && vk.emit_indirect_clamp &&
                 clamp_command_available && !(statistics_active && !statistics_helpers) &&
@@ -4950,7 +4989,9 @@ inline void emit_commands(const PreparedList& prepared, VkCommandBuffer command_
                    std::holds_alternative<CopyResource>(command)) {
             if constexpr (Checkpoints) checkpoints->record(command_buffer, i, CheckpointKind::copy);
             const auto [dst_id, src_id] = copy_ids(command);
-            if (!p.predicated_copy.empty()) {
+            if (p.copy_left_out) {
+                // prepare() logged it.
+            } else if (!p.predicated_copy.empty()) {
                 end_statistics();
                 vk.emit_predicated_copy(command_buffer, p.predicated_copy);
                 begin_statistics();
@@ -5234,6 +5275,7 @@ inline void emit_commands(const PreparedList& prepared, VkCommandBuffer command_
                 indirect_stats::skip(indirect_stats::Event::replay_skip, indirect_stats::stateless);
                 continue;
             }
+            if (ind->kind == IndirectKind::dispatch && !ind->max_count) continue;
             // The clamp pass (vulkan_indirect_clamp.h) runs before anything reads the indirect arguments, and before
             // the drawing scope an indirect draw opens around itself. It is a helper dispatch: a pipeline-statistics
             // query must not count it, and it runs even under a false predicate (the draw it feeds may be the one

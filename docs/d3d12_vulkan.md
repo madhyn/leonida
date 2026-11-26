@@ -3111,6 +3111,9 @@ The console has two list topologies Vulkan lacks: rectangle list (`IASetPrimitiv
     without host-transfer usage before it is bound, and takes the staging path. `d3d12_vulkan_device_test` and
     `d3d12_subresource_copy_test` force this branch on any GPU with `VulkanDeviceInfo::force_host_transfer_retry`
     (their third CPU-copy path; the second compares it with the host runtime).
+  - Setting `LEONIDA_HOST_IMAGE_COPY=0` (or `off`) disables `VK_EXT_host_image_copy` and routes all CPU texture
+    copies through the staging submit path. This provides an immediate diagnostic bypass for driver-side host image
+    transfer write faults (e.g. `WRITE_INVALID` stops during world-start loading on NVIDIA GPUs).
 - 96-bit textures (`R32G32B32_FLOAT`/`_UINT`/`_SINT`/`_TYPELESS`, D3D-62) are `R32G32B32A32` images
   (`ResourceBinding::rgb96`), on every GPU. Most GPUs have no optimal-tiling RGB32 image (an RX 9070 XT reports
   no optimal features for `R32G32B32_SFLOAT`), and one that has would not avoid the repack: D3D12 places
@@ -4270,7 +4273,11 @@ to be recovered from call sites (or the NDA GDK headers, if a developer has acce
 | Mesh shader tier | Public `D3D12_MESH_SHADER_TIER` | `VK_EXT_mesh_shader`; the 9,282 translated mesh shaders make this a hard requirement for any content that uses them. |
 | Wave MMA | Public `D3D12_WAVE_MMA_TIER` | Not used: no shader sets `WAVE_MMA` in SFI0 and none contains `v_mfma`/`v_wmma` (all 26,503, `tools/feature_scan.py`). Answer the tier query truthfully; no cooperative-matrix mapping is needed. |
 | Enhanced barriers | Public Xbox Series `D3D12_BARRIER_GROUP` | `VK_KHR_synchronization2`; implement directly. |
+| List slot 146: texture barrier with no resource | The retail title records `D3D12_BARRIER_TYPE_TEXTURE` barriers whose `pResource` is null in its `Barrier(NumBarrierGroups, pBarrierGroups)` calls; on the console such a barrier is a global memory and execution barrier | `d3d12_xs_device.cpp` turns each into a `D3D12_GLOBAL_BARRIER` with the same `SyncBefore`/`SyncAfter`/`AccessBefore`/`AccessAfter` (layouts, subresource range and flags dropped) before it calls GCL7 `Barrier` (PC slot 80). A texture group with both kinds is split into runs, in order, in storage that lives for the call; a call with nothing to convert goes through with the title's own pointer. Without this the PC list goes into its error state, `Close` fails and `ExecuteCommandLists` drops the submission. A group array the proxy cannot read safely (null with a nonzero count, a group type it does not know, more than 1,024 groups or 65,536 barriers in one group) is refused whole, nothing recorded, and logged once per reason. **Confirmed by the mock tests only** (`xs_proxy_mock_test`), not by a retail run. |
+| List slot 52: clear of an RTV made with no resource | The title creates some render-target views with `CreateRenderTargetView(nullptr, ...)` and clears them every frame; on the console that clear does nothing | The device proxy marks the real handle when device slot 20 gets no resource; a view made there with a resource removes the mark, and `CopyDescriptors`/`CopyDescriptorsSimple` of RTVs move it with the descriptors. List slot 52 skips the clear of a marked view (logged the first time) and the list stays valid. The mark is the proxy's own because the real descriptor cannot tell: the Vulkan layer writes the same empty record for a view it could not make, and a PC runtime's handles are opaque. Any other view, valid or not, still reaches `ClearRenderTargetView` (PC slot 48); RTV records the title copies with its own `memcpy` are not followed. **Confirmed by the mock tests only** (`xs_proxy_mock_test`), not by a retail run. |
 | XDXR batched/streaming BVH | `XboxBvhBuilder.dll` exports | See 4.8. |
+
+The null-resource barrier and null-view clear behaviour were first reported by luizwidmer/palmetto.
 
 ### 4.10 Debug markers and private data
 

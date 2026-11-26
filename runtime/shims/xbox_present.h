@@ -181,6 +181,7 @@ private:
     HRESULT present_x(UINT plane_count, const XboxPresentPlaneParameters* planes, const XboxPresentParameters* params);
     float effective_sdr_white_nits();  // override, else the cached Windows setting while HDR10, else 203
     void display_white_worker();       // refreshes display_white_ off the present path
+    void note_present_fps() noexcept;  // logs 5s FPS windows when LEONIDA_FPS_LOG=1
     std::unique_ptr<WindowPresenter> presenter_;
     std::unique_ptr<leonida::FrameClock> own_clock_;
     leonida::FramePacer pacer_;

@@ -20875,7 +20875,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     std::vector<VkQueueFamilyProperties> families(family_count);
     vkGetPhysicalDeviceQueueFamilyProperties(info.physical, &family_count, families.data());
     const std::uint32_t queue_cap = max_queues_per_family(queue_test_settings);
-    const std::uint32_t command_queue_count = std::min(queue_cap, families[info.queue_family].queueCount);
+    std::uint32_t command_queue_count = std::min(queue_cap, families[info.queue_family].queueCount);
     std::vector<float> priorities(16, 1.0f);
     std::vector<VkDeviceQueueCreateInfo> queue_infos;
     {
@@ -21001,11 +21001,20 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     }
     const char* host_image_copy_name = VK_EXT_HOST_IMAGE_COPY_EXTENSION_NAME;
     info.host_image_copy = has_host_image_copy && host_copy.hostImageCopy;
+    // LEONIDA_HOST_IMAGE_COPY=0 (or "off") makes CPU texture copies use a staging submit even where the GPU has
+    // VK_EXT_host_image_copy.
+    char host_copy_env[8]{};
+    std::size_t host_copy_len = 0;
+    const bool host_copy_forced_off =
+        getenv_s(&host_copy_len, host_copy_env, "LEONIDA_HOST_IMAGE_COPY") == 0 && host_copy_len > 1 &&
+        (host_copy_env[0] == '0' || std::strcmp(host_copy_env, "off") == 0);
+    if (host_copy_forced_off) info.host_image_copy = false;
     if (info.host_image_copy) {
         host_copy.pNext = *v13.next();  // after the conditional rendering features, if any
         *v13.next() = &host_copy;
     } else {
-        std::fprintf(stderr, "[rt] d3d12: no VK_EXT_host_image_copy; CPU texture copies use a staging submit\n");
+        std::fprintf(stderr, "[rt] d3d12: %s; CPU texture copies use a staging submit\n",
+                     host_copy_forced_off ? "LEONIDA_HOST_IMAGE_COPY=0" : "no VK_EXT_host_image_copy");
     }
 
     const auto has_device_extension = [&](const char* name) {
@@ -21349,8 +21358,34 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
                              "debug info, resource tracking or checkpoints\n");
     device_info.enabledExtensionCount = std::uint32_t(device_extensions.size());
     device_info.ppEnabledExtensionNames = device_extensions.empty() ? nullptr : device_extensions.data();
-    if (vkCreateDevice(info.physical, &device_info, nullptr, &owned.device) != VK_SUCCESS)
-        return fail("vkCreateDevice failed");
+    // A driver can refuse a device that asks for every queue it lists: NVIDIA 615 on an RTX 3060 Ti (16 + 8 + 2 queues)
+    // fails vkCreateDevice with VK_ERROR_INITIALIZATION_FAILED when the kernel cannot allocate that many channels
+    // (NVRM kchannel NV_ERR_STATE_IN_USE). Retry with half the queues per family until one request is accepted; D3D12
+    // queues share a VkQueue when there are fewer of them than live queues.
+    VkResult created = vkCreateDevice(info.physical, &device_info, nullptr, &owned.device);
+    while (created == VK_ERROR_INITIALIZATION_FAILED) {
+        bool reduced = false;
+        for (auto& q : queue_infos) {
+            if (q.queueCount <= 1) continue;
+            q.queueCount = std::max<std::uint32_t>(1, q.queueCount / 2);
+            reduced = true;
+            if (q.queueFamilyIndex == info.queue_family)
+                command_queue_count = q.queueCount;
+            else if (q.queueFamilyIndex == info.compute_family)
+                compute_count = q.queueCount;
+            else
+                copy_count = q.queueCount;
+        }
+        if (!reduced) break;
+        std::fprintf(stderr, "[rt] d3d12: vkCreateDevice refused the queue request; retrying with fewer queues (%u graphics",
+                     command_queue_count);
+        if (compute_count) std::fprintf(stderr, ", %u compute", compute_count);
+        if (copy_count) std::fprintf(stderr, ", %u copy", copy_count);
+        std::fprintf(stderr, ")\n");
+        device_info.queueCreateInfoCount = std::uint32_t(queue_infos.size());
+        created = vkCreateDevice(info.physical, &device_info, nullptr, &owned.device);
+    }
+    if (created != VK_SUCCESS) return fail("vkCreateDevice failed");
     info.device = owned.device;
     owned.destroy_device = reinterpret_cast<PFN_vkDestroyDevice>(vkGetDeviceProcAddr(owned.device, "vkDestroyDevice"));
     info.command_queues.resize(command_queue_count);
