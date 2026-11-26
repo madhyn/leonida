@@ -238,6 +238,7 @@ public:
             if (frame.done) vkDestroyFence_(device, frame.done, nullptr);
             if (frame.acquired) vk.vkDestroySemaphore(device, frame.acquired, nullptr);
         }
+        probe_reclaim(true);  // LOCAL DIAGNOSTIC: the queue wait above has finished a timed-out readback's copy
         if (probe_fence_) vkDestroyFence_(device, probe_fence_, nullptr);  // LOCAL DIAGNOSTIC
         if (pool_) vk.vkDestroyCommandPool(device, pool_, nullptr);
         if (surface_ && vkDestroySurfaceKHR_) vkDestroySurfaceKHR_(instance_, surface_, nullptr);
@@ -732,6 +733,9 @@ private:
     int probe_written_ = 0;
     VkCommandBuffer probe_commands_ = VK_NULL_HANDLE;
     VkFence probe_fence_ = VK_NULL_HANDLE;
+    // The staging buffer of a readback whose fence wait timed out: the copy may still write it (probe_reclaim).
+    VkBuffer probe_parked_buffer_ = VK_NULL_HANDLE;
+    VkDeviceMemory probe_parked_memory_ = VK_NULL_HANDLE;
 
     static float probe_half(std::uint16_t h) {
         const std::uint32_t sign = (h >> 15) & 1, exponent = (h >> 10) & 0x1f, mantissa = h & 0x3ff;
@@ -818,6 +822,21 @@ private:
         }
     }
 
+    // Frees the staging buffer a timed-out readback left behind once its fence has signalled (or unconditionally
+    // when `idle`: the destructor's queue wait has finished the copy). True when nothing is in flight any more, so
+    // the probe's command buffer and fence may be reset.
+    bool probe_reclaim(bool idle) {
+        if (!probe_parked_buffer_ && !probe_parked_memory_) return true;
+        const VkDevice device = context_.device();
+        if (!idle && vkWaitForFences_(device, 1, &probe_fence_, VK_TRUE, 0) != VK_SUCCESS) return false;
+        auto& vk = context_.vk;
+        if (probe_parked_memory_) vk.vkFreeMemory(device, probe_parked_memory_, nullptr);
+        if (probe_parked_buffer_) vk.vkDestroyBuffer(device, probe_parked_buffer_, nullptr);
+        probe_parked_buffer_ = VK_NULL_HANDLE;
+        probe_parked_memory_ = VK_NULL_HANDLE;
+        return true;
+    }
+
     // Copies mip 0, layer 0 of `id` to host memory on the presenter's queue (waited for), logs and writes it.
     void probe_read_source(ResourceId id, std::uint64_t number, const char* path, const char* prefix = "source") {
         const bool is_source = std::strcmp(prefix, "source") == 0;
@@ -836,6 +855,11 @@ private:
                 probe_source_ = false;
                 return;
             }
+        }
+        if (!probe_reclaim(false)) {  // an earlier readback timed out and its copy is still running
+            std::fprintf(stderr, "[rt] present-probe: %s frame %llu skipped: the last readback is still in flight\n",
+                         prefix, static_cast<unsigned long long>(number));
+            return;
         }
         std::shared_lock resource_lock(context_.resource_mutex_);
         const ResourceBinding* found = context_.resolve(id);
@@ -944,11 +968,21 @@ private:
                                                 "vkQueueSubmit (present probe)");
             if (submitted == VK_SUCCESS) context_.note_image_work_locked();
         }
-        if (submitted != VK_SUCCESS ||
-            context_.observe_result(vkWaitForFences_(device, 1, &probe_fence_, VK_TRUE, 5'000'000'000ull),
-                                    "vkWaitForFences (present probe)") != VK_SUCCESS) {
-            std::fprintf(stderr, "[rt] present-probe: readback submit/wait failed (%d)\n", int(submitted));
+        if (submitted != VK_SUCCESS) {
+            std::fprintf(stderr, "[rt] present-probe: readback submit failed (%d)\n", int(submitted));
             cleanup();
+            return;
+        }
+        if (const VkResult waited = context_.observe_result(
+                vkWaitForFences_(device, 1, &probe_fence_, VK_TRUE, 5'000'000'000ull), "vkWaitForFences (present probe)");
+            waited != VK_SUCCESS) {
+            // The copy was submitted and may still run: the GPU can write the staging buffer and still owns the
+            // command buffer and the fence. Give up on this readback, but park the buffer and its memory until the
+            // fence signals (probe_reclaim, or the destructor after its queue wait) instead of freeing them now.
+            std::fprintf(stderr, "[rt] present-probe: readback wait failed (%d); its buffer is freed once the copy is "
+                                 "done\n", int(waited));
+            probe_parked_buffer_ = buffer;
+            probe_parked_memory_ = memory;
             return;
         }
         const std::size_t texels = std::size_t(binding.width) * binding.height;

@@ -101,11 +101,90 @@ VKAPI_ATTR void VKAPI_CALL destroy_swapchain(VkDevice device, VkSwapchainKHR swa
     real_destroy_swapchain(device, swapchain, alloc);
 }
 
+// --probe-timeout: the present-source probe's readback copies `probe_image` into a staging buffer. While `hold` is
+// set, the submit carrying that copy also waits on the timeline semaphore `hold` (value 1, signalled by the test),
+// and the fence wait that follows times out at once, so the copy is still pending when the probe gives up.
+PFN_vkDestroyBuffer real_destroy_buffer = nullptr;
+PFN_vkFreeMemory real_free_memory = nullptr;
+PFN_vkBindBufferMemory real_bind_buffer = nullptr;
+VkImage probe_image = VK_NULL_HANDLE;
+VkCommandBuffer probe_cb = VK_NULL_HANDLE;
+VkBuffer probe_dst = VK_NULL_HANDLE;
+VkSemaphore hold = VK_NULL_HANDLE;
+std::atomic<bool> held{false};                  // the semaphore is not signalled yet: the held copy is pending
+std::atomic<bool> timeout_next_wait{false};
+std::atomic<std::uint32_t> probe_submits{0};    // submits of the probe's copy
+std::atomic<std::uint32_t> probe_submits_held{0};
+std::atomic<bool> freed_in_flight{false};       // the pending copy's buffer or memory was destroyed or freed
+std::mutex bind_mutex;
+std::vector<std::pair<VkBuffer, VkDeviceMemory>> binds;
+VkBuffer held_buffer = VK_NULL_HANDLE;
+VkDeviceMemory held_memory = VK_NULL_HANDLE;
+
+VKAPI_ATTR VkResult VKAPI_CALL bind_buffer_memory(VkDevice device, VkBuffer buffer, VkDeviceMemory memory,
+                                                  VkDeviceSize offset) {
+    {
+        std::lock_guard lock(bind_mutex);
+        binds.emplace_back(buffer, memory);
+    }
+    return real_bind_buffer(device, buffer, memory, offset);
+}
+
+// A buffer or memory the held copy still uses is recorded and kept (a real free would let the GPU write freed
+// memory once the test signals the semaphore); the test then fails on `freed_in_flight`.
+VKAPI_ATTR void VKAPI_CALL destroy_buffer(VkDevice device, VkBuffer buffer, const VkAllocationCallbacks* alloc) {
+    if (buffer != VK_NULL_HANDLE && held.load() && buffer == held_buffer) {
+        freed_in_flight.store(true);
+        return;
+    }
+    real_destroy_buffer(device, buffer, alloc);
+}
+
+VKAPI_ATTR void VKAPI_CALL free_memory(VkDevice device, VkDeviceMemory memory, const VkAllocationCallbacks* alloc) {
+    if (memory != VK_NULL_HANDLE && held.load() && memory == held_memory) {
+        freed_in_flight.store(true);
+        return;
+    }
+    real_free_memory(device, memory, alloc);
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL queue_submit(VkQueue queue, std::uint32_t count, const VkSubmitInfo* submits,
                                             VkFence fence) {
     submit_entered.store(true, std::memory_order_release);
+    const bool probe = probe_cb != VK_NULL_HANDLE && count == 1 && submits[0].commandBufferCount == 1 &&
+                       submits[0].pCommandBuffers[0] == probe_cb;
+    if (probe) {
+        probe_cb = VK_NULL_HANDLE;  // recorded again by the next readback's copy
+        probe_submits.fetch_add(1);
+        if (held.load()) probe_submits_held.fetch_add(1);
+    }
     const VkResult armed = fail_next_submit.exchange(VK_SUCCESS);
     if (armed != VK_SUCCESS) return armed;
+    if (probe) {
+        if (hold != VK_NULL_HANDLE && held.load() && !held_buffer) {
+            {
+                std::lock_guard lock(bind_mutex);
+                for (const auto& [b, m] : binds)
+                    if (b == probe_dst) held_memory = m;
+            }
+            held_buffer = probe_dst;
+            const std::uint64_t one = 1;
+            VkTimelineSemaphoreSubmitInfo timeline{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
+            timeline.waitSemaphoreValueCount = 1;
+            timeline.pWaitSemaphoreValues = &one;
+            const VkPipelineStageFlags stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+            VkSubmitInfo submit = submits[0];
+            submit.pNext = &timeline;
+            submit.waitSemaphoreCount = 1;
+            submit.pWaitSemaphores = &hold;
+            submit.pWaitDstStageMask = &stage;
+            timeout_next_wait.store(true);
+            // The frame's own submit, next, fails: a present queued behind the held copy would wait on a signal
+            // that is not submitted yet (VUID-vkQueuePresentKHR-pWaitSemaphores-03268).
+            fail_next_submit.store(VK_ERROR_OUT_OF_HOST_MEMORY);
+            return real_submit(queue, 1, &submit, fence);
+        }
+    }
     return real_submit(queue, count, submits, fence);
 }
 
@@ -122,6 +201,7 @@ VKAPI_ATTR VkResult VKAPI_CALL wait_for_fences(VkDevice device, std::uint32_t co
                                                VkBool32 wait_all, std::uint64_t timeout) {
     const VkResult armed = fail_next_wait.exchange(VK_SUCCESS);
     if (armed != VK_SUCCESS) return armed;
+    if (timeout_next_wait.exchange(false)) timeout = 0;  // the held probe copy: a real VK_TIMEOUT, at once
     return real_wait(device, count, fences, wait_all, timeout);
 }
 
@@ -154,6 +234,10 @@ VKAPI_ATTR void VKAPI_CALL cmd_copy_image_to_buffer(VkCommandBuffer cb, VkImage 
         if (saw_capture_waw.exchange(false, std::memory_order_relaxed))
             capture_waw_barriers.fetch_add(1, std::memory_order_relaxed);
     }
+    if (probe_image != VK_NULL_HANDLE && src == probe_image) {
+        probe_cb = cb;
+        probe_dst = dst;
+    }
     real_copy_i2b(cb, src, layout, dst, count, regions);
 }
 
@@ -165,6 +249,9 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL get_device(VkDevice device, const char*
     if (n == "vkWaitForFences") return reinterpret_cast<PFN_vkVoidFunction>(wait_for_fences);
     if (n == "vkCmdPipelineBarrier") return reinterpret_cast<PFN_vkVoidFunction>(cmd_pipeline_barrier);
     if (n == "vkCmdCopyImageToBuffer") return reinterpret_cast<PFN_vkVoidFunction>(cmd_copy_image_to_buffer);
+    if (n == "vkDestroyBuffer") return reinterpret_cast<PFN_vkVoidFunction>(destroy_buffer);
+    if (n == "vkFreeMemory") return reinterpret_cast<PFN_vkVoidFunction>(free_memory);
+    if (n == "vkBindBufferMemory") return reinterpret_cast<PFN_vkVoidFunction>(bind_buffer_memory);
     return real_get_device(device, name);
 }
 
@@ -183,16 +270,21 @@ void install(PFN_vkGetInstanceProcAddr instance_proc, VkInstance instance, VkDev
     real_wait = reinterpret_cast<PFN_vkWaitForFences>(real_get_device(device, "vkWaitForFences"));
     real_barrier = reinterpret_cast<PFN_vkCmdPipelineBarrier>(real_get_device(device, "vkCmdPipelineBarrier"));
     real_copy_i2b = reinterpret_cast<PFN_vkCmdCopyImageToBuffer>(real_get_device(device, "vkCmdCopyImageToBuffer"));
+    real_destroy_buffer = reinterpret_cast<PFN_vkDestroyBuffer>(real_get_device(device, "vkDestroyBuffer"));
+    real_free_memory = reinterpret_cast<PFN_vkFreeMemory>(real_get_device(device, "vkFreeMemory"));
+    real_bind_buffer = reinterpret_cast<PFN_vkBindBufferMemory>(real_get_device(device, "vkBindBufferMemory"));
 }
 }  // namespace driver
 
 #include "vk_presenter_sparse_capture.h"
+#include "vk_presenter_probe_timeout.h"
 
 }  // namespace
 
 int main(int argc, char** argv) {
     using namespace leonida;
     const bool sparse = argc==2 && std::string_view(argv[1])=="--sparse-capture";
+    if (argc==2 && std::string_view(argv[1])=="--probe-timeout") return probe_timeout_test::run();
     if (argc!=1 && !sparse) return 2;
 
     vktest::Device d;
