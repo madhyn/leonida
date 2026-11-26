@@ -137,6 +137,8 @@ int main() {
         std::array<double, 4> maximum;
     };
     const Norm norms[] = {
+        {VK_FORMAT_R5G6B5_UNORM_PACK16, {0.5f, 0.5f, 0.5f, 1}, {16, 32, 16, 0}, {31, 63, 31, 0}},
+        {VK_FORMAT_R5G6B5_UNORM_PACK16, {nan, -1, 2, 1}, {0, 0, 31, 0}, {31, 63, 31, 0}},
         {VK_FORMAT_R8G8B8A8_UNORM, {0.5f, 0.499f, 0.501f, 1.0f}, {128, 127, 128, 255}, {255, 255, 255, 255}},
         {VK_FORMAT_B8G8R8A8_UNORM, {-1, 2, nan, 0.5f}, {0, 255, 0, 128}, {255, 255, 255, 255}},
         {VK_FORMAT_R8G8_UNORM, {0.5f, 1.5f, 0, 0}, {128, 255, 0, 0}, {255, 255, 255, 255}},
