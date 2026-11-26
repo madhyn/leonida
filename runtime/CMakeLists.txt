@@ -2478,6 +2478,14 @@ if(TARGET Vulkan::Headers)
                          FAIL_REGULAR_EXPRESSION "Validation Error;VUID-")
     # The pipelines a submission needs, compiled on the device's workers: the same image as without them. The second
     # time with the pipelines compiled when they are created, which leaves the variants.
+    # The compile workers of PipelineCompiler (LEONIDA_COMPILE_THREADS, LEONIDA_COMPILE_HEAVY_MAX): their rules with jobs
+    # that wait at gates, no device.
+    add_executable(d3d12_compile_pool_test test/d3d12_compile_pool_test.cpp)
+    target_link_libraries(d3d12_compile_pool_test PRIVATE gta6rt_d3d12_com)
+    target_compile_definitions(d3d12_compile_pool_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_compile_pool_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_compile_pool COMMAND d3d12_compile_pool_test)
+    set_tests_properties(d3d12_compile_pool PROPERTIES TIMEOUT 120)
     add_executable(d3d12_pipeline_workers_test test/d3d12_pipeline_workers_test.cpp)
     target_link_libraries(d3d12_pipeline_workers_test PRIVATE gta6rt_d3d12_com)
     target_compile_definitions(d3d12_pipeline_workers_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
@@ -3810,6 +3818,10 @@ if(TARGET Vulkan::Headers)
       target_compile_options(d3d12_compile_teardown_test PRIVATE /W4 /permissive- /utf-8)
       add_test(NAME d3d12_compile_teardown COMMAND d3d12_compile_teardown_test)
       set_tests_properties(d3d12_compile_teardown PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+      # The same with one compile worker, the layout before the pool (LEONIDA_COMPILE_THREADS=1).
+      add_test(NAME d3d12_compile_teardown_one_worker COMMAND d3d12_compile_teardown_test)
+      set_tests_properties(d3d12_compile_teardown_one_worker PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300
+                           ENVIRONMENT "LEONIDA_COMPILE_THREADS=1")
       # A buffer at the title's own VA (device slot 133) read by the same shader through a root view and a V#.
       add_executable(d3d12_title_va_test test/d3d12_title_va_test.cpp shims/d3d12_xs_device.cpp
                      test/xmem_geometry_aliases_stub.cpp ${LEONIDA_TEST_CS})
