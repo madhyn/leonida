@@ -11127,6 +11127,7 @@ ComputeBuild build_compute_pipeline(DeviceState& device, const leonida::ShaderEn
     auto& compiling = leonida::driver_compile;
     VkResult created = VK_ERROR_UNKNOWN;
     bool from_shared = false, probe_compiled = false;
+    bool journal_retry_failed = false;  // the create against the empty cache failed: nothing to write
     ULONGLONG probe_ms = 0, driver_ms = 0;
     {
         // Every driver call of the build (shader module, journal cache, pipeline) in one turn through the compile
@@ -11177,7 +11178,8 @@ ComputeBuild build_compute_pipeline(DeviceState& device, const leonida::ShaderEn
                 const ULONGLONG at_again = GetTickCount64();
                 const VkResult again_result = vk.vkCreateComputePipelines(dev, journal.cache, 1, &pipeline_info, nullptr, &again);
                 const ULONGLONG again_ms = GetTickCount64() - at_again;
-                if (again_result == VK_SUCCESS && again) {
+                journal_retry_failed = again_result != VK_SUCCESS || !again;
+                if (!journal_retry_failed) {
                     vk.vkDestroyPipeline(dev, built, nullptr);
                     built = again;
                 }
@@ -11189,7 +11191,7 @@ ComputeBuild build_compute_pipeline(DeviceState& device, const leonida::ShaderEn
         }
         compiling.name.store(nullptr, std::memory_order_release);
         vk.vkDestroyShaderModule(dev, module, nullptr);  // Vulkan lets a module go once the pipeline exists
-        journal.finish(!from_shared && created == VK_SUCCESS && built, trace.hit(), driver_ms);
+        journal.finish(!from_shared && !journal_retry_failed && created == VK_SUCCESS && built, trace.hit(), driver_ms);
     }
     std::vector<std::uint32_t>().swap(words);
     profile.finish(int(created));
